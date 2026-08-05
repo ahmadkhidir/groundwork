@@ -13,6 +13,22 @@ conventions, and commands only.
   by the `product-shaper` agent, never by an implementor.
 - When this file and `docs/Groundwork/` conflict, **the docs win**. Fix this file, not the docs.
 
+**`docs/` is a git submodule** → `ahmadkhidir/groundwork-docs` (private). The parent repo stores only
+a commit pointer, so docs access is granted separately from code access.
+
+- After cloning: `git submodule update --init docs`. A **permission error** there means you have code
+  access but not docs access — request it; do not proceed as if the product has no docs.
+- An **empty `docs/` is never "no specs"**. It is an uninitialized submodule. Stop and say so rather
+  than inventing requirements to fill the gap.
+- **Push order is not optional:** push the docs repo *before* pushing any parent commit that
+  references the new docs commit, or everyone else's `submodule update` fails on a SHA that exists
+  nowhere. `push.recurseSubmodules=check` is configured to enforce this.
+- **Bump the pointer only when committing code built against those docs** — `git add docs` in the
+  same commit as that code. Between those moments, `modified: docs (new commits)` in the parent is
+  accurate information (docs have moved ahead of the code); leave it alone.
+- Staging the pointer is a parent-repo index change, **not** a write to `docs/`. It is expected of
+  you; the read-only rule governs document contents.
+
 ## 2. Tech Stack
 
 | Layer | Technology | Version |
@@ -252,6 +268,14 @@ Update this table at each phase checkpoint. It is how anyone tells what exists i
 what is only documented.
 
 ## 8. Key Commands
+
+**Docs submodule**
+```bash
+git submodule update --init docs      # After clone - fetches docs/Groundwork
+git -C docs pull origin main          # Get the latest specs
+git -C docs log --oneline -5          # What changed in the specs
+git add docs                          # Stage a pointer bump (with the code it pairs with)
+```
 
 **Local infrastructure**
 ```bash
