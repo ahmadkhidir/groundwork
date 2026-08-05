@@ -1,0 +1,290 @@
+/*
+ * Groundwork design tokens.
+ *
+ * SINGLE SOURCE OF TRUTH for every design token in the web client, transcribed from
+ * docs/Groundwork/branding.md. There is no second token file, no JS theme object, and no
+ * tailwind.config.js — Tailwind v4 is CSS-first and generates utilities from the @theme block below.
+ *
+ * RULES (see IMPLEMENTATION.md §3a and Behavior Rule 3):
+ *   - Never write a raw hex value or magic pixel number in a component. Reference a token.
+ *   - Every color and shadow carries BOTH a light and a dark value. Components never branch on
+ *     theme; they name the token and the `dark` variant resolves it.
+ *   - If a token you need is missing, report it. Do not inline its value.
+ */
+
+@import "tailwindcss";
+
+/*
+ * Class-based dark mode rather than a bare `prefers-color-scheme` media query, because
+ * screens/13-workspace-settings.md exposes an explicit theme preference. The media query alone
+ * cannot be overridden by the user; a class can. The inline script in src/app/layout.tsx sets this
+ * class before first paint to avoid a flash of the wrong theme.
+ */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  /* ---------------------------------------------------------------------------------------------
+   * Color — light values. Dark counterparts are re-declared in the .dark block below.
+   * branding.md §Color Palette
+   * ------------------------------------------------------------------------------------------ */
+
+  /* Primary — a restrained, desaturated engineering-tool blue, deliberately not "AI startup" violet */
+  --color-primary: #1d4ed8;
+  --color-primary-hover: #1839a8;
+  --color-primary-light: #e8eefc;
+
+  /* Neutral */
+  --color-surface: #ffffff;
+  --color-surface-secondary: #f4f5f7;
+  --color-text-primary: #111418;
+  --color-text-secondary: #5b6270;
+  --color-border: #dfe1e6;
+
+  /* Semantic */
+  --color-success: #15803d;
+  --color-warning: #b45309;
+  --color-error: #b91c1c;
+  --color-info: #0369a1;
+
+  /*
+   * Trust & provenance. These exist so "this number is a clickable, verified claim" is a distinct
+   * visual signal — never styled as an ordinary link. branding.md §Trust & Provenance Colors.
+   */
+  --color-provenance: #0f766e;
+  --color-provenance-light: #e6f5f3;
+  --color-code-accent: #334155;
+
+  /*
+   * Chart palette — deliberately independent of the UI palette so financial data reads consistently
+   * across reports. Categorical tokens are assigned to series in FIXED order (cat-1 first), so the
+   * same metric renders in the same color across reports. branding.md §Chart Colors.
+   */
+  --color-chart-cat-1: #1d4ed8; /* matches `primary` for brand continuity */
+  --color-chart-cat-2: #b45309;
+  --color-chart-cat-3: #0f766e; /* matches `provenance` for continuity */
+  --color-chart-cat-4: #7c3aed;
+  --color-chart-cat-5: #be185d;
+  --color-chart-cat-6: #4d7c0f;
+  --color-chart-cat-7: #0369a1;
+  --color-chart-cat-8: #78716c; /* series 8 / "other" bucket */
+
+  /* Sequential ramp — magnitude only (e.g. revenue heatmap) */
+  --color-chart-seq-1: #e8eefc;
+  --color-chart-seq-3: #6690e8;
+  --color-chart-seq-5: #1d4ed8;
+
+  /*
+   * Diverging — for values relative to a baseline ONLY (variance vs. budget, period-over-period).
+   * Never use these for categorical series: red/green meaning must not be overloaded.
+   */
+  --color-chart-div-negative: #b91c1c;
+  --color-chart-div-neutral: #dfe1e6;
+  --color-chart-div-positive: #15803d;
+
+  /* ---------------------------------------------------------------------------------------------
+   * Typography — branding.md §Typography
+   * Plex Sans (headings) + Plex Mono (SQL/code/data) is a deliberate family relationship that makes
+   * "narrative vs. query" a visual system. Inter carries body text for small-size legibility in
+   * dense report tables. Bound to next/font variables in layout.tsx.
+   * ------------------------------------------------------------------------------------------ */
+  --font-display: var(--font-plex-sans), sans-serif;
+  --font-body: var(--font-inter), sans-serif;
+  --font-mono: var(--font-plex-mono), monospace;
+
+  /* Type scale. Each step pairs its size with the line-height and weight branding.md specifies. */
+  --text-display: 2.25rem; /* 36px — marketing/landing headline only */
+  --text-display--line-height: 1.2;
+  --text-display--font-weight: 700;
+
+  --text-h1: 1.75rem; /* 28px — page titles */
+  --text-h1--line-height: 1.3;
+  --text-h1--font-weight: 700;
+
+  --text-h2: 1.375rem; /* 22px — section headings within a report */
+  --text-h2--line-height: 1.35;
+  --text-h2--font-weight: 600;
+
+  --text-h3: 1.125rem; /* 18px — card titles, chart titles */
+  --text-h3--line-height: 1.4;
+  --text-h3--font-weight: 600;
+
+  --text-body-large: 1.0625rem; /* 17px — narrative report text, the primary reading surface */
+  --text-body-large--line-height: 1.55;
+  --text-body-large--font-weight: 400;
+
+  --text-body: 0.9375rem; /* 15px — UI body, form labels, table cells. Accessible floor; see below */
+  --text-body--line-height: 1.5;
+  --text-body--font-weight: 400;
+
+  --text-body-small: 0.8125rem; /* 13px — captions, timestamps, egress log entries */
+  --text-body-small--line-height: 1.5;
+  --text-body-small--font-weight: 400;
+
+  --text-caption: 0.6875rem; /* 11px — badges, overlines, status pills */
+  --text-caption--line-height: 1.4;
+  --text-caption--font-weight: 500;
+
+  --text-code: 0.875rem; /* 14px — SQL editor, code blocks, raw data values */
+  --text-code--line-height: 1.6;
+  --text-code--font-weight: 400;
+
+  /* ---------------------------------------------------------------------------------------------
+   * Spacing — 4px base grid. branding.md §Spacing
+   * ------------------------------------------------------------------------------------------ */
+  --spacing-xs: 4px; /* icon-to-label gaps, inline badges */
+  --spacing-sm: 8px; /* table cell padding, chip padding */
+  --spacing-md: 16px; /* default — card padding, form field gaps */
+  --spacing-lg: 24px; /* between report sections, dialog padding */
+  --spacing-xl: 32px; /* page margins, panel padding */
+  --spacing-2xl: 48px; /* major separation between dashboard regions */
+  --spacing-3xl: 64px; /* marketing/landing layout only */
+
+  /* ---------------------------------------------------------------------------------------------
+   * Radii — branding.md §Sizing
+   * ------------------------------------------------------------------------------------------ */
+  --radius-sm: 4px; /* badges, chips, status pills */
+  --radius-md: 8px; /* buttons, inputs, cards, code blocks */
+  --radius-lg: 12px; /* modals, drawers, large cards */
+  --radius-full: 9999px; /* avatars, engine-status dot */
+
+  /* ---------------------------------------------------------------------------------------------
+   * Shadows — branding.md §Shadows. Dark values are NOT the light ones at higher opacity; they are
+   * separately specified because elevation reads differently on a dark surface.
+   * ------------------------------------------------------------------------------------------ */
+  --shadow-none: none;
+  --shadow-sm: 0 1px 2px rgb(17 20 24 / 0.06);
+  --shadow-md: 0 4px 10px rgb(17 20 24 / 0.08);
+  --shadow-lg: 0 12px 28px rgb(17 20 24 / 0.12);
+
+  /* ---------------------------------------------------------------------------------------------
+   * Sizing constants. Tailwind v4 has no `--size-*` utility namespace, so these are emitted as
+   * plain custom properties and consumed via arbitrary-value utilities: h-(--size-button-height).
+   * That keeps the literal value out of call sites, which is the rule that matters.
+   * ------------------------------------------------------------------------------------------ */
+  --size-button-height: 40px; /* desktop-primary; 44px touch minimum via .touch-target */
+  --size-input-height: 40px;
+  --size-icon-sm: 16px; /* inline icons, status indicators */
+  --size-icon-md: 20px; /* navigation icons, button icons */
+  --size-icon-lg: 28px; /* empty-state icons, feature callouts */
+  --size-touch-target: 44px; /* WCAG minimum on the mobile responsive view */
+}
+
+/*
+ * Dark theme. One token name, two values — utilities never change, only what they resolve to.
+ * branding.md gives an explicit dark value for every color and shadow; all of them are here.
+ */
+.dark {
+  --color-primary: #5b8def;
+  --color-primary-hover: #7da4f5;
+  --color-primary-light: #16223d;
+
+  --color-surface: #15171a;
+  --color-surface-secondary: #1f2226;
+  --color-text-primary: #f2f3f5;
+  --color-text-secondary: #9aa1ac;
+  --color-border: #2e3238;
+
+  --color-success: #4ade80;
+  --color-warning: #fbbf24;
+  --color-error: #f87171;
+  --color-info: #67c3f3;
+
+  --color-provenance: #5eead4;
+  --color-provenance-light: #0e2926;
+  --color-code-accent: #cbd5e1;
+
+  --color-chart-cat-1: #5b8def;
+  --color-chart-cat-2: #f4a93b;
+  --color-chart-cat-3: #5eead4;
+  --color-chart-cat-4: #b794f6;
+  --color-chart-cat-5: #f472b6;
+  --color-chart-cat-6: #a3d65c;
+  --color-chart-cat-7: #67c3f3;
+  --color-chart-cat-8: #a8a29e;
+
+  --color-chart-seq-1: #16223d;
+  --color-chart-seq-3: #3d5fa8;
+  --color-chart-seq-5: #5b8def;
+
+  --color-chart-div-negative: #f87171;
+  --color-chart-div-neutral: #2e3238;
+  --color-chart-div-positive: #4ade80;
+
+  --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.45);
+  --shadow-md: 0 4px 12px rgb(0 0 0 / 0.55);
+  --shadow-lg: 0 12px 32px rgb(0 0 0 / 0.7);
+}
+
+@layer base {
+  /*
+   * Accessibility baseline — wired here so every feature slice inherits it rather than
+   * reimplementing it. branding.md §Accessibility.
+   */
+
+  /*
+   * Focus indicator: visible 2px primary outline at 2px offset on EVERY interactive element,
+   * including provenance claims and SQL editor regions. Keyboard navigation through a report and
+   * its underlying query must be fully usable without a mouse (Chidinma's SQL-editing workflow).
+   * :focus-visible rather than :focus so pointer users don't see rings on click.
+   */
+  *:focus-visible {
+    outline: 2px solid var(--color-primary);
+    outline-offset: 2px;
+  }
+
+  body {
+    background-color: var(--color-surface);
+    color: var(--color-text-primary);
+    font-family: var(--font-body);
+    /*
+     * 15px floor. Density in dense table views is achieved through spacing and hierarchy, never by
+     * shrinking text below the accessible floor. branding.md §Dense-data legibility.
+     */
+    font-size: var(--text-body);
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  h1,
+  h2,
+  h3 {
+    font-family: var(--font-display);
+  }
+
+  code,
+  pre,
+  kbd {
+    font-family: var(--font-mono);
+  }
+
+  /* Respect a user's reduced-motion preference globally. */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
+
+@layer utilities {
+  /*
+   * Guarantees the 44x44px WCAG touch minimum without inflating the visual box, for controls whose
+   * desktop size is the tighter 40px button-height. Apply to icon buttons and compact controls.
+   */
+  .touch-target {
+    position: relative;
+  }
+
+  .touch-target::after {
+    content: "";
+    position: absolute;
+    inset: 50% auto auto 50%;
+    width: max(100%, var(--size-touch-target));
+    height: max(100%, var(--size-touch-target));
+    transform: translate(-50%, -50%);
+  }
+}

@@ -37,7 +37,7 @@ a commit pointer, so docs access is granted separately from code access.
 | UI runtime | React | `19.2.8` |
 | Styling | Tailwind CSS v4 (`@theme`) | `4.3.3` |
 | Charts | Recharts (wrapped in first-party components) | `3.10.1` |
-| Auth | Auth.js (`next-auth`) + `@auth/pg-adapter` | `5.0.0-beta.32` / `1.11.3` |
+| Auth | Auth.js (`next-auth`), Credentials provider + JWT sessions | `5.0.0-beta.32` |
 | Language (web) | TypeScript | `7.0.2` |
 | Backend | Go (single service — the only backend) | `1.26.3` |
 | HTTP router | `github.com/go-chi/chi/v5` | `5.3.1` |
@@ -55,9 +55,21 @@ Single region, scale-to-zero. See `docs/Groundwork/architecture.md`.
 The DuckDB engine runs as a local OS process — this is `architecture.md`'s "implementation #1" of the
 Engine Provider seam, not a mock.
 
-**cgo is mandatory.** `CGO_ENABLED=1` and a C compiler are required for every Go build and test run
-(the DuckDB driver). Fully static binaries are not available. Accepted constraint — see `risk_log.md`
-R-010.
+**No database adapter in the web tier — deliberately.** `architecture.md`'s boundary rule confines
+Next.js to rendering, routing, session handling, and BFF proxying. Auth.js therefore uses a
+Credentials provider that verifies against the Go API's `/v1/auth/login`, with **JWT** sessions
+(a database session strategy would require this tier to hold a Postgres connection). `@auth/pg-adapter`
+and `pg` were removed for this reason; do not reintroduce them.
+
+**cgo is mandatory — once the DuckDB driver lands.** `CGO_ENABLED=1` and a C compiler are required
+for every Go build and test run that includes it. Fully static binaries are not available. Accepted
+constraint — see `risk_log.md` R-010.
+
+> **Current state:** the DuckDB driver is **not yet a dependency.** Foundation defines the Engine
+> Provider seam (`server/internal/engine`) as an interface only; the local-process DuckDB
+> implementation lands with FEAT-004 in Phase 1. Until then `go build`/`go test` run with
+> `CGO_ENABLED=0` and need no C toolchain. The machine this was scaffolded on has no C compiler, so
+> **a compiler must be installed before FEAT-004 starts** (Windows: MSYS2/mingw-w64 or TDM-GCC).
 
 ## 3. Project Structure
 
@@ -149,9 +161,34 @@ and dark value. Components never branch on theme — they reference the token an
 constants exposed as `--size-*` custom properties and consumed via arbitrary-value utilities where no
 native Tailwind slot exists.
 
-**Skipped tokens:** none yet. Any token that cannot be mapped during Foundation gets recorded here
-with the reason. **A skipped token is never inlined as a raw value at a call site** — report it
-instead.
+**Skipped tokens: none.** Every token in `branding.md` is mapped, in both light and dark. If a future
+token cannot be mapped, record it here with the reason. **A skipped token is never inlined as a raw
+value at a call site** — report it instead.
+
+**Two deliberate exceptions to "no literal values", both narrow:**
+
+1. `--size-*` tokens (`button-height`, `input-height`, `icon-sm/md/lg`, `touch-target`) live inside
+   `@theme` but generate no utilities, because Tailwind v4 has no `--size-*` utility namespace.
+   Consume them as `h-(--size-button-height)`. The value still lives in exactly one place, which is
+   the rule that matters.
+2. `text-white` on the `primary` and `destructive` button fills. `branding.md` specifies a literal
+   `#FFFFFF` there — it is a fixed foreground for a colored fill and must **not** flip in dark mode,
+   so it is deliberately not the `surface` token.
+
+**Component library** (`web/src/components/ui/`) — where the component tokens landed. Use these
+rather than restyling from scratch:
+
+| Component | Covers |
+|---|---|
+| `Button` / `buttonClassNames()` | All 5 variants. Use the helper for `<Link>`s that should look like buttons — never copy the classes |
+| `StatusPill` | All 5 variants + `engineStatusPill()` / `runStatusPill()` mappers. **The label prop is required by the type** — a colored dot with no text is unconstructable |
+| `Input` | All 4 states, with label binding, `aria-invalid`, and `aria-describedby` wired |
+| `Card` / `CardHeader` | Surface container and standard header |
+
+**Accessibility is in the base layer, not per-feature.** `globals.css` carries the global
+`:focus-visible` ring, the 15px body floor, `prefers-reduced-motion`, and the `.touch-target`
+utility for the 44px mobile minimum; `layout.tsx` carries the skip link. Inherit these; don't
+reimplement them per screen.
 
 **Fonts:** IBM Plex Sans (display/headings), Inter (body), IBM Plex Mono (SQL/code/data values),
 loaded via `next/font` and bound to `--font-display`, `--font-body`, `--font-mono`.
@@ -266,7 +303,7 @@ loaded via `next/font` and bound to `--font-display`, `--font-body`, `--font-mon
 
 | Phase | Features | Status |
 |---|---|---|
-| **A — Foundation** | Scaffold, theme tokens, schema entities, auth, routing skeleton, docker-compose | Not started |
+| **A — Foundation** | Scaffold, theme tokens, schema entities, auth, routing skeleton, docker-compose | **Complete** |
 | **1 — Foundation: Workspace, Ingest & Trust** | FEAT-001, 002, 003, 004, 005, 006, 007, 008, 009, 011, 042, 044 | Not started |
 | **2 — Core Grounded Answer Loop** | FEAT-013, 014, 015, 016, 017, 018, 019, 020 | Not started |
 | **3 — Trust & Observability** | FEAT-022, 023, 024, 027, 028, 029, 030 | Not started |
@@ -275,6 +312,25 @@ loaded via `next/font` and bound to `--font-display`, `--font-body`, `--font-mon
 
 > **Current authorized scope: Foundation + Phase 1 only.** Phases 2–5 are documented but not
 > authorized for implementation. Do not begin a later phase without explicit approval.
+
+**What Foundation delivered** (green: `gofmt`, `go vet`, `go test`, `tsc`, `eslint`, `vitest` 37/37,
+`next build`):
+
+- `web/` — Next.js 16 App Router. All 15 routes from `screens.md` registered; unbuilt screens render
+  an honest `PlaceholderScreen` naming their spec, feature IDs, and phase. Global `error`,
+  `not-found`, and `loading` states.
+- `web/src/types/schema.ts` — all 18 entities, enums as const objects, empty-string-absence helpers.
+- `web/src/lib/` — `routes.ts` (single route map + public-route list), `api-client.ts` (`ApiError`,
+  SSE helper), `limits.ts` (500 MB ceiling), `cn.ts`.
+- `web/src/auth.ts` + `web/src/proxy.ts` — Auth.js and the optimistic auth gate.
+- `server/` — Go service: `config` (thresholds), `domain` (18 entities), `api` (chi router,
+  request-id logging, CORS, 501s naming the owning feature), `engine` (Provider seam interface).
+- `server/migrations/00001_init.sql` — all 18 tables, `workspace_id` everywhere, cascade FKs, step
+  lease columns from day one, `deletion_records` deliberately outside the cascade.
+- `docker-compose.yml` — Postgres + MinIO with healthchecks and bucket bootstrap.
+
+**Placeholders are replaced, not wrapped.** A feature slice deletes the `PlaceholderScreen` call and
+the route's 501 handler; it does not build around them.
 
 Update this table at each phase checkpoint. It is how anyone tells what exists in the codebase from
 what is only documented.
@@ -297,11 +353,13 @@ docker compose down -v               # Tear down, including volumes
 
 **Backend (`server/`)**
 ```bash
-CGO_ENABLED=1 go build ./...         # Build (cgo required — DuckDB driver)
-CGO_ENABLED=1 go run ./cmd/api       # Run the API service
-CGO_ENABLED=1 go test ./...          # Test
-CGO_ENABLED=1 go test -race ./...    # Test with race detector
-gofmt -l . && golangci-lint run      # Format check + lint
+# cgo is not required until the DuckDB driver lands with FEAT-004; prefix these with
+# CGO_ENABLED=1 from that point on.
+go build ./...                       # Build
+go run ./cmd/api                     # Run the API service
+go test ./...                        # Test
+go test -race ./...                  # Test with race detector
+gofmt -l . && go vet ./...           # Format check + vet
 goose -dir migrations postgres "$DATABASE_URL" up      # Apply migrations
 goose -dir migrations postgres "$DATABASE_URL" down    # Roll back one
 goose -dir migrations create <name> sql                # New migration
@@ -310,10 +368,20 @@ goose -dir migrations create <name> sql                # New migration
 **Web (`web/`)**
 ```bash
 npm install
+cp .env.example .env.local           # then: npx auth secret  → AUTH_SECRET
 npm run dev                          # Dev server
-npm run build                        # Production build
+npm run build                        # Production build (needs AUTH_SECRET set)
 npm run test                         # Vitest
-npm run test:e2e                     # Playwright
 npm run lint                         # ESLint
 npm run typecheck                    # tsc --noEmit
+npx next typegen                     # Regenerate PageProps/LayoutProps after adding a route
 ```
+
+**This Next.js version is not the one in your training data.** `web/AGENTS.md` is written by
+`next dev` and says so. Before writing app code, read the bundled docs at
+`web/node_modules/next/dist/docs/`. Changes already hit in Foundation:
+
+- `middleware.ts` → **`proxy.ts`**. A file named `middleware.ts` is deprecated and will not run.
+- `params` and `searchParams` are **Promises** and must be awaited; synchronous access was removed.
+- Route prop types come from `next typegen` as global `PageProps<'/route'>` / `LayoutProps<'/'>`.
+- Parallel-route slots now require an explicit `default.js`, or the build fails.
