@@ -104,6 +104,14 @@ func Infer(ctx context.Context, h Execer, a, b DatasetInput) ([]domain.Candidate
 				confidence = ValueOverlapOnlyCeiling
 			}
 
+			// When the cap applies, record whether the measure-name rule specifically is why a
+			// near-unique column failed to earn the exemption — FEAT-008 requires basis to say so in
+			// those words rather than only reporting the generic cap.
+			var measureName string
+			if capped {
+				measureName = measureDefeatedExemption(colA, colB, a.RowCount, b.RowCount)
+			}
+
 			if confidence < MinConfidenceToPersist {
 				continue
 			}
@@ -112,7 +120,7 @@ func Infer(ctx context.Context, h Execer, a, b DatasetInput) ([]domain.Candidate
 				SourceColumnID:  colA.ID,
 				TargetColumnID:  colB.ID,
 				ConfidenceScore: confidence,
-				Basis:           basis(colA.Name, colB.Name, nameScore, typeScore, overlapPct, cardinalityScore, colA.InferredType, colB.InferredType, capped),
+				Basis:           basis(colA.Name, colB.Name, nameScore, typeScore, overlapPct, cardinalityScore, colA.InferredType, colB.InferredType, capped, measureName),
 				Status:          domain.JoinPending,
 			})
 		}
@@ -153,29 +161,95 @@ func isNumeric(t domain.InferredType) bool {
 	return t == domain.TypeInteger || t == domain.TypeNumber
 }
 
-// identifierShaped reports whether col looks like an identifier rather than a measure, per FEAT-008's
-// "`id`/`key`/`code`-named or near-unique column".
+// identifierTokens are FEAT-008's "identifier-named" tokens: `id`/`key`/`code`.
+var identifierTokens = []string{"id", "key", "code"}
+
+// measureTokens are FEAT-008's measure-shaped names — the words real exports use for money and
+// quantity columns. A column whose name matches one of these cannot claim the near-unique exemption
+// "regardless of its actual distinctness": every invoice happening to have a distinct total is a
+// property of the data, not evidence that `total` is a key.
+var measureTokens = []string{
+	"total", "amount", "price", "qty", "quantity", "balance",
+	"sum", "cost", "revenue", "fee", "tax", "discount",
+}
+
+// matchesNameToken reports whether col's normalized name matches any of tokens as a WHOLE NAME or a
+// `_`-delimited affix — the shapes real exports use (`id`, `customer_id`, `id_customer`,
+// `order_key`, `branch_code`, `line_total`, `tax_rate`).
 //
-// Name test: a normalized name that IS, STARTS WITH, or ENDS WITH one of id/key/code — the shapes
-// real exports use (`id`, `customer_id`, `id_customer`, `order_key`, `branch_code`). Deliberately not
-// a substring match anywhere in the name, which would read `code` inside `discount_code_value` fine
-// but also read `id` inside `paid`, `void`, or `residual` and quietly exempt real measure columns
-// from a cap that exists for them.
-//
-// Uniqueness test: distinct values at or above UniqueCardinalityThreshold of the row count — the same
-// key-like signal the confirmation API already uses to default a confirmed relationship's
-// cardinality, rather than a second definition of "looks like a key".
-func identifierShaped(col domain.Column, rowCount int64) bool {
-	if uniqueness(col.DistinctCount, rowCount) >= UniqueCardinalityThreshold {
-		return true
-	}
-	name := normalizeName(col.Name)
-	for _, token := range [...]string{"id", "key", "code"} {
-		if name == token || strings.HasPrefix(name, token+"_") || strings.HasSuffix(name, "_"+token) {
+// Deliberately not a substring match anywhere in the name. Substring matching would read `code`
+// inside `discount_code_value` fine but also read `id` inside `paid`, `void`, or `residual` — and,
+// on the measure list, would read `tax` inside `taxonomy`. FEAT-008 calls out `paid`/`void`/
+// `residual`/`taxonomy` by name as columns that must NOT match, so both lists share this one
+// matching discipline rather than each inventing its own.
+func matchesNameToken(name string, tokens []string) bool {
+	normalized := normalizeName(name)
+	for _, token := range tokens {
+		if normalized == token ||
+			strings.HasPrefix(normalized, token+"_") ||
+			strings.HasSuffix(normalized, "_"+token) {
 			return true
 		}
 	}
 	return false
+}
+
+// identifierNamed reports FEAT-008's identifier-named branch: an `id`/`key`/`code` name.
+func identifierNamed(col domain.Column) bool {
+	return matchesNameToken(col.Name, identifierTokens)
+}
+
+// measureShaped reports whether col's name is measure-shaped per FEAT-008's list.
+func measureShaped(col domain.Column) bool {
+	return matchesNameToken(col.Name, measureTokens)
+}
+
+// nearUnique reports whether col's distinct/row ratio reaches UniqueCardinalityThreshold — the same
+// key-like signal the confirmation API already uses to default a confirmed relationship's
+// cardinality, rather than a second definition of "looks like a key".
+func nearUnique(col domain.Column, rowCount int64) bool {
+	return uniqueness(col.DistinctCount, rowCount) >= UniqueCardinalityThreshold
+}
+
+// identifierShaped reports whether col looks like an identifier rather than a measure, per FEAT-008.
+// It is a NAME-based test first, checked before uniqueness is ever consulted, with two independent
+// exempting branches:
+//
+//   - Identifier-named: `id`/`key`/`code` as a whole name or `_`-delimited affix.
+//   - Near-unique: distinct/row ratio >= UniqueCardinalityThreshold AND the name is not
+//     measure-shaped. FEAT-008: "Uniqueness alone is no longer sufficient" — a measure-shaped name
+//     defeats this branch outright, "regardless of its actual distinctness", closing the observed
+//     case where a `total` column with 40 distinct values over 40 rows escaped the cap and reported
+//     as key-like on uniqueness alone.
+//
+// Note the two branches are independent: an identifier-NAMED column is exempt even if its values
+// repeat heavily (`branch_code`), and a measure-shaped name only defeats the near-unique branch — it
+// never overrides an explicit identifier name, so a hypothetical `total_id` stays exempt.
+func identifierShaped(col domain.Column, rowCount int64) bool {
+	if identifierNamed(col) {
+		return true
+	}
+	return nearUnique(col, rowCount) && !measureShaped(col)
+}
+
+// measureDefeatedExemption returns the name of the column, if any, whose near-unique exemption was
+// defeated specifically by the measure-name rule — i.e. it is near-unique, is not identifier-named,
+// and carries a measure-shaped name. Returns "" when no side is in that position.
+//
+// This exists purely so basis can use FEAT-008's required wording for that case ("capped:
+// measure-shaped name (`total`), near-unique exemption does not apply") rather than the generic cap
+// sentence, which would leave a user staring at a near-unique money column with no explanation of
+// why its uniqueness bought it nothing.
+func measureDefeatedExemption(colA, colB domain.Column, rowCountA, rowCountB int64) string {
+	for _, side := range []struct {
+		col      domain.Column
+		rowCount int64
+	}{{colA, rowCountA}, {colB, rowCountB}} {
+		if !identifierNamed(side.col) && nearUnique(side.col, side.rowCount) && measureShaped(side.col) {
+			return side.col.Name
+		}
+	}
+	return ""
 }
 
 // basis renders the plain-language rationale schema.md's CandidateJoin.Basis requires — "a confidence
@@ -183,8 +257,9 @@ func identifierShaped(col domain.Column, rowCount int64) bool {
 //
 // capped adds FEAT-008's required disclosure: when the MEDIUM cap applies, the basis must say so, so
 // a user reading "78% sampled value overlap" is also told why that overlap is not being treated as a
-// strong signal.
-func basis(nameA, nameB string, nameScore, typeScore, overlapPct, cardinalityScore float64, typeA, typeB domain.InferredType, capped bool) string {
+// strong signal. measureName, when non-empty, names the column whose near-unique exemption the
+// measure-name rule specifically defeated, which FEAT-008 requires be stated in those terms.
+func basis(nameA, nameB string, nameScore, typeScore, overlapPct, cardinalityScore float64, typeA, typeB domain.InferredType, capped bool, measureName string) string {
 	var parts []string
 
 	switch {
@@ -206,11 +281,20 @@ func basis(nameA, nameB string, nameScore, typeScore, overlapPct, cardinalitySco
 		parts = append(parts, fmt.Sprintf("%.0f%% sampled value overlap", overlapPct))
 	}
 
-	if cardinalityScore >= 0.9 {
+	// Suppressed when the measure-name rule fired: claiming "consistent with a key" in the same
+	// breath as "the near-unique exemption does not apply" is the exact contradiction the live bug
+	// showed a user — a `total` column scored on uniqueness with that sentence as its justification.
+	if cardinalityScore >= 0.9 && measureName == "" {
 		parts = append(parts, "one side is nearly unique, consistent with a key")
 	}
 
-	if capped {
+	switch {
+	case measureName != "":
+		parts = append(parts, fmt.Sprintf(
+			"capped at medium: measure-shaped name (%q), near-unique exemption does not apply — a "+
+				"money or quantity column having distinct values is not evidence it is a key",
+			measureName))
+	case capped:
 		parts = append(parts,
 			"capped at medium: value overlap only, not an identifier column — two numeric measure "+
 				"columns can overlap by chance, so this is never reported as high confidence")

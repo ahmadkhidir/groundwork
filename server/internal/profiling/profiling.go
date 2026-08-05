@@ -32,24 +32,37 @@ type ColumnStat struct {
 	DistinctCount  int64
 }
 
-// confidence bases per inferred type category. DuckDB's CSV/Excel/SQLite readers already ran their
-// own type sniffing when the file was normalized to Parquet (see ingest/loaders.go); this package
-// reads that decision back out of the Parquet schema via DESCRIBE rather than re-sniffing values
-// itself. What is NOT available from DuckDB is a confidence number for that decision, so this package
-// assigns one heuristically: a boolean/date/timestamp column is a highly distinctive shape (little
-// room for a wrong guess), a numeric column is very likely correct but occasionally an
-// all-numeric-looking string column (e.g. zero-padded IDs) is legitimately a string, and a string
-// column is DuckDB's fallback once every more specific type was tried and rejected — a real
-// conclusion, not "unknown," but the least distinctive of the three. features.md's acceptance
-// criteria require a confidence score without specifying its formula; this heuristic is documented
-// here precisely so it is inspectable and adjustable, not scattered as a magic number.
-var confidenceBaseByType = map[domain.InferredType]float64{
-	domain.TypeBoolean:   0.97,
-	domain.TypeDate:      0.97,
-	domain.TypeTimestamp: 0.97,
-	domain.TypeInteger:   0.92,
-	domain.TypeNumber:    0.92,
-	domain.TypeString:    0.85,
+// nullRatePenalty is how much a fully-null column's confidence is docked. FEAT-005: the agreement
+// rate is "weakened by the column's null rate as before (a mostly-empty column gave the sniffer
+// little to work with)". Tunable without a docs change; named here rather than inlined.
+const nullRatePenalty = 0.2
+
+// confidenceFloor keeps a confidence from being reported as ~0, which reads as "no opinion" rather
+// than the low-but-real opinion it is. FEAT-005 fixes that a floor exists; its value is tunable. It
+// sits inside the LOW band (<0.6) so a floored column still reads LOW to the user.
+const confidenceFloor = 0.4
+
+// stricterThanString are the types DuckDB's sniffer tries and rejects before falling back to VARCHAR,
+// expressed as the SQL types a value would have to coerce to for that rejection to look doubtful.
+// Used only for the string branch of the agreement measure (see agreementExpr).
+//
+// DOUBLE subsumes the integer check: any value that coerces to an integer also coerces to a double,
+// and the string branch only asks "could this have been something stricter?", not which stricter
+// type it would have been.
+var stricterThanString = []string{"DOUBLE", "BOOLEAN", "TIMESTAMP", "DATE"}
+
+// coercionTargetSQL maps schema.md's InferredType enum to the SQL type a value must coerce to for it
+// to count as agreeing with that inference.
+//
+// Integer maps to HUGEINT rather than BIGINT deliberately: DuckDB's integer family runs up to
+// HUGEINT/UHUGEINT, and casting a wide column down to BIGINT would report overflow as type
+// disagreement — a false LOW on a column nothing is actually ambiguous about.
+var coercionTargetSQL = map[domain.InferredType]string{
+	domain.TypeBoolean:   "BOOLEAN",
+	domain.TypeDate:      "DATE",
+	domain.TypeTimestamp: "TIMESTAMP",
+	domain.TypeInteger:   "HUGEINT",
+	domain.TypeNumber:    "DOUBLE",
 }
 
 // Profile computes distinct-value count, null rate, and inferred type for every column in the
@@ -67,7 +80,7 @@ func Profile(ctx context.Context, h Execer, parquetPath string) ([]ColumnStat, e
 		return nil, fmt.Errorf("profiling: %q has no columns to profile", parquetPath)
 	}
 
-	totalRows, nullCounts, distinctCounts, err := aggregateStats(ctx, h, parquetPath, schema)
+	agg, err := aggregateStats(ctx, h, parquetPath, schema)
 	if err != nil {
 		return nil, err
 	}
@@ -75,30 +88,50 @@ func Profile(ctx context.Context, h Execer, parquetPath string) ([]ColumnStat, e
 	stats := make([]ColumnStat, 0, len(schema))
 	for _, col := range schema {
 		var nullRate float64
-		if totalRows > 0 {
-			nullRate = float64(nullCounts[col.name]) / float64(totalRows)
+		if agg.totalRows > 0 {
+			nullRate = float64(agg.nullCounts[col.name]) / float64(agg.totalRows)
 		}
 
-		base := confidenceBaseByType[col.inferredType]
-		if base == 0 {
-			base = 0.5
-		}
-		// Higher null rates weaken confidence in the inferred type: a mostly-empty column gave
-		// DuckDB's sniffer little to go on. Floored so confidence is never reported as ~0.
-		confidence := base - nullRate*0.2
-		if confidence < 0.4 {
-			confidence = 0.4
-		}
-
+		nonNull := agg.totalRows - agg.nullCounts[col.name]
 		stats = append(stats, ColumnStat{
 			Name:           col.name,
 			InferredType:   col.inferredType,
-			TypeConfidence: confidence,
+			TypeConfidence: typeConfidence(agg.agreeCounts[col.name], nonNull, nullRate),
 			NullRate:       nullRate,
-			DistinctCount:  distinctCounts[col.name],
+			DistinctCount:  agg.distinctCounts[col.name],
 		})
 	}
 	return stats, nil
+}
+
+// typeConfidence turns the measured agreement counts into FEAT-005's 0-1 score.
+//
+// FEAT-005 specifies WHAT this number measures — "type-inference agreement across the sampled
+// non-null values, not simply which type the sniffer picked" — because a fixed prior per inferred
+// type (the previous implementation) lands every column in the HIGH band regardless of evidence,
+// which makes the badge on screens/07 report which type was chosen rather than how much evidence
+// there was, and invites skimming the review step that doc calls the highest-risk UX in the product.
+//
+// agreeCount is the number of non-null values that agree with the inferred type; see agreementExpr
+// for how agreement is defined per type. That rate is then weakened by null rate and floored, both
+// of which FEAT-005 keeps.
+//
+// A column with no non-null values at all scores the floor: the sniffer had nothing to work with, so
+// there is no evidence to be confident about.
+func typeConfidence(agreeCount, nonNullCount int64, nullRate float64) float64 {
+	agreement := 0.0
+	if nonNullCount > 0 {
+		agreement = float64(agreeCount) / float64(nonNullCount)
+		if agreement > 1 {
+			agreement = 1
+		}
+	}
+
+	confidence := agreement - nullRate*nullRatePenalty
+	if confidence < confidenceFloor {
+		confidence = confidenceFloor
+	}
+	return confidence
 }
 
 type columnSchema struct {
@@ -140,60 +173,117 @@ func describeColumns(ctx context.Context, h Execer, parquetPath string) ([]colum
 	return out, nil
 }
 
-// aggregateStats runs one combined query computing the total row count plus a null count and an
-// approximate distinct count per column.
-func aggregateStats(ctx context.Context, h Execer, parquetPath string, schema []columnSchema) (int64, map[string]int64, map[string]int64, error) {
-	selectParts := []string{"count(*) AS __total_rows__"}
-	nullAlias := make(map[string]string, len(schema))
-	distinctAlias := make(map[string]string, len(schema))
+// columnAggregates is everything the single combined aggregate query yields, keyed by column name.
+type columnAggregates struct {
+	totalRows      int64
+	nullCounts     map[string]int64
+	distinctCounts map[string]int64
+	// agreeCounts is the number of non-null values in each column that agree with its inferred type,
+	// per agreementExpr — the numerator of FEAT-005's agreement rate.
+	agreeCounts map[string]int64
+}
 
+// agreementExpr builds the SQL aggregate that counts a column's non-null values agreeing with its
+// inferred type — FEAT-005's measure, computed in the engine rather than by pulling values into Go.
+//
+// Two branches, exactly as FEAT-005 specifies:
+//
+//   - boolean/date/timestamp/integer/number: values that coerce to the inferred type without loss.
+//     TRY_CAST yields NULL rather than erroring on failure, which is what makes this expressible as
+//     a FILTER clause inside the existing combined query.
+//   - string: DuckDB's fallback, chosen once every stricter type was tried and rejected. Agreement
+//     is the fraction of values that do NOT also coerce to one of those stricter types. Free text
+//     coerces to none of them and scores 1.0; a mostly-numeric column scores near 0, surfacing the
+//     unresolved ambiguity the sniffer actually had instead of hiding it behind an always-HIGH badge.
+//
+// The inner TRY_CAST to VARCHAR is not redundant. mapDuckDBType routes anything unrecognized — BLOB,
+// STRUCT, LIST — to string, and casting those directly to DOUBLE is a binder error that would fail
+// the whole profiling query rather than returning NULL for that column.
+func agreementExpr(col columnSchema) string {
+	ident := quoteIdent(col.name)
+
+	if target, ok := coercionTargetSQL[col.inferredType]; ok {
+		return fmt.Sprintf("count(*) FILTER (WHERE %s IS NOT NULL AND TRY_CAST(%s AS %s) IS NOT NULL)",
+			ident, ident, target)
+	}
+
+	tests := make([]string, 0, len(stricterThanString))
+	for _, target := range stricterThanString {
+		tests = append(tests, fmt.Sprintf("TRY_CAST(TRY_CAST(%s AS VARCHAR) AS %s) IS NOT NULL", ident, target))
+	}
+	return fmt.Sprintf("count(*) FILTER (WHERE %s IS NOT NULL AND NOT (%s))",
+		ident, strings.Join(tests, " OR "))
+}
+
+// aggregateStats runs one combined query computing the total row count plus a null count, an
+// approximate distinct count, and a type-agreement count per column.
+//
+// Still ONE query, not one per column. FEAT-005 requires profiling to complete before the user's
+// first question, and a per-column coercion query would turn a wide dataset into N sequential round
+// trips through the engine. Because that single scan is already required, the "sample" of non-null
+// values FEAT-005 measures agreement over is the whole column — the largest sample available at no
+// extra round trip. Sample size is explicitly implementation-defined, so narrowing this to a LIMITed
+// subsample later is a local change here.
+func aggregateStats(ctx context.Context, h Execer, parquetPath string, schema []columnSchema) (columnAggregates, error) {
+	var zero columnAggregates
+
+	selectParts := []string{"count(*) AS __total_rows__"}
 	for i, col := range schema {
 		ident := quoteIdent(col.name)
-		nAlias := fmt.Sprintf("__null_%d__", i)
-		dAlias := fmt.Sprintf("__distinct_%d__", i)
-		nullAlias[col.name] = nAlias
-		distinctAlias[col.name] = dAlias
 		selectParts = append(selectParts,
-			fmt.Sprintf("count(*) FILTER (WHERE %s IS NULL) AS %s", ident, nAlias),
-			fmt.Sprintf("approx_count_distinct(%s) AS %s", ident, dAlias),
+			fmt.Sprintf("count(*) FILTER (WHERE %s IS NULL) AS __null_%d__", ident, i),
+			// Exact, NOT approx_count_distinct. HyperLogLog is approximate by construction and was
+			// observed returning 4 for a 5-value DOUBLE column — a 20% error on a trivial input.
+			// That is wrong twice over: schema.md defines distinct_count as "Number of distinct
+			// values in this column" with no notion of approximation and shows it to the user, and
+			// the value feeds FEAT-008's near-unique (>=0.95) identifier test, where a small error
+			// can flip a column between "identifier" and "measure" and change a join's confidence
+			// band. A trust-facing number must not be an estimate. DuckDB computes exact distinct
+			// counts columnar-fast; revisit only with a measured problem on real dataset sizes.
+			fmt.Sprintf("count(DISTINCT %s) AS __distinct_%d__", ident, i),
+			fmt.Sprintf("%s AS __agree_%d__", agreementExpr(col), i),
 		)
 	}
 
 	query := fmt.Sprintf("SELECT %s FROM read_parquet(%s)", strings.Join(selectParts, ", "), sqlQuote(parquetPath))
 	rows, err := h.Query(ctx, query)
 	if err != nil {
-		return 0, nil, nil, fmt.Errorf("profiling: computing column statistics: %w", err)
+		return zero, fmt.Errorf("profiling: computing column statistics: %w", err)
 	}
 	defer rows.Close()
 
 	if !rows.Next() {
-		return 0, nil, nil, fmt.Errorf("profiling: no result returned computing column statistics")
+		return zero, fmt.Errorf("profiling: no result returned computing column statistics")
 	}
 
-	numCols := 1 + 2*len(schema)
+	numCols := 1 + 3*len(schema)
 	dest := make([]any, numCols)
 	ptrs := make([]any, numCols)
 	for i := range dest {
 		ptrs[i] = &dest[i]
 	}
 	if err := rows.Scan(ptrs...); err != nil {
-		return 0, nil, nil, fmt.Errorf("profiling: scanning column statistics: %w", err)
+		return zero, fmt.Errorf("profiling: scanning column statistics: %w", err)
 	}
 	if err := rows.Err(); err != nil {
-		return 0, nil, nil, fmt.Errorf("profiling: reading column statistics: %w", err)
+		return zero, fmt.Errorf("profiling: reading column statistics: %w", err)
 	}
 
-	totalRows := asInt64(dest[0])
-	nullCounts := make(map[string]int64, len(schema))
-	distinctCounts := make(map[string]int64, len(schema))
+	agg := columnAggregates{
+		totalRows:      asInt64(dest[0]),
+		nullCounts:     make(map[string]int64, len(schema)),
+		distinctCounts: make(map[string]int64, len(schema)),
+		agreeCounts:    make(map[string]int64, len(schema)),
+	}
 	idx := 1
 	for _, col := range schema {
-		nullCounts[col.name] = asInt64(dest[idx])
-		distinctCounts[col.name] = asInt64(dest[idx+1])
-		idx += 2
+		agg.nullCounts[col.name] = asInt64(dest[idx])
+		agg.distinctCounts[col.name] = asInt64(dest[idx+1])
+		agg.agreeCounts[col.name] = asInt64(dest[idx+2])
+		idx += 3
 	}
 
-	return totalRows, nullCounts, distinctCounts, nil
+	return agg, nil
 }
 
 // mapDuckDBType maps a DuckDB column type name (as reported by DESCRIBE) to schema.md's

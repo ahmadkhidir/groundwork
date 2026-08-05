@@ -213,6 +213,128 @@ func TestInferDoesNotCapCodeNamedNumericColumns(t *testing.T) {
 	}
 }
 
+// TestInferCapsNearUniqueMeasureNamedJoinAtMedium is the regression for the live false positive that
+// motivated FEAT-008's measure-name rule: an invoice `total` and a payment `amount`, each with 40
+// distinct values over 40 rows, read as near-unique, escaped the cap on that basis alone, and were
+// offered at 0.75 justified as "one side is nearly unique, consistent with a key" — despite
+// `total`/`amount` being exactly what the cap was written for.
+//
+// FEAT-008: a measure-shaped name "cannot claim the near-unique exemption regardless of its actual
+// distinctness... the cap applies even at 100% value-overlap and 100% uniqueness on that side."
+func TestInferCapsNearUniqueMeasureNamedJoinAtMedium(t *testing.T) {
+	handle := acquireTestHandle(t)
+	dir := t.TempDir()
+
+	invoicesPath := filepath.Join(dir, "invoices.parquet")
+	paymentsPath := filepath.Join(dir, "payments.parquet")
+
+	// Identical value sets, 40 distinct values over 40 rows on both sides: 100% overlap and 100%
+	// uniqueness, the strongest signal a measure column can possibly present.
+	writeParquetFixture(t, handle, invoicesPath,
+		`SELECT CAST(v AS DOUBLE) AS total FROM generate_series(1, 40) AS t(v)`)
+	writeParquetFixture(t, handle, paymentsPath,
+		`SELECT CAST(v AS DOUBLE) AS amount FROM generate_series(1, 40) AS t(v)`)
+
+	invoices := DatasetInput{
+		DatasetID: "ds-invoices", ParquetPath: invoicesPath, RowCount: 40,
+		Columns: []domain.Column{
+			{ID: "col-total", Name: "total", InferredType: domain.TypeNumber, DistinctCount: 40},
+		},
+	}
+	payments := DatasetInput{
+		DatasetID: "ds-payments", ParquetPath: paymentsPath, RowCount: 40,
+		Columns: []domain.Column{
+			{ID: "col-amount", Name: "amount", InferredType: domain.TypeNumber, DistinctCount: 40},
+		},
+	}
+
+	candidates, err := Infer(context.Background(), handle, invoices, payments)
+	if err != nil {
+		t.Fatalf("Infer() error = %v", err)
+	}
+
+	found := findCandidate(candidates, "col-total", "col-amount")
+	if found == nil {
+		t.Fatalf("expected the total/amount pair to be evaluated and persisted, got %+v", candidates)
+	}
+	if found.ConfidenceScore > ValueOverlapOnlyCeiling {
+		t.Errorf("confidence_score = %v, want <= %v — a near-unique measure column must not escape the cap",
+			found.ConfidenceScore, ValueOverlapOnlyCeiling)
+	}
+	if !strings.Contains(found.Basis, "measure-shaped name") {
+		t.Errorf("basis = %q, want it to name the measure-name rule as why the near-unique exemption did not apply",
+			found.Basis)
+	}
+	// The contradiction the live bug showed the user: uniqueness cited as key-like evidence on a
+	// column whose uniqueness the rule has just declared meaningless.
+	if strings.Contains(found.Basis, "consistent with a key") {
+		t.Errorf("basis = %q still justifies a capped measure column as key-like", found.Basis)
+	}
+}
+
+// TestMeasureShapedMatchesWholeNamesAndAffixesOnly guards the matching discipline FEAT-008 shares
+// between the identifier and measure lists. `taxonomy` is the trap the doc calls out by name: a
+// substring match would read `tax` inside it and wrongly strip a legitimate column's exemption.
+func TestMeasureShapedMatchesWholeNamesAndAffixesOnly(t *testing.T) {
+	cases := []struct {
+		name string
+		want bool
+	}{
+		{"total", true},
+		{"amount", true},
+		{"line_total", true},
+		{"total_price", true},
+		{"unit_cost", true},
+		{"tax", true},
+		{"tax_rate", true},
+		{"sales_tax", true},
+		{"qty", true},
+		{"discount", true},
+		// Must NOT match — FEAT-008 names all four explicitly.
+		{"taxonomy", false},
+		{"paid", false},
+		{"void", false},
+		{"residual", false},
+		{"customer_id", false},
+		{"reference_number", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := measureShaped(domain.Column{Name: tc.name}); got != tc.want {
+				t.Errorf("measureShaped(%q) = %v, want %v", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestIdentifierShapedMeasureNameDefeatsNearUnique asserts the branch interaction directly: a
+// perfectly unique measure column is not identifier-shaped, while a perfectly unique non-measure
+// column and an identifier-NAMED measure column both still are.
+func TestIdentifierShapedMeasureNameDefeatsNearUnique(t *testing.T) {
+	cases := []struct {
+		label    string
+		column   domain.Column
+		rowCount int64
+		want     bool
+	}{
+		{"fully unique total", domain.Column{Name: "total", DistinctCount: 40}, 40, false},
+		{"fully unique amount", domain.Column{Name: "amount", DistinctCount: 100}, 100, false},
+		{"fully unique invoice_amount", domain.Column{Name: "invoice_amount", DistinctCount: 100}, 100, false},
+		{"fully unique taxonomy is not a measure", domain.Column{Name: "taxonomy", DistinctCount: 100}, 100, true},
+		{"fully unique reference_number", domain.Column{Name: "reference_number", DistinctCount: 100}, 100, true},
+		// An explicit identifier name is the other branch and is unaffected by the measure list.
+		{"total_id is identifier-named", domain.Column{Name: "total_id", DistinctCount: 100}, 100, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.label, func(t *testing.T) {
+			if got := identifierShaped(tc.column, tc.rowCount); got != tc.want {
+				t.Errorf("identifierShaped(%q, distinct=%d/%d) = %v, want %v",
+					tc.column.Name, tc.column.DistinctCount, tc.rowCount, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestIdentifierShapedRecognizesIdKeyAndCodeShapes(t *testing.T) {
 	cases := []struct {
 		name           string
