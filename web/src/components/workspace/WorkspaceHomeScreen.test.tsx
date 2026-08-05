@@ -76,10 +76,23 @@ describe("WorkspaceHomeScreen", () => {
 
   it("polls for live engine status and reflects a waking → ready transition", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
-    getMock
-      .mockResolvedValueOnce({ workspace: workspaceWith(EngineStatus.Sleeping) })
-      .mockResolvedValueOnce({ workspace: workspaceWith(EngineStatus.Waking) })
-      .mockResolvedValue({ workspace: workspaceWith(EngineStatus.Ready) });
+    // Path-dispatched rather than a blind call-order queue: SemanticLayerSummaryPanel (FEAT-019)
+    // now issues its own concurrent api.get for /semantic-layer/summary, which would otherwise
+    // consume one of a sequential .mockResolvedValueOnce chain out of order.
+    let workspaceFetchCount = 0;
+    const workspaceSequence = [
+      workspaceWith(EngineStatus.Sleeping),
+      workspaceWith(EngineStatus.Waking),
+      workspaceWith(EngineStatus.Ready),
+    ];
+    getMock.mockImplementation(async (path: string) => {
+      if (path.includes("/semantic-layer/summary")) {
+        return { relationship_count: 0, metric_definition_count: 0 };
+      }
+      const workspace = workspaceSequence[Math.min(workspaceFetchCount, workspaceSequence.length - 1)];
+      workspaceFetchCount += 1;
+      return { workspace };
+    });
 
     render(<WorkspaceHomeScreen workspaceId="ws-1" />);
     await vi.waitFor(() => expect(screen.getByText("Sleeping")).toBeInTheDocument());
@@ -90,13 +103,19 @@ describe("WorkspaceHomeScreen", () => {
     await vi.advanceTimersByTimeAsync(10_000);
     await vi.waitFor(() => expect(screen.getByText("Ready")).toBeInTheDocument());
 
-    expect(getMock).toHaveBeenCalledTimes(3);
+    expect(workspaceFetchCount).toBe(3);
   });
 
   it("keeps the last-known status visible if a later poll fails, rather than erroring out", async () => {
-    getMock
-      .mockResolvedValueOnce({ workspace: workspaceWith(EngineStatus.Ready) })
-      .mockRejectedValueOnce(new ApiError(500, "Transient"));
+    let workspaceFetchCount = 0;
+    getMock.mockImplementation(async (path: string) => {
+      if (path.includes("/semantic-layer/summary")) {
+        return { relationship_count: 0, metric_definition_count: 0 };
+      }
+      workspaceFetchCount += 1;
+      if (workspaceFetchCount === 1) return { workspace: workspaceWith(EngineStatus.Ready) };
+      throw new ApiError(500, "Transient");
+    });
 
     vi.useFakeTimers({ shouldAdvanceTime: true });
     render(<WorkspaceHomeScreen workspaceId="ws-1" />);
@@ -118,13 +137,23 @@ describe("WorkspaceHomeScreen", () => {
     expect(screen.getByText("Asking questions arrives in Phase 2 (FEAT-013).")).toBeInTheDocument();
   });
 
-  it("renders the honest empty state for recent reports and the semantic layer summary", async () => {
-    getMock.mockResolvedValue({ workspace: workspaceWith(EngineStatus.Ready) });
+  it("renders the honest empty state for recent reports and the real semantic layer summary counts", async () => {
+    // FEAT-019 landed GET /v1/workspaces/:id/semantic-layer/summary — distinguish it from the
+    // workspace fetch by path so SemanticLayerSummaryPanel gets its own real response shape rather
+    // than the workspace object.
+    getMock.mockImplementation(async (path: string) => {
+      if (path.includes("/semantic-layer/summary")) {
+        return { relationship_count: 12, metric_definition_count: 4 };
+      }
+      return { workspace: workspaceWith(EngineStatus.Ready) };
+    });
     render(<WorkspaceHomeScreen workspaceId="ws-1" />);
 
     await waitFor(() => expect(screen.getByText("Q3 Numbers")).toBeInTheDocument());
     expect(screen.getByText("Your reports will appear here.")).toBeInTheDocument();
-    expect(screen.getByText("Not built yet")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getByText("12 relationships, 4 metric definitions")).toBeInTheDocument(),
+    );
   });
 
   it("links Upload data to the File Upload screen", async () => {

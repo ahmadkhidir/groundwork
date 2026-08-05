@@ -90,6 +90,14 @@ func run(logger *slog.Logger) error {
 	columnRepo := postgres.NewColumnRepository(pool)
 	candidateJoinRepo := postgres.NewCandidateJoinRepository(pool)
 	relationshipRepo := postgres.NewRelationshipRepository(pool)
+
+	// FEAT-019 (Semantic Layer Storage). relationshipRepo above already satisfies
+	// api.SemanticRelationshipStore — same underlying table, wider interface — so it is reused
+	// rather than constructed twice.
+	metricDefinitionRepo := postgres.NewMetricDefinitionRepository(pool)
+	correctionRepo := postgres.NewCorrectionRepository(pool)
+	semanticSummaryRepo := postgres.NewSemanticSummaryRepository(pool)
+
 	ingestTracker := ingest.NewTracker()
 	ingestPipeline := ingest.NewPipeline(
 		datasetRepo, objectStore, engineProvider, columnRepo, candidateJoinRepo, ingestTracker, logger)
@@ -122,6 +130,12 @@ func run(logger *slog.Logger) error {
 
 		EngineProvider: engineProvider,
 		EngineDatasets: datasetRepo,
+
+		// FEAT-019: semantic layer storage. screens/15-semantic-layer.md, screens/04-workspace-home.md.
+		SemanticRelationships: relationshipRepo,
+		SemanticMetrics:       metricDefinitionRepo,
+		SemanticCorrections:   correctionRepo,
+		SemanticSummary:       semanticSummaryRepo,
 	}
 
 	server := &http.Server{

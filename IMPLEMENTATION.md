@@ -356,13 +356,38 @@ loaded via `next/font` and bound to `--font-display`, `--font-body`, `--font-mon
 |---|---|---|
 | **A — Foundation** | Scaffold, theme tokens, schema entities, auth, routing skeleton, docker-compose | **Complete** |
 | **1 — Foundation: Workspace, Ingest & Trust** | FEAT-001 ✅ 002 ✅ 003 ✅ 004 ✅ 005 ✅ 006 ✅ 007 ✅ 008 ✅ 009 ✅ 011 ✅ 042 ✅ 044 ✅ | **Complete** — 5 waves + a spec-alignment pass against docs `c2bc326` |
-| **2 — Core Grounded Answer Loop** | FEAT-013, 014, 015, 016, 017, 018, 019, 020 | Not started |
+| **2 — Core Grounded Answer Loop** | FEAT-013, 014, 015, 016, 017, 018, 019 ✅, 020 | In progress — FEAT-019 landed this wave |
 | **3 — Trust & Observability** | FEAT-022, 023, 024, 027, 028, 029, 030 | Not started |
 | **4 — Reports & Delivery** | FEAT-034, 035, 036, 041, 043 | Not started |
 | **5 — Polish & Expansion** | FEAT-010, 012, 021, 025, 026, 031, 032, 033, 037, 038, 039, 040, 045, 046, 047 | Not started |
 
-> **Current authorized scope: Foundation + Phase 1 only.** Phases 2–5 are documented but not
-> authorized for implementation. Do not begin a later phase without explicit approval.
+> **Current authorized scope: Foundation + Phases 1 and 2** (user-approved 2026-08-05, along with
+> the four phase-boundary assumptions recorded under "Phase 2 boundary assumptions" below). Phases
+> 3–5 are documented but not authorized. Do not begin a later phase without explicit approval.
+>
+> **FEAT-019 (Semantic Layer Storage) landed in Phase 2's Wave 1**, as a solo pass (no parallel
+> dispatch) — see the "FEAT-019 — Semantic Layer Storage" note below for what shipped and what it
+> deliberately left for FEAT-013/FEAT-020.
+
+### Phase 2 boundary assumptions (user-approved 2026-08-05)
+
+Four Phase 2 features lean on capabilities `roadmap.md` schedules for Phase 3+. These are the
+agreed Phase 2 behaviours — each is a deliberate boundary, not a gap to be quietly filled:
+
+| Forward reference | Phase 2 behaviour |
+|---|---|
+| FEAT-023 live event stream (P3) | Run Viewer **polls** run/steps. A stream replaces the transport later, not the model. |
+| FEAT-022 resumable DAG (P3) | A **linear persisted executor** writing real `runs`/`steps` rows per schema.md. No leases, heartbeats, or forks. |
+| FEAT-024 halt/amend/resume (P3) | FEAT-018's edited SQL starts a **new run** carrying the user's SQL as `generate_sql` output. |
+| FEAT-033 honest uncertainty (P5) | An ambiguous question **fails the run with a plain message** — FEAT-013's AC forbids a best-effort guess. |
+
+`Report` requires `provenance_links` and `reconciliation_summary`, but FEAT-029/030 produce them in
+Phase 3. Phase 2 persists an empty links array and a `rows_out` the executor actually measures —
+never a fabricated `rows_in`.
+
+**Model provider:** Anthropic Go SDK, model `anthropic.ModelClaudeHaiku4_5` (`claude-haiku-4-5`),
+chosen for cost and changeable in one place. `ANTHROPIC_API_KEY` comes from the environment via
+`internal/config` — never hardcoded, never committed.
 >
 > **Phase 1 is functionally complete as of Wave 5** — every listed feature is implemented and green.
 > A full pipeline pass (upload → provisioning → loading → profiling → PII flagging → relationship
@@ -447,6 +472,49 @@ you reintroduce a skew that passes locally and fails in CI.
 The Windows binary loads `duckdb.dll` at run time. Without it on PATH the process exits **127**
 (or `0xc0000135`) with no output at all — a silent failure that resembles a crash, not a missing
 library. `make` puts it on PATH; running the binary by hand needs it there too.
+
+### FEAT-019 — Semantic Layer Storage (Phase 2, this wave)
+
+**What shipped:**
+
+- `server/internal/store/postgres/relationships.go` — extended (Phase 1's Create-only
+  `RelationshipRepository`) with `ListByWorkspace`, `GetByIDForWorkspace`, and `Update`
+  (cardinality/grain_notes). Same `relationships` table FEAT-009 already writes into; no new table.
+- `server/internal/store/postgres/metric_definitions.go` (new) — full CRUD over
+  `metric_definitions` (already a table since migration `00001`, unused until now).
+- `server/internal/store/postgres/corrections.go` (new) + `server/migrations/00005_semantic_layer.sql`
+  (new table, the only new table this wave — `corrections`, with `originating_run_id` FK
+  `ON DELETE SET NULL`) — Create + read side only; FEAT-020 (later wave) captures rows.
+- `server/internal/store/postgres/semantic.go` (new) — `SemanticSummaryRepository`, cheap counts for
+  the workspace-home summary panel.
+- `server/internal/semantic/grounding.go` (new package) — `AssembleGroundingContext`, the exported,
+  fully-tested building block FEAT-019 AC2 requires. **Not called by anything yet** — FEAT-013
+  (Phase 2, next wave, the first feature to build a model payload) is the intended caller. Signature:
+  `AssembleGroundingContext(ctx, workspaceID, RelationshipLister, MetricDefinitionLister, CorrectionLister) (GroundingContext, error)`,
+  returning `{WorkspaceID, Relationships []RelationshipGrounding, Metrics []MetricGrounding, Corrections []CorrectionGrounding}`.
+  Deliberately excludes `Correction.OriginalLogic` from the payload shape (see the package doc).
+- `server/internal/api/semantic.go` (new) — `GET/PATCH .../semantic-layer/relationships[/:id]`,
+  full CRUD `.../semantic-layer/metrics[/:id]`, `GET .../semantic-layer/corrections`,
+  `GET .../semantic-layer/summary`. Wired into `api.go`'s `Dependencies` and `cmd/api/main.go`.
+- `web/src/components/semantic/` (new) — `SemanticLayerScreen`, `RelationshipsTab` (+
+  `RelationshipEditor`), `MetricDefinitionsTab` (+ `MetricDefinitionEditor`), `CorrectionsTab`.
+  Replaces the screen 15 placeholder. `web/src/components/workspace/SemanticLayerSummaryPanel.tsx`
+  now calls the real summary endpoint instead of showing "Not built yet".
+
+**Reported doc gaps/assumptions (routed to product-shaper, not fixed in code):**
+
+- `screens/15-semantic-layer.md`'s Relationships tab lists "confidence, status (confirmed/rejected)"
+  as columns, but schema.md's `Relationship` entity has neither field (those belong to
+  `CandidateJoin`). Implemented using only what `Relationship` actually carries; every row is
+  definitionally "confirmed" since a `Relationship` only exists once accepted.
+- Metric definition **creation** (not just editing) was built as an in-scope assumption under this
+  wave's "full CRUD" grant — screens/15 documents editing an existing definition explicitly but shows
+  no "add new metric" affordance in as many words. Flagged in `createMetricDefinitionRequest`'s doc
+  comment in `semantic.go`.
+
+**Left unimplemented, on purpose:** any model call, run, or step consuming the grounding context
+(FEAT-013, next wave); capturing a correction during a run, and editing/removing a stored correction
+(FEAT-020, later wave — the Corrections tab's Empty state is therefore expected, not a bug).
 
 ## 8. Key Commands
 

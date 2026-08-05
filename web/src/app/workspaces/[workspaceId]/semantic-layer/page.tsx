@@ -1,5 +1,5 @@
 import type { Metadata } from "next";
-import { PlaceholderScreen } from "@/components/PlaceholderScreen";
+import { SemanticLayerScreen } from "@/components/semantic/SemanticLayerScreen";
 
 export const metadata: Metadata = { title: "Semantic layer" };
 
@@ -8,13 +8,5 @@ export default async function Page(props: PageProps<"/workspaces/[workspaceId]/s
   // params is a Promise in Next 16; synchronous access was removed.
   const params = await props.params;
 
-  return (
-    <PlaceholderScreen
-      screen="15 — Semantic Layer"
-      spec="screens/15-semantic-layer.md"
-      features="FEAT-022, FEAT-023, FEAT-024"
-      phase="Phase 3"
-      params={params}
-    />
-  );
+  return <SemanticLayerScreen workspaceId={params.workspaceId} />;
 }

@@ -84,6 +84,17 @@ type Dependencies struct {
 	// single-workspace GET. Same DatasetRepository as the seams above, narrowed to one existence
 	// question.
 	EngineDatasets WorkspaceDatasetPresence
+
+	// SemanticRelationships, SemanticMetrics, SemanticCorrections, and SemanticSummary back FEAT-019
+	// (Semantic Layer Storage) — screens/15-semantic-layer.md's three tabs and
+	// screens/04-workspace-home.md's summary panel. SemanticRelationships is a wider seam over the
+	// SAME relationships table Relationships (above) writes into on candidate-join accept; see
+	// semantic.go's doc comment for why the read/edit surface extends that repository rather than
+	// duplicating it.
+	SemanticRelationships SemanticRelationshipStore
+	SemanticMetrics       SemanticMetricDefinitionStore
+	SemanticCorrections   SemanticCorrectionStore
+	SemanticSummary       SemanticSummaryStore
 }
 
 // Server wires configuration and dependencies into an http.Handler.
@@ -187,6 +198,15 @@ func (s *Server) routes() {
 				// FEAT-011: engine sleep/wake lifecycle and honest status.
 				if s.deps.EngineProvider != nil && s.deps.EngineDatasets != nil {
 					RegisterEngineRoutes(r, s.deps.Workspaces, s.deps.EngineProvider, s.deps.EngineDatasets, s.logger)
+				}
+
+				// FEAT-019: semantic layer storage — relationships read/edit, metric definition CRUD,
+				// corrections read, and the workspace-home summary panel.
+				// screens/15-semantic-layer.md, screens/04-workspace-home.md.
+				if s.deps.SemanticRelationships != nil && s.deps.SemanticMetrics != nil &&
+					s.deps.SemanticCorrections != nil && s.deps.SemanticSummary != nil {
+					RegisterSemanticRoutes(r, s.deps.Workspaces, s.deps.SemanticRelationships,
+						s.deps.SemanticMetrics, s.deps.SemanticCorrections, s.deps.SemanticSummary, s.logger)
 				}
 			})
 		}
