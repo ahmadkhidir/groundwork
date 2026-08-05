@@ -65,11 +65,15 @@ and `pg` were removed for this reason; do not reintroduce them.
 for every Go build and test run that includes it. Fully static binaries are not available. Accepted
 constraint — see `risk_log.md` R-010.
 
-> **Current state:** the DuckDB driver is **not yet a dependency.** Foundation defines the Engine
-> Provider seam (`server/internal/engine`) as an interface only; the local-process DuckDB
-> implementation lands with FEAT-004 in Phase 1. Until then `go build`/`go test` run with
-> `CGO_ENABLED=0` and need no C toolchain. The machine this was scaffolded on has no C compiler, so
-> **a compiler must be installed before FEAT-004 starts** (Windows: MSYS2/mingw-w64 or TDM-GCC).
+> **Current state (updated 2026-08-05):** the toolchain is **installed and verified** — MSYS2
+> `ucrt64` GCC 16.1.0, `CGO_ENABLED=1`, official DuckDB 1.5.5 C library. Verified end to end
+> against the real workload: CSV type sniffing, Parquet write with null preservation, and a
+> persistent database file. `server/go.mod` requires `duckdb-go/v2` and the whole suite builds and
+> passes with cgo on.
+>
+> `server/internal/engine` is still an **interface only** — the local-process DuckDB implementation
+> lands with FEAT-004. Build through `make` (§8), never bare `go` commands, or the Windows link
+> fails.
 
 ## 3. Project Structure
 
@@ -388,6 +392,23 @@ current implementation does not, which is a second reason this needs revisiting 
 Update this table at each phase checkpoint. It is how anyone tells what exists in the codebase from
 what is only documented.
 
+### Known divergences — dev environment vs. production
+
+| Divergence | Detail |
+|---|---|
+| **Windows dev links DuckDB dynamically; Linux/CI/production link statically** | Windows builds use `-tags duckdb_use_lib` against the official DuckDB 1.5.5 DLL (§8). Linux uses the static libraries bundled in `duckdb-go-bindings`. |
+
+Accepted deliberately on 2026-08-05 — the static path **cannot** link under any MSYS2 toolchain, for
+a reason no install fixes (see §8). **Only the linkage differs.** The DuckDB version is identical on
+both sides — 1.5.5, matching `duckdb-go v2.10505.0` — because the dev library is pinned to the exact
+version the driver targets rather than to whatever a package manager happens to ship. Keep it that
+way: if the driver is upgraded, bump `DUCKDB_DIR` in `server/Makefile` and re-download to match, or
+you reintroduce a skew that passes locally and fails in CI.
+
+The Windows binary loads `duckdb.dll` at run time. Without it on PATH the process exits **127**
+(or `0xc0000135`) with no output at all — a silent failure that resembles a crash, not a missing
+library. `make` puts it on PATH; running the binary by hand needs it there too.
+
 ## 8. Key Commands
 
 **Docs submodule**
@@ -405,18 +426,60 @@ docker compose down -v               # Tear down, including volumes
 ```
 
 **Backend (`server/`)**
+
+**Use `make`, not bare `go` commands.** From FEAT-004 the DuckDB driver requires cgo, and Windows
+requires different linkage than Linux. `server/Makefile` encodes that; a bare `go build` on Windows
+fails at link time with an error that reads like a compiler bug (see below).
+
 ```bash
-# cgo is not required until the DuckDB driver lands with FEAT-004; prefix these with
-# CGO_ENABLED=1 from that point on.
-go build ./...                       # Build
-go run ./cmd/api                     # Run the API service
-go test ./...                        # Test
-go test -race ./...                  # Test with race detector
-gofmt -l . && go vet ./...           # Format check + vet
+make doctor                          # Diagnose the toolchain — run this FIRST if a build fails
+make build                           # Build
+make run                             # Run the API service
+make test                            # Test
+make test-race                       # Test with race detector
+make fmt                             # gofmt check (reports; never rewrites)
+make check                           # fmt + vet + test — what CI runs
 goose -dir migrations postgres "$DATABASE_URL" up      # Apply migrations
 goose -dir migrations postgres "$DATABASE_URL" down    # Roll back one
 goose -dir migrations create <name> sql                # New migration
 ```
+
+**Windows prerequisites** (Linux/macOS need none of this — they use the bundled static libraries,
+as do CI and production):
+
+```bash
+# 1. C toolchain
+winget install -e --id MSYS2.MSYS2
+C:/msys64/usr/bin/pacman.exe -S --needed mingw-w64-ucrt-x86_64-gcc
+# Add C:\msys64\ucrt64\bin to your user PATH, then:
+go env -w CGO_ENABLED=1
+
+# 2. DuckDB C library — the OFFICIAL release, version-matched to the driver
+DD="$USERPROFILE/.local/duckdb/1.5.5"; mkdir -p "$DD"
+curl -sSL -o /tmp/libduckdb.zip \
+  https://github.com/duckdb/duckdb/releases/download/v1.5.5/libduckdb-windows-amd64.zip
+unzip -o -q /tmp/libduckdb.zip -d "$DD"
+cp "$DD/duckdb.dll" "$DD/libduckdb.dll"   # `-lduckdb` resolves against the DLL directly
+
+# 3. Verify
+cd server && make doctor
+```
+
+**Do NOT install `mingw-w64-ucrt-x86_64-duckdb`, and remove it if present**
+(`pacman -R mingw-w64-ucrt-x86_64-duckdb`). It is version-behind (1.4.4 vs the 1.5.5 the driver
+targets) and installs into the compiler's *default* search path, so the driver's own
+`#cgo LDFLAGS: -lduckdb` finds it even with no `-L` pointing there. The binary then imports **both**
+DuckDB runtimes and binds symbols from whichever the loader reaches first — it links, it runs, and
+`SELECT version()` quietly reports the wrong one. `make doctor` checks for this explicitly.
+
+Installing gcc alone is not enough — `CGO_ENABLED` is cached in `go env` and stays `0`, so builds
+keep failing with "C source files not allowed when not using cgo" while gcc sits on PATH.
+
+If a Windows link fails with `undefined reference to __emutls_v._ZSt11__once_call`, you invoked
+`go` directly instead of `make`. That symbol is an ABI mismatch, not a missing package: the
+bundled static libs were built by a **win32-threads** GCC (emulated TLS), while MSYS2's GCC is
+`--enable-threads=posix --enable-tls` and its libstdc++ defines no such symbol. No additional
+install fixes it; the `duckdb_use_lib` linkage in the Makefile is the fix.
 
 **Web (`web/`)**
 ```bash
