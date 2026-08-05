@@ -176,6 +176,11 @@ func (f *fakeColumnStore) countAll() int {
 type fakeCandidateJoinStore struct {
 	mu    sync.Mutex
 	joins []domain.CandidateJoin
+	// rejectedNamePairs records (filenameA, columnA, filenameB, columnB) tuples tests want
+	// ExistsRejectedForNamePair to report as previously rejected. domain.CandidateJoin itself only
+	// carries column ids, not the dataset-filename/column-name pairs the real Postgres implementation
+	// resolves via a join through columns/datasets, so this is tracked separately here.
+	rejectedNamePairs [][4]string
 }
 
 func newFakeCandidateJoinStore() *fakeCandidateJoinStore {
@@ -195,6 +200,28 @@ func (f *fakeCandidateJoinStore) ExistsForPair(ctx context.Context, columnAID, c
 	for _, j := range f.joins {
 		if (j.SourceColumnID == columnAID && j.TargetColumnID == columnBID) ||
 			(j.SourceColumnID == columnBID && j.TargetColumnID == columnAID) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// markRejectedByName records that (filenameA, columnA) / (filenameB, columnB) was rejected, for
+// tests exercising ExistsRejectedForNamePair.
+func (f *fakeCandidateJoinStore) markRejectedByName(filenameA, columnA, filenameB, columnB string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rejectedNamePairs = append(f.rejectedNamePairs, [4]string{filenameA, columnA, filenameB, columnB})
+}
+
+func (f *fakeCandidateJoinStore) ExistsRejectedForNamePair(ctx context.Context, workspaceID, filenameA, columnA, filenameB, columnB string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, p := range f.rejectedNamePairs {
+		if p[0] == filenameA && p[1] == columnA && p[2] == filenameB && p[3] == columnB {
+			return true, nil
+		}
+		if p[0] == filenameB && p[1] == columnB && p[2] == filenameA && p[3] == columnA {
 			return true, nil
 		}
 	}
@@ -349,6 +376,120 @@ func TestPipelineInfersCandidateJoinsAcrossTwoFiles(t *testing.T) {
 	if got := columns.countAll(); got != 4 {
 		t.Errorf("total profiled columns across both datasets = %d, want 4 (2 + 2)", got)
 	}
+}
+
+func TestPipelineFlagsPIIColumnsAtIngest(t *testing.T) {
+	ws, dsID := "ws-pii", "ds-pii"
+	ds := domain.Dataset{
+		ID: dsID, WorkspaceID: ws, OriginalFilename: "customers.csv",
+		Format: domain.FormatCSV, IngestStatus: domain.IngestPending,
+	}
+
+	datasets := newFakeDatasetStore(ds)
+	objects := newFakeObjectStore()
+	objects.objects["workspaces/ws-pii/datasets/ds-pii/original/customers.csv"] = []byte(
+		"customer_id,email,order_total\n1,ada@example.com,42.5\n2,grace@example.com,10\n3,alan@example.com,7.25\n",
+	)
+
+	pipeline, columns, _, _ := newTestPipeline(datasets, objects)
+	pipeline.Start(dsID)
+	final := waitForTerminalStatus(t, datasets, dsID)
+	if final.IngestStatus != domain.IngestComplete {
+		t.Fatalf("ingest_status = %q, want %q", final.IngestStatus, domain.IngestComplete)
+	}
+
+	cols, err := columns.ListByDataset(context.Background(), dsID)
+	if err != nil {
+		t.Fatalf("listing columns: %v", err)
+	}
+
+	var email domain.Column
+	var foundEmail bool
+	for _, c := range cols {
+		if c.Name == "email" {
+			email, foundEmail = c, true
+		}
+		if c.Name == "order_total" && c.PIIFlag {
+			t.Errorf("order_total should not be flagged as PII: %+v", c)
+		}
+	}
+	if !foundEmail {
+		t.Fatal("expected an 'email' column among the profiled columns")
+	}
+	if !email.PIIFlag || email.PIIPattern != "email" {
+		t.Errorf("email column = %+v, want flagged with pattern %q", email, "email")
+	}
+}
+
+func TestPipelineNeverResurrectsARejectedJoinOnReIngestOfSameFiles(t *testing.T) {
+	ws := "ws-3"
+	dsA := domain.Dataset{
+		ID: "ds-a1", WorkspaceID: ws, OriginalFilename: "customers.csv",
+		Format: domain.FormatCSV, IngestStatus: domain.IngestPending,
+	}
+	dsB := domain.Dataset{
+		ID: "ds-b1", WorkspaceID: ws, OriginalFilename: "orders.csv",
+		Format: domain.FormatCSV, IngestStatus: domain.IngestPending,
+	}
+
+	datasets := newFakeDatasetStore(dsA, dsB)
+	objects := newFakeObjectStore()
+	objects.objects["workspaces/ws-3/datasets/ds-a1/original/customers.csv"] = []byte(
+		"customer_id,name\n1,Ada\n2,Grace\n3,Alan\n",
+	)
+	objects.objects["workspaces/ws-3/datasets/ds-b1/original/orders.csv"] = []byte(
+		"order_id,customer_id\n100,1\n101,2\n102,1\n",
+	)
+
+	pipeline, columns, joins, _ := newTestPipeline(datasets, objects)
+
+	// Simulate the user having already rejected the customer_id <-> customer_id join in a PRIOR
+	// ingest of these same two files — recorded by (filename, column name), the only identity that
+	// survives a re-ingest, which always produces brand new dataset and column ids.
+	joins.markRejectedByName("customers.csv", "customer_id", "orders.csv", "customer_id")
+
+	pipeline.Start(dsA.ID)
+	waitForTerminalStatus(t, datasets, dsA.ID)
+	pipeline.Start(dsB.ID)
+	final := waitForTerminalStatus(t, datasets, dsB.ID)
+
+	if final.IngestStatus != domain.IngestComplete {
+		t.Fatalf("ingest_status = %q, want %q", final.IngestStatus, domain.IngestComplete)
+	}
+
+	// Resolve the actual column ids this run assigned to each file's "customer_id" column — this test
+	// only asserts that THAT SPECIFIC previously-rejected pair stays absent; the same data can also
+	// produce other, weaker candidates (e.g. between customer_id and order_id) that this test is not
+	// about and must not fail on.
+	colsA, err := columns.ListByDataset(context.Background(), dsA.ID)
+	if err != nil {
+		t.Fatalf("listing dsA columns: %v", err)
+	}
+	colsB, err := columns.ListByDataset(context.Background(), dsB.ID)
+	if err != nil {
+		t.Fatalf("listing dsB columns: %v", err)
+	}
+	customerIDInA := findColumnID(t, colsA, "customer_id")
+	customerIDInB := findColumnID(t, colsB, "customer_id")
+
+	for _, cj := range joins.all() {
+		if (cj.SourceColumnID == customerIDInA && cj.TargetColumnID == customerIDInB) ||
+			(cj.SourceColumnID == customerIDInB && cj.TargetColumnID == customerIDInA) {
+			t.Errorf("the previously-rejected customer_id<->customer_id join must not be resurrected on re-ingest of the same files, got: %+v", cj)
+		}
+	}
+}
+
+// findColumnID returns the id of the column named name within cols, failing the test if none matches.
+func findColumnID(t *testing.T, cols []domain.Column, name string) string {
+	t.Helper()
+	for _, c := range cols {
+		if c.Name == name {
+			return c.ID
+		}
+	}
+	t.Fatalf("no column named %q found among %+v", name, cols)
+	return ""
 }
 
 func TestPipelineSerializesRelationshipInferenceAcrossConcurrentSiblings(t *testing.T) {

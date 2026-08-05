@@ -56,6 +56,19 @@ type Dependencies struct {
 	Columns           ProfilingColumnStore
 	CandidateJoins    ProfilingCandidateJoinStore
 
+	// ConfirmationDatasets, ConfirmationColumns, ConfirmationCandidateJoins, and Relationships back
+	// screens/07-ingest-confirmation.md's write endpoints — FEAT-006 (type override), FEAT-007 (PII
+	// flag override), and FEAT-009 (candidate join accept/reject). Distinct fields from
+	// ProfilingDatasets/Columns/CandidateJoins above for the same reason those are distinct from
+	// Datasets/IngestDatasets: each interface here is intentionally narrower than the concrete
+	// repository (e.g. ConfirmationColumnStore adds UpdateInferredType/UpdatePII that
+	// ProfilingColumnStore has no reason to expose), even though one ColumnRepository,
+	// DatasetRepository, and CandidateJoinRepository instance satisfies all of them.
+	ConfirmationDatasets       ConfirmationDatasetStore
+	ConfirmationColumns        ConfirmationColumnStore
+	ConfirmationCandidateJoins ConfirmationCandidateJoinStore
+	Relationships              ConfirmationRelationshipStore
+
 	// EngineProvider backs FEAT-011's honest engine status. Deliberately typed as the narrow
 	// EngineStatusProvider rather than *engine.LocalProvider: the handler only ever reads Status, and
 	// architecture.md's Engine Provider seam exists so a later non-DuckDB implementation can be
@@ -149,6 +162,14 @@ func (s *Server) routes() {
 				// FEAT-005 / FEAT-008: profiling statistics and inferred candidate joins.
 				if s.deps.ProfilingDatasets != nil && s.deps.Columns != nil && s.deps.CandidateJoins != nil {
 					RegisterProfilingRoutes(r, s.deps.Workspaces, s.deps.ProfilingDatasets, s.deps.Columns, s.deps.CandidateJoins, s.logger)
+				}
+
+				// FEAT-006 / FEAT-007 / FEAT-009: ingest confirmation — type review, PII flag review,
+				// and candidate join accept/reject. screens/07-ingest-confirmation.md.
+				if s.deps.ConfirmationDatasets != nil && s.deps.ConfirmationColumns != nil &&
+					s.deps.ConfirmationCandidateJoins != nil && s.deps.Relationships != nil {
+					RegisterConfirmationRoutes(r, s.deps.Workspaces, s.deps.ConfirmationDatasets,
+						s.deps.ConfirmationColumns, s.deps.ConfirmationCandidateJoins, s.deps.Relationships, s.logger)
 				}
 
 				// FEAT-011: engine sleep/wake lifecycle and honest status.

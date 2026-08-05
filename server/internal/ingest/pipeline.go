@@ -26,6 +26,7 @@ import (
 
 	"github.com/ahmadkhidir/groundwork/server/internal/domain"
 	"github.com/ahmadkhidir/groundwork/server/internal/engine"
+	"github.com/ahmadkhidir/groundwork/server/internal/pii"
 	"github.com/ahmadkhidir/groundwork/server/internal/profiling"
 	"github.com/ahmadkhidir/groundwork/server/internal/relationships"
 	"github.com/ahmadkhidir/groundwork/server/internal/storage"
@@ -72,9 +73,18 @@ type ColumnStore interface {
 type CandidateJoinStore interface {
 	Create(ctx context.Context, cj domain.CandidateJoin) error
 	// ExistsForPair reports whether a candidate already exists between two columns, in either
-	// direction — see CandidateJoinRepository.ExistsForPair's doc comment for why this guards both
-	// duplicate inserts and reintroducing a rejected join.
+	// direction, matched by COLUMN ID — this guards against a duplicate insert for the same pair
+	// within the same set of datasets (e.g. the pipeline re-running against an already-profiled
+	// sibling).
 	ExistsForPair(ctx context.Context, columnAID, columnBID string) (bool, error)
+	// ExistsRejectedForNamePair reports whether a candidate join between two columns identified by
+	// (dataset original filename, column name) — in either direction — was ever rejected in this
+	// workspace. Matched by NAME rather than id: a later ingest of "the same files" (FEAT-009's
+	// phrasing) creates entirely new Dataset and Column rows with new ids, so ExistsForPair alone
+	// would silently forget a rejection the moment the user re-uploads. This is what makes FEAT-009's
+	// "never silently reintroduced... with the same files" guarantee survive a re-ingest, not merely
+	// a single session.
+	ExistsRejectedForNamePair(ctx context.Context, workspaceID, filenameA, columnA, filenameB, columnB string) (bool, error)
 }
 
 // Pipeline turns one pending Dataset into normalized, durable, profiled Parquet, inferring candidate
@@ -228,8 +238,9 @@ func (p *Pipeline) run(ctx context.Context, ds domain.Dataset) {
 	)
 }
 
-// profileAndStore runs FEAT-005's profiling over the dataset's normalized Parquet and persists the
-// resulting Column rows, returning them so relationship inference can use them without a re-fetch.
+// profileAndStore runs FEAT-005's profiling over the dataset's normalized Parquet, runs FEAT-007's
+// PII detection over the resulting columns, and persists the combined Column rows — returning them so
+// relationship inference can use them without a re-fetch.
 func (p *Pipeline) profileAndStore(ctx context.Context, handle engine.Handle, ds domain.Dataset, localParquetPath string) ([]domain.Column, error) {
 	stats, err := profiling.Profile(ctx, handle, localParquetPath)
 	if err != nil {
@@ -237,18 +248,30 @@ func (p *Pipeline) profileAndStore(ctx context.Context, handle engine.Handle, ds
 		return nil, errors.New("could not profile the uploaded data. Try again.")
 	}
 
+	piiInputs := make([]pii.ColumnInput, 0, len(stats))
+	for _, s := range stats {
+		piiInputs = append(piiInputs, pii.ColumnInput{Name: s.Name, InferredType: s.InferredType})
+	}
+	piiResults, err := pii.DetectAll(ctx, handle, localParquetPath, piiInputs)
+	if err != nil {
+		p.logger.Error("ingest: pii detection", slog.String("dataset_id", ds.ID), slog.String("error", err.Error()))
+		return nil, errors.New("could not screen the uploaded data for sensitive columns. Try again.")
+	}
+
 	cols := make([]domain.Column, 0, len(stats))
 	for _, s := range stats {
+		result := piiResults[s.Name] // zero value (unflagged) if DetectAll somehow omitted this name
 		cols = append(cols, domain.Column{
 			ID:             uuid.NewString(),
 			DatasetID:      ds.ID,
 			Name:           s.Name,
 			InferredType:   s.InferredType,
 			TypeConfidence: s.TypeConfidence,
-			// PII detection (FEAT-007) is a separate feature, out of this pipeline's scope; every
-			// column starts unflagged and unexcluded here until FEAT-007 lands.
-			PIIFlag:           false,
-			PIIPattern:        "",
+			PIIFlag:        result.Flagged,
+			PIIPattern:     result.Pattern,
+			// Column-level exclusion (FEAT-010) is a separate, user-driven override on top of this
+			// automatic flag — every column starts un-excluded regardless of its PII flag; see
+			// pii.DetectAll's package doc comment for why the two are kept distinct.
 			ExcludedFromModel: false,
 			NullRate:          s.NullRate,
 			DistinctCount:     s.DistinctCount,
@@ -292,7 +315,7 @@ func (p *Pipeline) inferRelationshipsAndComplete(ctx context.Context, handle eng
 		}
 
 		for _, sib := range completedSiblings {
-			if err := p.inferAgainstSibling(ctx, handle, thisInput, sib); err != nil {
+			if err := p.inferAgainstSibling(ctx, handle, ds, thisInput, sib); err != nil {
 				p.logger.Error("ingest: relationship inference",
 					slog.String("dataset_id", ds.ID), slog.String("sibling_dataset_id", sib.ID), slog.String("error", err.Error()))
 				return errors.New("could not check for related files. Try again.")
@@ -307,8 +330,11 @@ func (p *Pipeline) inferRelationshipsAndComplete(ctx context.Context, handle eng
 }
 
 // inferAgainstSibling downloads sib's normalized Parquet, runs relationships.Infer between it and
-// thisInput, and persists every resulting candidate that doesn't already exist for that column pair.
-func (p *Pipeline) inferAgainstSibling(ctx context.Context, handle engine.Handle, thisInput relationships.DatasetInput, sib domain.Dataset) error {
+// thisInput, and persists every resulting candidate that doesn't already exist for that column pair
+// AND was never previously rejected for the same (dataset filename, column name) pair — see
+// CandidateJoinStore.ExistsRejectedForNamePair's doc comment for why the rejection check is name-based
+// rather than id-based.
+func (p *Pipeline) inferAgainstSibling(ctx context.Context, handle engine.Handle, ds domain.Dataset, thisInput relationships.DatasetInput, sib domain.Dataset) error {
 	sibCols, err := p.columns.ListByDataset(ctx, sib.ID)
 	if err != nil {
 		return fmt.Errorf("listing sibling columns: %w", err)
@@ -332,6 +358,18 @@ func (p *Pipeline) inferAgainstSibling(ctx context.Context, handle engine.Handle
 		return fmt.Errorf("inferring candidates: %w", err)
 	}
 
+	// relationships.Infer(a, b) always sources SourceColumnID from a.Columns and TargetColumnID from
+	// b.Columns (see its loop order) — here a is thisInput and b is sibInput — so these two maps are
+	// enough to resolve every candidate's column names without a further query.
+	thisNameByID := make(map[string]string, len(thisInput.Columns))
+	for _, c := range thisInput.Columns {
+		thisNameByID[c.ID] = c.Name
+	}
+	sibNameByID := make(map[string]string, len(sibCols))
+	for _, c := range sibCols {
+		sibNameByID[c.ID] = c.Name
+	}
+
 	for _, c := range candidates {
 		exists, err := p.joins.ExistsForPair(ctx, c.SourceColumnID, c.TargetColumnID)
 		if err != nil {
@@ -340,6 +378,17 @@ func (p *Pipeline) inferAgainstSibling(ctx context.Context, handle engine.Handle
 		if exists {
 			continue
 		}
+
+		rejected, err := p.joins.ExistsRejectedForNamePair(ctx, sib.WorkspaceID,
+			ds.OriginalFilename, thisNameByID[c.SourceColumnID],
+			sib.OriginalFilename, sibNameByID[c.TargetColumnID])
+		if err != nil {
+			return fmt.Errorf("checking previously rejected candidate join: %w", err)
+		}
+		if rejected {
+			continue
+		}
+
 		c.ID = uuid.NewString()
 		c.WorkspaceID = sib.WorkspaceID
 		c.CreatedAt = time.Now()

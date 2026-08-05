@@ -38,6 +38,12 @@ type DatasetInput struct {
 // documented here as the single, inspectable place that decision lives (never inlined per-call-site).
 const MinConfidenceToPersist = 0.35
 
+// UniqueCardinalityThreshold is the uniqueness ratio (see Uniqueness) above which a column is
+// treated as key-like when the confirmation API (FEAT-009's accept endpoint) defaults a confirmed
+// Relationship's cardinality. Documented here, alongside MinConfidenceToPersist, as the single place
+// this kind of inference tunable lives — never inlined at the call site.
+const UniqueCardinalityThreshold = 0.95
+
 // pruneFloor is the combined name+type signal below which a column pair is skipped entirely, before
 // ever running a value-overlap query. Bounds cost to roughly (columns in A) x (columns in B)
 // candidate pairs actually worth sampling, rather than every pair unconditionally — a wide pair of
@@ -138,6 +144,13 @@ func uniqueness(distinctCount, rowCount int64) float64 {
 		ratio = 1
 	}
 	return ratio
+}
+
+// Uniqueness is uniqueness's exported form, reused by the confirmation API (FEAT-009's accept
+// endpoint) to default a confirmed Relationship's cardinality from the same key-like signal
+// relationship inference already computes — rather than reimplementing it.
+func Uniqueness(distinctCount, rowCount int64) float64 {
+	return uniqueness(distinctCount, rowCount)
 }
 
 // normalizeName lowercases and collapses separators so "Customer ID", "customer-id", and

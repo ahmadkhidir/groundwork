@@ -1,0 +1,528 @@
+// This file implements screens/07-ingest-confirmation.md's write/aggregate endpoints — FEAT-006 (type
+// override), FEAT-007 (PII flag override), and FEAT-009 (candidate join accept/reject) — the
+// mandatory review gate before any ingested data is queryable. profiling.go's existing read-only
+// per-dataset /columns and per-workspace /candidate-joins endpoints are extended here rather than
+// duplicated: this file adds a workspace-wide columns read (spanning every dataset in one ingest
+// batch, which the confirmation screen reviews as a whole) plus the two override/decision writes.
+package api
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+
+	"github.com/ahmadkhidir/groundwork/server/internal/domain"
+	"github.com/ahmadkhidir/groundwork/server/internal/relationships"
+	"github.com/ahmadkhidir/groundwork/server/internal/store/postgres"
+)
+
+// ConfirmationDatasetStore is the seam confirmation handlers use to resolve a dataset's original
+// filename (for the workspace-wide column listing) and row count (for defaulting a confirmed
+// relationship's cardinality), satisfied by internal/store/postgres.DatasetRepository.
+type ConfirmationDatasetStore interface {
+	GetByID(ctx context.Context, id string) (domain.Dataset, error)
+	ListByWorkspace(ctx context.Context, workspaceID string) ([]domain.Dataset, error)
+}
+
+// ConfirmationColumnStore is the persistence seam for reviewing and overriding profiled columns
+// (FEAT-006/FEAT-007), satisfied by internal/store/postgres.ColumnRepository.
+type ConfirmationColumnStore interface {
+	ListByWorkspace(ctx context.Context, workspaceID string) ([]domain.Column, error)
+	GetByIDForWorkspace(ctx context.Context, id, workspaceID string) (domain.Column, error)
+	UpdateInferredType(ctx context.Context, id string, t domain.InferredType) error
+	UpdatePII(ctx context.Context, id string, flag bool, pattern string) error
+}
+
+// ConfirmationCandidateJoinStore is the persistence seam for reviewing and deciding candidate joins
+// (FEAT-009), satisfied by internal/store/postgres.CandidateJoinRepository.
+type ConfirmationCandidateJoinStore interface {
+	GetByID(ctx context.Context, id string) (domain.CandidateJoin, error)
+	UpdateStatus(ctx context.Context, id string, status domain.CandidateJoinStatus) error
+}
+
+// ConfirmationRelationshipStore is the persistence seam for recording an accepted candidate join into
+// the semantic layer (FEAT-009's write side of FEAT-008), satisfied by
+// internal/store/postgres.RelationshipRepository. Deliberately the ONLY relationship operation wired
+// this wave — FEAT-019 (full semantic layer read/write) is Phase 2 and not authorized.
+type ConfirmationRelationshipStore interface {
+	Create(ctx context.Context, rel domain.Relationship) error
+}
+
+// uniqueCardinalityThreshold mirrors relationships.UniqueCardinalityThreshold's role: the uniqueness
+// ratio above which a column reads as key-like when defaulting a confirmed Relationship's cardinality.
+// Read via the exported constant rather than redeclared, so the one tunable value lives in one place.
+const uniqueCardinalityThreshold = relationships.UniqueCardinalityThreshold
+
+// RegisterConfirmationRoutes wires FEAT-006/FEAT-007/FEAT-009's write endpoints onto r, for
+// screens/07-ingest-confirmation.md.
+func RegisterConfirmationRoutes(
+	r chi.Router,
+	workspaces WorkspaceStore,
+	datasets ConfirmationDatasetStore,
+	columns ConfirmationColumnStore,
+	joins ConfirmationCandidateJoinStore,
+	relationshipStore ConfirmationRelationshipStore,
+	logger *slog.Logger,
+) {
+	r.Get("/workspaces/{workspaceId}/columns", handleListWorkspaceColumns(workspaces, datasets, columns, logger))
+	r.Patch("/workspaces/{workspaceId}/columns/{columnId}", handleUpdateColumn(workspaces, columns, logger))
+	r.Patch("/workspaces/{workspaceId}/candidate-joins/{joinId}", handleUpdateCandidateJoin(workspaces, columns, datasets, joins, relationshipStore, logger))
+}
+
+// publicRelationship is a confirmed relationship as returned when a candidate join is accepted.
+type publicRelationship struct {
+	ID             string `json:"id"`
+	WorkspaceID    string `json:"workspace_id"`
+	SourceColumnID string `json:"source_column_id"`
+	TargetColumnID string `json:"target_column_id"`
+	Cardinality    string `json:"cardinality"`
+	GrainNotes     string `json:"grain_notes,omitempty"`
+	ConfirmedAt    string `json:"confirmed_at"`
+}
+
+func toPublicRelationship(rel domain.Relationship) publicRelationship {
+	return publicRelationship{
+		ID:             rel.ID,
+		WorkspaceID:    rel.WorkspaceID,
+		SourceColumnID: rel.SourceColumnID,
+		TargetColumnID: rel.TargetColumnID,
+		Cardinality:    string(rel.Cardinality),
+		GrainNotes:     rel.GrainNotes,
+		ConfirmedAt:    rel.ConfirmedAt.Format(time.RFC3339),
+	}
+}
+
+// publicConfirmationColumn is one column as shown on screens/07's Type/PII review tables — the
+// existing publicColumn (profiling.go) plus the owning dataset's filename, since the confirmation
+// screen reviews every column across an entire ingest batch (potentially several files) at once and
+// needs to label which file each column belongs to.
+type publicConfirmationColumn struct {
+	ID                string  `json:"id"`
+	DatasetID         string  `json:"dataset_id"`
+	DatasetFilename   string  `json:"dataset_filename"`
+	Name              string  `json:"name"`
+	InferredType      string  `json:"inferred_type"`
+	TypeConfidence    float64 `json:"type_confidence"`
+	PIIFlag           bool    `json:"pii_flag"`
+	PIIPattern        string  `json:"pii_pattern,omitempty"`
+	ExcludedFromModel bool    `json:"excluded_from_model"`
+	NullRate          float64 `json:"null_rate"`
+	DistinctCount     int64   `json:"distinct_count"`
+}
+
+// handleListWorkspaceColumns serves GET /v1/workspaces/:id/columns — every profiled column across
+// every dataset in the workspace, labelled with its owning file's name. This is the "types" and
+// "pii-flags" data source for screens/07-ingest-confirmation.md, which reviews an entire upload batch
+// (potentially several files) as one screen rather than one dataset at a time.
+func handleListWorkspaceColumns(workspaces WorkspaceStore, datasets ConfirmationDatasetStore, columns ConfirmationColumnStore, logger *slog.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		claims, ok := requireClaims(w, r)
+		if !ok {
+			return
+		}
+
+		workspaceID := chi.URLParam(r, "workspaceId")
+		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+			return
+		}
+
+		dsList, err := datasets.ListByWorkspace(r.Context(), workspaceID)
+		if err != nil {
+			logger.Error("listing datasets for column review", slog.String("error", err.Error()))
+			respondJSON(w, http.StatusInternalServerError, map[string]string{
+				"error": "Something went wrong. Try again.",
+				"code":  "internal_error",
+			})
+			return
+		}
+		filenameByDatasetID := make(map[string]string, len(dsList))
+		for _, ds := range dsList {
+			filenameByDatasetID[ds.ID] = ds.OriginalFilename
+		}
+
+		cols, err := columns.ListByWorkspace(r.Context(), workspaceID)
+		if err != nil {
+			logger.Error("listing workspace columns", slog.String("error", err.Error()))
+			respondJSON(w, http.StatusInternalServerError, map[string]string{
+				"error": "Something went wrong. Try again.",
+				"code":  "internal_error",
+			})
+			return
+		}
+
+		out := make([]publicConfirmationColumn, 0, len(cols))
+		for _, c := range cols {
+			out = append(out, publicConfirmationColumn{
+				ID:                c.ID,
+				DatasetID:         c.DatasetID,
+				DatasetFilename:   filenameByDatasetID[c.DatasetID],
+				Name:              c.Name,
+				InferredType:      string(c.InferredType),
+				TypeConfidence:    c.TypeConfidence,
+				PIIFlag:           c.PIIFlag,
+				PIIPattern:        c.PIIPattern,
+				ExcludedFromModel: c.ExcludedFromModel,
+				NullRate:          c.NullRate,
+				DistinctCount:     c.DistinctCount,
+			})
+		}
+		respondJSON(w, http.StatusOK, map[string]any{"columns": out})
+	}
+}
+
+// validInferredTypes mirrors schema.md's Column.inferred_type enum, for validating FEAT-006's type
+// override request.
+var validInferredTypes = map[string]domain.InferredType{
+	"string":    domain.TypeString,
+	"integer":   domain.TypeInteger,
+	"number":    domain.TypeNumber,
+	"boolean":   domain.TypeBoolean,
+	"date":      domain.TypeDate,
+	"timestamp": domain.TypeTimestamp,
+}
+
+// updateColumnRequest is the PATCH body for overriding a column's reviewed type and/or PII flag.
+// Both fields are pointers so the handler can tell "not supplied" (nil) apart from an explicit
+// false/zero-value — a request overriding only the PII flag must not accidentally reset the type,
+// and vice versa.
+type updateColumnRequest struct {
+	InferredType *string `json:"inferred_type"`
+	PIIFlag      *bool   `json:"pii_flag"`
+	// PIIPattern is only consulted when PIIFlag is true; if omitted, "manual" is recorded — this is a
+	// user-initiated flag, not one DetectAll proposed, per pii.PatternManual's doc comment.
+	PIIPattern *string `json:"pii_pattern"`
+}
+
+// handleUpdateColumn serves PATCH /v1/workspaces/:id/columns/:columnId — FEAT-006's type-review
+// override and FEAT-007's PII-flag override, both landing on the same column resource since
+// screens/07 reviews them as two tabs/steps over the same underlying rows.
+func handleUpdateColumn(workspaces WorkspaceStore, columns ConfirmationColumnStore, logger *slog.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		claims, ok := requireClaims(w, r)
+		if !ok {
+			return
+		}
+
+		workspaceID := chi.URLParam(r, "workspaceId")
+		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+			return
+		}
+
+		var req updateColumnRequest
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		if req.InferredType == nil && req.PIIFlag == nil {
+			respondJSON(w, http.StatusBadRequest, map[string]string{
+				"error": "Provide inferred_type and/or pii_flag to update.",
+				"code":  "validation_error",
+			})
+			return
+		}
+
+		columnID := chi.URLParam(r, "columnId")
+		col, err := columns.GetByIDForWorkspace(r.Context(), columnID, workspaceID)
+		if err != nil {
+			if errors.Is(err, postgres.ErrColumnNotFound) {
+				respondJSON(w, http.StatusNotFound, map[string]string{
+					"error": "Column not found.",
+					"code":  "not_found",
+				})
+				return
+			}
+			logger.Error("getting column for override", slog.String("error", err.Error()))
+			respondJSON(w, http.StatusInternalServerError, map[string]string{
+				"error": "Something went wrong. Try again.",
+				"code":  "internal_error",
+			})
+			return
+		}
+
+		if req.InferredType != nil {
+			t, ok := validInferredTypes[*req.InferredType]
+			if !ok {
+				respondJSON(w, http.StatusBadRequest, map[string]string{
+					"error": fmt.Sprintf("%q is not a recognized column type.", *req.InferredType),
+					"code":  "validation_error",
+				})
+				return
+			}
+			if err := columns.UpdateInferredType(r.Context(), columnID, t); err != nil {
+				logger.Error("updating column inferred type", slog.String("error", err.Error()))
+				respondJSON(w, http.StatusInternalServerError, map[string]string{
+					"error": "Something went wrong. Try again.",
+					"code":  "internal_error",
+				})
+				return
+			}
+			col.InferredType = t
+			col.TypeConfidence = 1.0
+		}
+
+		if req.PIIFlag != nil {
+			pattern := ""
+			if *req.PIIFlag {
+				pattern = "manual"
+				if req.PIIPattern != nil && *req.PIIPattern != "" {
+					pattern = *req.PIIPattern
+				} else if col.PIIFlag && col.PIIPattern != "" {
+					// Re-confirming an already-detected flag (e.g. toggled off then back on in the
+					// same review session) keeps its original detected pattern rather than being
+					// relabeled "manual".
+					pattern = col.PIIPattern
+				}
+			}
+			if err := columns.UpdatePII(r.Context(), columnID, *req.PIIFlag, pattern); err != nil {
+				logger.Error("updating column pii flag", slog.String("error", err.Error()))
+				respondJSON(w, http.StatusInternalServerError, map[string]string{
+					"error": "Something went wrong. Try again.",
+					"code":  "internal_error",
+				})
+				return
+			}
+			col.PIIFlag = *req.PIIFlag
+			col.PIIPattern = pattern
+		}
+
+		respondJSON(w, http.StatusOK, map[string]any{"column": publicColumn{
+			ID:                col.ID,
+			DatasetID:         col.DatasetID,
+			Name:              col.Name,
+			InferredType:      string(col.InferredType),
+			TypeConfidence:    col.TypeConfidence,
+			PIIFlag:           col.PIIFlag,
+			PIIPattern:        col.PIIPattern,
+			ExcludedFromModel: col.ExcludedFromModel,
+			NullRate:          col.NullRate,
+			DistinctCount:     col.DistinctCount,
+		}})
+	}
+}
+
+// validCardinalities mirrors schema.md's Relationship.cardinality enum, for validating an optional
+// manual cardinality override on accept.
+var validCardinalities = map[string]domain.Cardinality{
+	"one_to_one":   domain.OneToOne,
+	"one_to_many":  domain.OneToMany,
+	"many_to_one":  domain.ManyToOne,
+	"many_to_many": domain.ManyToMany,
+}
+
+// updateCandidateJoinRequest is the PATCH body for FEAT-009's accept/reject/manually-adjust decision.
+type updateCandidateJoinRequest struct {
+	Status string `json:"status"`
+	// Cardinality and GrainNotes are optional manual-adjust fields, only meaningful when Status is
+	// "accepted" — if Cardinality is omitted, it is computed from the columns' uniqueness (mirroring
+	// relationship inference's own cardinality signal) rather than left to an arbitrary default.
+	Cardinality *string `json:"cardinality"`
+	GrainNotes  *string `json:"grain_notes"`
+}
+
+// handleUpdateCandidateJoin serves PATCH /v1/workspaces/:id/candidate-joins/:joinId — FEAT-009's
+// accept/reject/manually-adjust decision on a single candidate join.
+//
+// Rejecting only updates the candidate join's own status; FEAT-009's "never silently reintroduced"
+// guarantee is enforced downstream, by internal/ingest.Pipeline consulting
+// CandidateJoinStore.ExistsRejectedForNamePair on any later ingest — not by anything this handler
+// does.
+//
+// Accepting additionally writes a Relationship row into the semantic layer (schema.md: "Created when
+// a CandidateJoin is accepted"). FEAT-019 (the full semantic layer feature) is Phase 2 and not
+// authorized this wave; this handler performs only the single write FEAT-009 itself requires.
+func handleUpdateCandidateJoin(
+	workspaces WorkspaceStore,
+	columns ConfirmationColumnStore,
+	datasets ConfirmationDatasetStore,
+	joins ConfirmationCandidateJoinStore,
+	relationshipStore ConfirmationRelationshipStore,
+	logger *slog.Logger,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		claims, ok := requireClaims(w, r)
+		if !ok {
+			return
+		}
+
+		workspaceID := chi.URLParam(r, "workspaceId")
+		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+			return
+		}
+
+		var req updateCandidateJoinRequest
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+
+		var status domain.CandidateJoinStatus
+		switch req.Status {
+		case string(domain.JoinAccepted):
+			status = domain.JoinAccepted
+		case string(domain.JoinRejected):
+			status = domain.JoinRejected
+		default:
+			respondJSON(w, http.StatusBadRequest, map[string]string{
+				"error": `status must be "accepted" or "rejected".`,
+				"code":  "validation_error",
+			})
+			return
+		}
+
+		var cardinality domain.Cardinality
+		if req.Cardinality != nil {
+			c, ok := validCardinalities[*req.Cardinality]
+			if !ok {
+				respondJSON(w, http.StatusBadRequest, map[string]string{
+					"error": fmt.Sprintf("%q is not a recognized cardinality.", *req.Cardinality),
+					"code":  "validation_error",
+				})
+				return
+			}
+			cardinality = c
+		}
+
+		joinID := chi.URLParam(r, "joinId")
+		cj, err := joins.GetByID(r.Context(), joinID)
+		if err != nil {
+			if errors.Is(err, postgres.ErrCandidateJoinNotFound) {
+				respondJSON(w, http.StatusNotFound, map[string]string{
+					"error": "Candidate join not found.",
+					"code":  "not_found",
+				})
+				return
+			}
+			logger.Error("getting candidate join for decision", slog.String("error", err.Error()))
+			respondJSON(w, http.StatusInternalServerError, map[string]string{
+				"error": "Something went wrong. Try again.",
+				"code":  "internal_error",
+			})
+			return
+		}
+		// Same non-enumeration response as a genuinely missing join — see requireWorkspaceOwnership's
+		// doc comment for why this pattern is used throughout the API.
+		if cj.WorkspaceID != workspaceID {
+			respondJSON(w, http.StatusNotFound, map[string]string{
+				"error": "Candidate join not found.",
+				"code":  "not_found",
+			})
+			return
+		}
+
+		var createdRelationship *domain.Relationship
+		if status == domain.JoinAccepted {
+			rel, err := buildRelationship(r.Context(), columns, datasets, cj, cardinality, req.GrainNotes)
+			if err != nil {
+				logger.Error("computing relationship for accepted join", slog.String("error", err.Error()))
+				respondJSON(w, http.StatusInternalServerError, map[string]string{
+					"error": "Something went wrong. Try again.",
+					"code":  "internal_error",
+				})
+				return
+			}
+			if err := relationshipStore.Create(r.Context(), rel); err != nil {
+				logger.Error("storing accepted relationship", slog.String("error", err.Error()))
+				respondJSON(w, http.StatusInternalServerError, map[string]string{
+					"error": "Something went wrong. Try again.",
+					"code":  "internal_error",
+				})
+				return
+			}
+			createdRelationship = &rel
+		}
+
+		if err := joins.UpdateStatus(r.Context(), joinID, status); err != nil {
+			logger.Error("updating candidate join status", slog.String("error", err.Error()))
+			respondJSON(w, http.StatusInternalServerError, map[string]string{
+				"error": "Something went wrong. Try again.",
+				"code":  "internal_error",
+			})
+			return
+		}
+		cj.Status = status
+
+		resp := map[string]any{"candidate_join": toPublicCandidateJoin(cj)}
+		if createdRelationship != nil {
+			resp["relationship"] = toPublicRelationship(*createdRelationship)
+		}
+		respondJSON(w, http.StatusOK, resp)
+	}
+}
+
+// buildRelationship assembles the Relationship row for an accepted candidate join. cardinality is
+// used as-is when the caller supplied a manual override (FEAT-009's "manually adjust"); otherwise it
+// is defaulted from the source/target columns' uniqueness, the same key-like signal relationship
+// inference itself already computes (relationships.Uniqueness) — reused here rather than guessed
+// fresh, so a candidate accepted without a manual override still gets a considered default rather
+// than an arbitrary one.
+func buildRelationship(ctx context.Context, columns ConfirmationColumnStore, datasets ConfirmationDatasetStore, cj domain.CandidateJoin, cardinality domain.Cardinality, grainNotes *string) (domain.Relationship, error) {
+	notes := ""
+	if grainNotes != nil {
+		notes = *grainNotes
+	}
+
+	if cardinality == "" {
+		computed, err := defaultCardinality(ctx, columns, datasets, cj)
+		if err != nil {
+			return domain.Relationship{}, err
+		}
+		cardinality = computed
+	}
+
+	return domain.Relationship{
+		ID:             uuid.NewString(),
+		WorkspaceID:    cj.WorkspaceID,
+		SourceColumnID: cj.SourceColumnID,
+		TargetColumnID: cj.TargetColumnID,
+		Cardinality:    cardinality,
+		GrainNotes:     notes,
+		ConfirmedAt:    time.Now(),
+	}, nil
+}
+
+// defaultCardinality scores each side of the join's uniqueness (distinct_count against its owning
+// dataset's row_count) and reports the shape that best matches — one_to_one, one_to_many,
+// many_to_one, or many_to_many — using relationships.UniqueCardinalityThreshold as the "key-like"
+// cutoff. Both columns are looked up scoped to cj.WorkspaceID (via GetByIDForWorkspace) since the
+// candidate join's own workspace has already been verified by its caller — never a bare,
+// workspace-unscoped column fetch.
+func defaultCardinality(ctx context.Context, columns ConfirmationColumnStore, datasets ConfirmationDatasetStore, cj domain.CandidateJoin) (domain.Cardinality, error) {
+	sourceUnique, err := columnIsUnique(ctx, columns, datasets, cj.WorkspaceID, cj.SourceColumnID)
+	if err != nil {
+		return "", fmt.Errorf("scoring source column uniqueness: %w", err)
+	}
+	targetUnique, err := columnIsUnique(ctx, columns, datasets, cj.WorkspaceID, cj.TargetColumnID)
+	if err != nil {
+		return "", fmt.Errorf("scoring target column uniqueness: %w", err)
+	}
+
+	switch {
+	case sourceUnique && targetUnique:
+		return domain.OneToOne, nil
+	case sourceUnique && !targetUnique:
+		return domain.OneToMany, nil
+	case !sourceUnique && targetUnique:
+		return domain.ManyToOne, nil
+	default:
+		return domain.ManyToMany, nil
+	}
+}
+
+// columnIsUnique reports whether columnID's distinct_count is at least
+// relationships.UniqueCardinalityThreshold of its owning dataset's row_count — a primary/foreign-key
+// shape, the same signal relationship inference itself computes via relationships.Uniqueness.
+func columnIsUnique(ctx context.Context, columns ConfirmationColumnStore, datasets ConfirmationDatasetStore, workspaceID, columnID string) (bool, error) {
+	col, err := columns.GetByIDForWorkspace(ctx, columnID, workspaceID)
+	if err != nil {
+		return false, fmt.Errorf("getting column %q: %w", columnID, err)
+	}
+	ds, err := datasets.GetByID(ctx, col.DatasetID)
+	if err != nil {
+		return false, fmt.Errorf("getting dataset %q for column %q: %w", col.DatasetID, columnID, err)
+	}
+	return relationships.Uniqueness(col.DistinctCount, ds.RowCount) >= uniqueCardinalityThreshold, nil
+}

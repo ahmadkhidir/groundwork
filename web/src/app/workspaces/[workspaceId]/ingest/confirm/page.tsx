@@ -1,20 +1,16 @@
 import type { Metadata } from "next";
-import { PlaceholderScreen } from "@/components/PlaceholderScreen";
+import { IngestConfirmationScreen } from "@/components/confirmation/IngestConfirmationScreen";
 
 export const metadata: Metadata = { title: "Confirm ingest" };
 
-/** Route: `/workspaces/[workspaceId]/ingest/confirm` — see docs/Groundwork/screens/07-ingest-confirmation.md */
+/**
+ * Route: `/workspaces/[workspaceId]/ingest/confirm` — see docs/Groundwork/screens/07-ingest-confirmation.md.
+ *
+ * FEAT-006 (type review), FEAT-007 (PII flag review), and FEAT-009 (candidate join accept/reject).
+ */
 export default async function Page(props: PageProps<"/workspaces/[workspaceId]/ingest/confirm">) {
   // params is a Promise in Next 16; synchronous access was removed.
-  const params = await props.params;
+  const { workspaceId } = await props.params;
 
-  return (
-    <PlaceholderScreen
-      screen="07 — Ingest Confirmation"
-      spec="screens/07-ingest-confirmation.md"
-      features="FEAT-006, FEAT-007, FEAT-008, FEAT-009"
-      phase="Phase 1"
-      params={params}
-    />
-  );
+  return <IngestConfirmationScreen workspaceId={workspaceId} />;
 }

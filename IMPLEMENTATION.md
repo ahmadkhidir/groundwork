@@ -345,7 +345,7 @@ loaded via `next/font` and bound to `--font-display`, `--font-body`, `--font-mon
 | Phase | Features | Status |
 |---|---|---|
 | **A — Foundation** | Scaffold, theme tokens, schema entities, auth, routing skeleton, docker-compose | **Complete** |
-| **1 — Foundation: Workspace, Ingest & Trust** | FEAT-001 ✅ 002 ✅ 003 ✅ 004 ✅ 005 ✅ 008 ✅ 011 ✅ 042 ✅ 044 ✅ · 006, 007, 009 | In progress (wave 4 of 5) |
+| **1 — Foundation: Workspace, Ingest & Trust** | FEAT-001 ✅ 002 ✅ 003 ✅ 004 ✅ 005 ✅ 006 ✅ 007 ✅ 008 ✅ 009 ✅ 011 ✅ 042 ✅ 044 ✅ | **Complete** (wave 5 of 5) |
 | **2 — Core Grounded Answer Loop** | FEAT-013, 014, 015, 016, 017, 018, 019, 020 | Not started |
 | **3 — Trust & Observability** | FEAT-022, 023, 024, 027, 028, 029, 030 | Not started |
 | **4 — Reports & Delivery** | FEAT-034, 035, 036, 041, 043 | Not started |
@@ -353,6 +353,13 @@ loaded via `next/font` and bound to `--font-display`, `--font-body`, `--font-mon
 
 > **Current authorized scope: Foundation + Phase 1 only.** Phases 2–5 are documented but not
 > authorized for implementation. Do not begin a later phase without explicit approval.
+>
+> **Phase 1 is functionally complete as of Wave 5** — every listed feature is implemented and green.
+> A full pipeline pass (upload → provisioning → loading → profiling → PII flagging → relationship
+> inference → ingest confirmation → workspace home) has been manually verified end to end against
+> real Postgres/MinIO/DuckDB, including a re-ingest of the same two files confirming a rejected
+> candidate join is not resurrected. See Wave 5's open items below for the few gaps this wave
+> reported rather than invented a fix for.
 
 **What Foundation delivered** (green: `gofmt`, `go vet`, `go test`, `tsc`, `eslint`, `vitest` 37/37,
 `next build`):
@@ -376,7 +383,8 @@ the route's 501 handler; it does not build around them.
 ### Open items
 
 Wave 3's first two items are **closed** by Wave 4: the ingest pipeline now runs through to
-`ingest_status = "complete"`, and "Profiling columns" reflects real work.
+`ingest_status = "complete"`, and "Profiling columns" reflects real work. Wave 4's PII-safe-defaults
+item is **closed** by Wave 5: PII detection is real (`internal/pii`).
 
 | Item | Detail | Owner |
 |---|---|---|
@@ -385,7 +393,11 @@ Wave 3's first two items are **closed** by Wave 4: the ingest pipeline now runs 
 | **`features.md` FEAT-005 mentions min/max; `schema.md`'s `Column` has no such fields** | The two documents disagree, and the acceptance criteria don't require min/max. Either add `min_value`/`max_value` to the schema (+ migration) or drop it from the description. Nothing was invented in code. | Product |
 | **Screen 04's semantic-layer summary panel has no FEAT ID** | The only component on that screen without one. Assumed FEAT-019 in a code comment rather than guessed silently. | Product |
 | **Screen 04's "Upload data" button renders unconditionally** | Spec says "shown when no files ingested yet", but the screen has no dataset-presence endpoint. Documented in code; needs either an endpoint or a spec change. | Wave 5 / FEAT-034 |
-| **PII fields written as safe defaults** | Every profiled column gets `pii_flag: false`, `pii_pattern: ""` — PII detection is FEAT-007 (Wave 5), following the established "safe default until the owning feature lands" pattern. | FEAT-007 |
+| **FEAT-006's "type corrections... used for all subsequent ingest of the same schema shape" is NOT implemented** | `schema.md`'s `Column` has no field keying a correction to a reusable "schema shape" (e.g. a hash of column names+types), and nothing else in `docs/` defines what a schema shape is. Implemented instead: overriding a column's type persists on that specific column (`PATCH /v1/workspaces/:id/columns/:columnId`), which is everything the schema supports today. A future re-ingest of the same file gets a fresh Column row with the ORIGINAL heuristic type, not the prior correction. Needs a schema-shape-keyed corrections table (+ migration) before this acceptance criterion can be met — route to product-shaper for the data model, since nothing was invented here. | Product |
+| 🔴 **FEAT-007's "name-and-type-only exposure to the model" has NO ENFORCEMENT POINT YET** | Detection and flagging are real and verified (`email` → pattern `email`, `full_name` → `name`). But `pii_flag` currently governs nothing at runtime: the criterion is enforced where a model payload is built, and **no model payload builder exists** — the first one arrives with FEAT-013 in Phase 2. `columns.excluded_from_model` is deliberately NOT used for this; `schema.md` assigns it to FEAT-010 ("the user has **explicitly** excluded"), a Phase 5 user override, so wiring automatic flags into it would conflate two different decisions. **Consequence: whoever builds the first model call must read `pii_flag` and send name-and-type only. If they don't, flagged PII goes to the model and nothing fails, no test breaks, and the product's central privacy promise is silently broken.** Verified today that flagged columns still have `excluded_from_model = false` — correct per spec, and exactly why the enforcement must live in the payload builder. | **Phase 2 / FEAT-013 — highest-priority carry-forward** |
+| **A PII flag explicitly overridden to "not sensitive" is indistinguishable from a column that was never flagged** | FEAT-007's description requires the override to be "logged in the semantic layer as an explicit user decision, distinguishable later." `schema.md`'s `Column` has exactly two fields for this (`pii_flag`, `pii_pattern`), both of which end up identical (`false`, `""`) whether a column was never flagged or was flagged-then-cleared. `AuditActionType` also has no action type for this decision. Implemented: the override itself works and persists correctly; the distinguishability requirement needs either a new column (e.g. `pii_reviewed_at`) or a new audit action type — route to product-shaper, nothing invented. | Product |
+| **FEAT-009's accepted joins land directly in `relationships`, not a full semantic layer** | FEAT-019 (Semantic Layer Storage — listing, editing, using relationships as query-planning grounding) is Phase 2 and not authorized this wave. `internal/store/postgres.RelationshipRepository` is deliberately `Create`-only; there is no read/update/delete surface, and no UI beyond ingest confirmation shows a relationship once created. This is intentional under-scoping, not a gap. | FEAT-019 (Phase 2) |
+| **Rejected-join resurrection is guarded by (dataset filename, column name), not a content hash** | `CandidateJoinRepository.ExistsRejectedForNamePair` matches on original filename + column name, since nothing in `docs/` defines a stronger notion of "the same file" across re-ingests. Renaming a file, or uploading a genuinely different file that happens to share both a name and a column name, are both outside this heuristic's guarantee. Verified live against a real re-ingest (see Wave 5's report) that the literal scenario in FEAT-009's acceptance criterion works. | Product (if a stronger identity is wanted) |
 
 ### Known divergences — code behind docs
 

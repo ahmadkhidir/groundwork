@@ -89,6 +89,7 @@ func run(logger *slog.Logger) error {
 	datasetRepo := postgres.NewDatasetRepository(pool)
 	columnRepo := postgres.NewColumnRepository(pool)
 	candidateJoinRepo := postgres.NewCandidateJoinRepository(pool)
+	relationshipRepo := postgres.NewRelationshipRepository(pool)
 	ingestTracker := ingest.NewTracker()
 	ingestPipeline := ingest.NewPipeline(
 		datasetRepo, objectStore, engineProvider, columnRepo, candidateJoinRepo, ingestTracker, logger)
@@ -109,6 +110,14 @@ func run(logger *slog.Logger) error {
 		ProfilingDatasets: datasetRepo,
 		Columns:           columnRepo,
 		CandidateJoins:    candidateJoinRepo,
+
+		// screens/07-ingest-confirmation.md's write endpoints (FEAT-006/FEAT-007/FEAT-009). Same
+		// underlying repositories as above, satisfying a further, deliberately narrow set of
+		// interfaces — see Dependencies' doc comment.
+		ConfirmationDatasets:       datasetRepo,
+		ConfirmationColumns:        columnRepo,
+		ConfirmationCandidateJoins: candidateJoinRepo,
+		Relationships:              relationshipRepo,
 
 		EngineProvider: engineProvider,
 	}

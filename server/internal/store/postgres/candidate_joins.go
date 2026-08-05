@@ -92,6 +92,51 @@ func (r *CandidateJoinRepository) ExistsForPair(ctx context.Context, columnAID, 
 	return exists, nil
 }
 
+// UpdateStatus transitions a candidate join to "accepted" or "rejected" per FEAT-009 — the user's
+// explicit accept/reject decision on screens/07-ingest-confirmation.md. Never used to set "pending":
+// that value is only ever assigned at creation time by relationship inference.
+func (r *CandidateJoinRepository) UpdateStatus(ctx context.Context, id string, status domain.CandidateJoinStatus) error {
+	_, err := r.pool.Exec(ctx, `UPDATE candidate_joins SET status = $2 WHERE id = $1`, id, string(status))
+	if err != nil {
+		return fmt.Errorf("updating candidate join status: %w", err)
+	}
+	return nil
+}
+
+// ExistsRejectedForNamePair reports whether a candidate join between two columns identified by
+// (dataset original filename, column name) — in either direction — was ever rejected in workspaceID.
+//
+// Deliberately name-based rather than id-based, unlike ExistsForPair: a later ingest of "the same
+// files" (FEAT-009's own phrasing) creates entirely NEW Dataset and Column rows with new ids, so an
+// id-keyed check alone would silently forget a rejection the moment the user re-uploads. Matching by
+// filename+column name is what makes FEAT-009's "never silently reintroduced... with the same files"
+// guarantee survive a re-ingest, not merely a single upload session.
+func (r *CandidateJoinRepository) ExistsRejectedForNamePair(ctx context.Context, workspaceID, filenameA, columnA, filenameB, columnB string) (bool, error) {
+	var exists bool
+	err := r.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM candidate_joins cj
+			JOIN columns sc ON sc.id = cj.source_column_id
+			JOIN columns tc ON tc.id = cj.target_column_id
+			JOIN datasets sd ON sd.id = sc.dataset_id
+			JOIN datasets td ON td.id = tc.dataset_id
+			WHERE cj.workspace_id = $1
+			  AND cj.status = 'rejected'
+			  AND (
+				(sd.original_filename = $2 AND sc.name = $3 AND td.original_filename = $4 AND tc.name = $5)
+				OR
+				(sd.original_filename = $4 AND sc.name = $5 AND td.original_filename = $2 AND tc.name = $3)
+			  )
+		)`,
+		workspaceID, filenameA, columnA, filenameB, columnB,
+	).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("checking rejected candidate join by name: %w", err)
+	}
+	return exists, nil
+}
+
 // GetByID returns the candidate join with id, or ErrCandidateJoinNotFound.
 func (r *CandidateJoinRepository) GetByID(ctx context.Context, id string) (domain.CandidateJoin, error) {
 	var (
