@@ -8,7 +8,7 @@ export default function Loading() {
   return (
     <main
       id="main-content"
-      className="flex flex-1 items-center justify-center p-xl"
+      className="flex flex-1 items-center justify-center p-8"
       aria-busy="true"
     >
       <p role="status" className="text-body text-text-secondary">

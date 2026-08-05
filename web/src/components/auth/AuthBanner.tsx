@@ -18,7 +18,7 @@ export function AuthBanner({ message, variant = "error" }: AuthBannerProps) {
   return (
     <div
       role="alert"
-      className="flex items-center gap-sm rounded-md border border-error bg-error/10 px-sm py-sm text-body-small text-error"
+      className="flex items-center gap-2 rounded-md border border-error bg-error/10 px-2 py-2 text-body-small text-error"
     >
       <Icon size={18} aria-hidden="true" className="shrink-0" />
       <span>{message}</span>

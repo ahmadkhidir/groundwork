@@ -33,8 +33,8 @@ const VARIANT_CLASSES: Record<ButtonVariant, string> = {
 
 /** Shape, size, and typography shared by every variant. */
 const BASE_CLASSES = [
-  "inline-flex items-center justify-center gap-xs",
-  "h-(--size-button-height) rounded-md px-md py-[10px]",
+  "inline-flex items-center justify-center gap-1",
+  "h-(--size-button-height) rounded-md px-4 py-[10px]",
   "text-body font-medium whitespace-nowrap",
   "transition-colors duration-150",
   "disabled:cursor-not-allowed disabled:opacity-50",

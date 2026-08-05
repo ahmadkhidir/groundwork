@@ -71,7 +71,7 @@ export function ResetPasswordForm({ token }: ResetPasswordFormProps) {
 
   if (succeeded) {
     return (
-      <div className="flex flex-col gap-md">
+      <div className="flex flex-col gap-4">
         <p className="text-body text-text-primary">
           Your password has been updated.
         </p>
@@ -83,7 +83,7 @@ export function ResetPasswordForm({ token }: ResetPasswordFormProps) {
   }
 
   return (
-    <form onSubmit={handleSubmit} noValidate className="flex flex-col gap-md">
+    <form onSubmit={handleSubmit} noValidate className="flex flex-col gap-4">
       {!online && (
         <AuthBanner
           variant="offline"

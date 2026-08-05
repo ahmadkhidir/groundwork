@@ -22,7 +22,7 @@ export function Card({
   return (
     <div
       className={cn(
-        "rounded-md border border-border bg-surface p-md",
+        "rounded-md border border-border bg-surface p-4",
         ELEVATION_CLASSES[elevation],
         className,
       )}
@@ -50,11 +50,11 @@ export function CardHeader({
   className,
 }: CardHeaderProps) {
   return (
-    <div className={cn("mb-md flex items-start justify-between gap-md", className)}>
+    <div className={cn("mb-4 flex items-start justify-between gap-4", className)}>
       <div className="min-w-0">
         <h3 className="text-h3 text-text-primary">{title}</h3>
         {description && (
-          <p className="mt-xs text-body-small text-text-secondary">{description}</p>
+          <p className="mt-1 text-body-small text-text-secondary">{description}</p>
         )}
       </div>
       {action && <div className="shrink-0">{action}</div>}

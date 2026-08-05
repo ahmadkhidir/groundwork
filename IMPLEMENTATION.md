@@ -151,7 +151,7 @@ and dark value. Components never branch on theme — they reference the token an
 | `provenance`, `provenance-light`, `code-accent` | `--color-provenance` … | `text-provenance` |
 | `chart-cat-1`…`8`, `chart-seq-1/3/5`, `chart-div-*` | `--color-chart-cat-1` … | passed to Recharts by name |
 | `display`, `h1`…`caption`, `code` | `--text-display` … (+ paired line-height/weight) | `text-h1` |
-| `space-xs`…`space-3xl` | `--spacing-xs` … | `p-md`, `gap-lg` |
+| `space-xs`…`space-3xl` | **none — use the built-in numeric scale** | `p-4`, `gap-6` |
 | `radius-sm`…`radius-full` | `--radius-sm` … | `rounded-md` |
 | `shadow-sm`…`shadow-lg` | `--shadow-sm` … | `shadow-md` |
 
@@ -166,6 +166,26 @@ native Tailwind slot exists.
 **Skipped tokens: none.** Every token in `branding.md` is mapped, in both light and dark. If a future
 token cannot be mapped, record it here with the reason. **A skipped token is never inlined as a raw
 value at a call site** — report it instead.
+
+> ### ⚠️ Never define named `--spacing-*` tokens
+>
+> `branding.md`'s spacing scale is a 4px grid, which **is** Tailwind's built-in numeric scale. Use it:
+>
+> | branding | utility | | branding | utility |
+> |---|---|---|---|---|
+> | `space-xs` 4px | `1` | | `space-xl` 32px | `8` |
+> | `space-sm` 8px | `2` | | `space-2xl` 48px | `12` |
+> | `space-md` 16px | `4` | | `space-3xl` 64px | `16` |
+> | `space-lg` 24px | `6` | | | |
+>
+> Defining `--spacing-md`, `--spacing-3xl`, … looks harmless and **breaks every page layout**.
+> Tailwind v4 resolves `max-w-*` and `w-*` against the `--spacing-*` namespace, and those key names
+> (`xs`…`3xl`) are the *same keys* as the container scale, so it emits
+> `.max-w-3xl { max-width: var(--spacing-3xl) }` — 64px instead of 48rem.
+>
+> This shipped in Foundation and survived Wave 1. **Typecheck, lint, 63 unit tests, and the
+> production build all passed** while every page rendered as a ~50px sliver. It is only visible on
+> screen. `src/app/globals.test.ts` now guards it.
 
 **Two deliberate exceptions to "no literal values", both narrow:**
 
@@ -265,7 +285,11 @@ loaded via `next/font` and bound to `--font-display`, `--font-body`, `--font-mon
     rejection message **states the 500 MB figure explicitly** — a generic "file too large" is a
     spec violation (`screens/05-file-upload.md` §54). One exported constant feeds the validator,
     the server check, and the message; the number appears in code exactly once.
-13. Run tests and lint before declaring any unit of work complete.
+13. Run tests and lint before declaring any unit of work complete. **For any change touching UI,
+    that is not sufficient — actually look at the rendered page.** Start `npm run dev` and screenshot
+    the affected screens in both light and dark, and check the browser console is clean. A green
+    suite proved nothing about layout during Foundation: the entire app rendered as a 50px sliver
+    while every automated check passed.
 14. **Commit messages are Conventional Commits**, with the feature IDs delivered listed in an
     `Implements:` footer:
 

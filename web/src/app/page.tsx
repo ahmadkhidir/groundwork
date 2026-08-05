@@ -13,16 +13,16 @@ export default function LandingPage() {
   return (
     <main
       id="main-content"
-      className="mx-auto flex w-full max-w-3xl flex-1 flex-col items-center justify-center gap-lg p-xl text-center"
+      className="mx-auto flex w-full max-w-3xl flex-1 flex-col items-center justify-center gap-6 p-8 text-center"
     >
-      <div className="flex flex-col gap-md">
+      <div className="flex flex-col gap-4">
         <h1 className="text-display text-text-primary">Groundwork</h1>
         <p className="text-body-large text-text-secondary">
           Every number, traced back to the data.
         </p>
       </div>
 
-      <div className="flex flex-wrap items-center justify-center gap-sm">
+      <div className="flex flex-wrap items-center justify-center gap-2">
         {/*
           Rendered as links, not buttons: these navigate, so they must keep middle-click,
           open-in-new-tab, and the anchor role. buttonClassNames gives them the button's appearance

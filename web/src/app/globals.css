@@ -129,15 +129,26 @@
   --text-code--font-weight: 400;
 
   /* ---------------------------------------------------------------------------------------------
-   * Spacing — 4px base grid. branding.md §Spacing
+   * Spacing — branding.md §Spacing
+   *
+   * NOTE: there are deliberately NO custom `--spacing-*` tokens here. branding.md's scale is a 4px
+   * base grid, which is exactly Tailwind's built-in numeric spacing scale, so the default scale IS
+   * the design system and needs no redefinition:
+   *
+   *   space-xs   4px → 1      space-lg   24px → 6      space-3xl  64px → 16
+   *   space-sm   8px → 2      space-xl   32px → 8
+   *   space-md  16px → 4      space-2xl  48px → 12
+   *
+   * DO NOT reintroduce named spacing keys (`--spacing-md`, `--spacing-3xl`, …).
+   *
+   * Tailwind v4 resolves `max-w-*` / `w-*` against the `--spacing-*` namespace, and those key names
+   * (xs, sm, md, lg, xl, 2xl, 3xl) are the SAME keys as the container scale. Defining them makes
+   * Tailwind emit `max-w-3xl { max-width: var(--spacing-3xl) }` — 64px instead of 48rem — so every
+   * page silently collapses into a narrow sliver.
+   *
+   * That failure passes typecheck, lint, unit tests, AND the production build. It is only visible
+   * on screen, which is exactly why it survived Foundation and Wave 1 undetected.
    * ------------------------------------------------------------------------------------------ */
-  --spacing-xs: 4px; /* icon-to-label gaps, inline badges */
-  --spacing-sm: 8px; /* table cell padding, chip padding */
-  --spacing-md: 16px; /* default — card padding, form field gaps */
-  --spacing-lg: 24px; /* between report sections, dialog padding */
-  --spacing-xl: 32px; /* page margins, panel padding */
-  --spacing-2xl: 48px; /* major separation between dashboard regions */
-  --spacing-3xl: 64px; /* marketing/landing layout only */
 
   /* ---------------------------------------------------------------------------------------------
    * Radii — branding.md §Sizing

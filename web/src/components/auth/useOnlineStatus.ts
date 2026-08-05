@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useSyncExternalStore } from "react";
 
 /**
  * Tracks the browser's `navigator.onLine` signal, live.
@@ -12,26 +12,46 @@ import { useEffect, useState } from "react";
  * Not auth-specific in principle; it lives here because auth is this slice's only consumer so far.
  * Worth promoting to a shared `src/lib` hook once a second screen needs it.
  */
+
+/** Subscribes to connectivity changes. Module-scope so its identity is stable across renders. */
+function subscribe(onStoreChange: () => void): () => void {
+  window.addEventListener("online", onStoreChange);
+  window.addEventListener("offline", onStoreChange);
+  return () => {
+    window.removeEventListener("online", onStoreChange);
+    window.removeEventListener("offline", onStoreChange);
+  };
+}
+
+/** Client snapshot: the live browser value. */
+function getSnapshot(): boolean {
+  return navigator.onLine;
+}
+
+/**
+ * Server snapshot: always "online".
+ *
+ * This MUST be a separate function rather than reusing `getSnapshot` with a `typeof navigator`
+ * guard. Node 24 defines a global `navigator` object, but WITHOUT an `onLine` property — so a
+ * `typeof navigator === "undefined"` check passes on the server, `navigator.onLine` evaluates to
+ * `undefined`, and the whole form server-renders in its OFFLINE state. That produced a real
+ * hydration mismatch: the server sent the offline banner, the client replaced it with the form.
+ *
+ * Rendering "online" on the server is also the right default on its own merits — the server cannot
+ * know a client's connectivity, and a page that arrives claiming the user is offline is wrong far
+ * more often than it is right.
+ */
+function getServerSnapshot(): boolean {
+  return true;
+}
+
+/**
+ * Returns whether the browser currently believes it has a network connection.
+ *
+ * Uses `useSyncExternalStore` rather than `useState` + `useEffect`: it is React's designated API for
+ * subscribing to external mutable state, it takes an explicit server snapshot so hydration cannot
+ * mismatch, and it avoids the extra post-mount render an effect-driven `setState` would cost.
+ */
 export function useOnlineStatus(): boolean {
-  // Lazy initializer rather than a hardcoded `true`: `navigator` doesn't exist during the server
-  // render, so the guard falls back to "online" there and reads the real value on the client's
-  // first render — before mount, not inside an effect, which avoids the extra render an
-  // effect-driven setState would cause (react-hooks/set-state-in-effect).
-  const [online, setOnline] = useState(() =>
-    typeof navigator === "undefined" ? true : navigator.onLine,
-  );
-
-  useEffect(() => {
-    const handleOnline = () => setOnline(true);
-    const handleOffline = () => setOnline(false);
-
-    window.addEventListener("online", handleOnline);
-    window.addEventListener("offline", handleOffline);
-    return () => {
-      window.removeEventListener("online", handleOnline);
-      window.removeEventListener("offline", handleOffline);
-    };
-  }, []);
-
-  return online;
+  return useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
 }

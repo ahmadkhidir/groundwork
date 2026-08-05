@@ -26,19 +26,19 @@ export function AuthCard({ title, toggle, children }: AuthCardProps) {
   return (
     <main
       id="main-content"
-      className="flex min-h-full flex-1 items-center justify-center bg-surface-secondary p-md"
+      className="flex min-h-full flex-1 items-center justify-center bg-surface-secondary p-4"
     >
       <div className="w-full max-w-sm">
-        <p className="mb-lg text-center text-h3 text-text-primary">
+        <p className="mb-6 text-center text-h3 text-text-primary">
           Groundwork
         </p>
 
         <Card>
-          <h1 className="mb-lg text-h2 text-text-primary">{title}</h1>
+          <h1 className="mb-6 text-h2 text-text-primary">{title}</h1>
 
           {children}
 
-          <p className="mt-lg text-center text-body-small text-text-secondary">
+          <p className="mt-6 text-center text-body-small text-text-secondary">
             {toggle.prompt}{" "}
             <Link href={toggle.href} className="text-primary hover:underline">
               {toggle.label}

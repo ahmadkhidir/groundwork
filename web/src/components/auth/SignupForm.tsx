@@ -103,7 +103,7 @@ export function SignupForm() {
   }
 
   return (
-    <form onSubmit={handleSubmit} noValidate className="flex flex-col gap-md">
+    <form onSubmit={handleSubmit} noValidate className="flex flex-col gap-4">
       {!online && (
         <AuthBanner
           variant="offline"

@@ -58,7 +58,7 @@ export function ForgotPasswordForm() {
 
   if (submitted) {
     return (
-      <div className="flex flex-col gap-md">
+      <div className="flex flex-col gap-4">
         <p className="text-body text-text-primary">
           If an account exists for <strong>{email}</strong>, reset instructions
           have been sent.
@@ -71,7 +71,7 @@ export function ForgotPasswordForm() {
   }
 
   return (
-    <form onSubmit={handleSubmit} noValidate className="flex flex-col gap-md">
+    <form onSubmit={handleSubmit} noValidate className="flex flex-col gap-4">
       {!online && (
         <AuthBanner
           variant="offline"

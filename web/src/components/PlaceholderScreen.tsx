@@ -36,19 +36,19 @@ export function PlaceholderScreen({
   children,
 }: PlaceholderScreenProps) {
   return (
-    <main id="main-content" className="mx-auto w-full max-w-3xl p-xl">
+    <main id="main-content" className="mx-auto w-full max-w-3xl p-8">
       <Card>
-        <div className="flex items-start justify-between gap-md">
+        <div className="flex items-start justify-between gap-4">
           <div className="min-w-0">
             <p className="text-caption uppercase tracking-wide text-text-secondary">
               Screen {screen}
             </p>
-            <h1 className="mt-xs text-h1 text-text-primary">Not built yet</h1>
+            <h1 className="mt-1 text-h1 text-text-primary">Not built yet</h1>
           </div>
           <StatusPill variant="neutral">Placeholder</StatusPill>
         </div>
 
-        <dl className="mt-lg grid grid-cols-[auto_1fr] gap-x-md gap-y-sm text-body-small">
+        <dl className="mt-6 grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 text-body-small">
           <dt className="text-text-secondary">Spec</dt>
           <dd className="font-mono text-text-primary">{spec}</dd>
 
@@ -67,7 +67,7 @@ export function PlaceholderScreen({
             ))}
         </dl>
 
-        {children && <div className="mt-lg">{children}</div>}
+        {children && <div className="mt-6">{children}</div>}
       </Card>
     </main>
   );

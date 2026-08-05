@@ -53,8 +53,8 @@ export function StatusPill({
   return (
     <span
       className={cn(
-        "inline-flex items-center gap-xs",
-        "rounded-sm px-sm py-[2px]",
+        "inline-flex items-center gap-1",
+        "rounded-sm px-2 py-[2px]",
         "text-caption font-medium uppercase tracking-wide",
         VARIANT_CLASSES[variant],
         className,

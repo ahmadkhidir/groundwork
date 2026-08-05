@@ -39,14 +39,14 @@ export const PasswordField = forwardRef<HTMLInputElement, PasswordFieldProps>(
     const hasError = Boolean(error);
 
     return (
-      <div className="flex flex-col gap-xs">
+      <div className="flex flex-col gap-1">
         <label htmlFor={inputId} className="text-body text-text-primary">
           {label}
         </label>
 
         <div
           className={cn(
-            "flex h-(--size-input-height) items-center rounded-md border bg-surface pl-sm",
+            "flex h-(--size-input-height) items-center rounded-md border bg-surface pl-2",
             hasError ? "border-error" : "border-border",
             !hasError && "focus-within:border-primary",
             disabled && "bg-surface-secondary opacity-50",
@@ -73,7 +73,7 @@ export const PasswordField = forwardRef<HTMLInputElement, PasswordFieldProps>(
             disabled={disabled}
             aria-label={visible ? "Hide password" : "Show password"}
             aria-pressed={visible}
-            className="touch-target flex shrink-0 items-center justify-center px-sm text-text-secondary hover:text-text-primary disabled:cursor-not-allowed"
+            className="touch-target flex shrink-0 items-center justify-center px-2 text-text-secondary hover:text-text-primary disabled:cursor-not-allowed"
           >
             {visible ? (
               <EyeOff size={18} aria-hidden="true" />

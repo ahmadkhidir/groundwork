@@ -24,18 +24,18 @@ export default function GlobalError({
   }, [error]);
 
   return (
-    <main id="main-content" className="mx-auto w-full max-w-xl p-xl">
+    <main id="main-content" className="mx-auto w-full max-w-xl p-8">
       <Card>
         <h1 className="text-h2 text-text-primary">Something went wrong</h1>
-        <p className="mt-sm text-body text-text-secondary">
+        <p className="mt-2 text-body text-text-secondary">
           The page could not be loaded. Your data is unaffected.
         </p>
         {error.digest && (
-          <p className="mt-sm font-mono text-body-small text-text-secondary">
+          <p className="mt-2 font-mono text-body-small text-text-secondary">
             Reference: {error.digest}
           </p>
         )}
-        <div className="mt-lg">
+        <div className="mt-6">
           <Button onClick={reset}>Try again</Button>
         </div>
       </Card>

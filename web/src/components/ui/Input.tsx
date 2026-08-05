@@ -31,7 +31,7 @@ export const Input = forwardRef<HTMLInputElement, InputProps>(function Input(
   const hasError = Boolean(error);
 
   return (
-    <div className="flex flex-col gap-xs">
+    <div className="flex flex-col gap-1">
       <label htmlFor={inputId} className="text-body text-text-primary">
         {label}
       </label>
@@ -43,7 +43,7 @@ export const Input = forwardRef<HTMLInputElement, InputProps>(function Input(
         aria-invalid={hasError || undefined}
         aria-describedby={hasError ? errorId : hint ? hintId : undefined}
         className={cn(
-          "h-(--size-input-height) w-full rounded-md px-sm",
+          "h-(--size-input-height) w-full rounded-md px-2",
           "text-body text-text-primary",
           "border bg-surface",
           "placeholder:text-text-secondary",
