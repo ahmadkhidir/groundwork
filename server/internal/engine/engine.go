@@ -50,6 +50,17 @@ type Handle interface {
 	// rather than let it run to completion unobserved. Implementations must honour it.
 	Query(ctx context.Context, sql string, args ...any) (Rows, error)
 
+	// Exec runs a statement that does not produce a row set — DDL, COPY, and other ingest-time
+	// statements — and reports the number of rows affected where the underlying engine reports one.
+	//
+	// Added by FEAT-004 (Wave 3), widening the seam beyond Query deliberately rather than loosening
+	// Query's read-only contract: the Ingest Pipeline genuinely needs to run CREATE/COPY/INSTALL
+	// statements against the workspace's engine (normalizing an uploaded file into Parquet), and
+	// Query's doc comment above scopes it to read-only analytical queries on purpose — narrating a
+	// COPY statement through it would be the wrong fix, not a shortcut. Every other caller of Handle
+	// (the future orchestrator's execute/generate_sql steps) is unaffected: it only ever needs Query.
+	Exec(ctx context.Context, sql string, args ...any) (int64, error)
+
 	// AcquiredAt reports when the lease began, for engine-seconds metering.
 	AcquiredAt() time.Time
 }

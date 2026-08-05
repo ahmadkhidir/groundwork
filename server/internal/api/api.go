@@ -17,6 +17,7 @@ import (
 	"github.com/ahmadkhidir/groundwork/server/internal/auth"
 	"github.com/ahmadkhidir/groundwork/server/internal/authsession"
 	"github.com/ahmadkhidir/groundwork/server/internal/config"
+	"github.com/ahmadkhidir/groundwork/server/internal/ingest"
 )
 
 // Dependencies bundles every wave-2-and-later collaborator NewServer needs, beyond auth. Grouped
@@ -35,6 +36,14 @@ type Dependencies struct {
 	Datasets   DatasetStore
 	Objects    ObjectStore
 	AuditLog   AuditStore
+
+	// IngestDatasets, IngestPipeline, and IngestTracker back FEAT-004's endpoints. Datasets above
+	// (FEAT-003's narrower Create-only seam) is left untouched; this is an additive, wider seam over
+	// the same underlying DatasetRepository, satisfied by IngestDatasetStore/IngestPipeline in
+	// ingest.go.
+	IngestDatasets IngestDatasetStore
+	IngestPipeline IngestPipeline
+	IngestTracker  *ingest.Tracker
 }
 
 // Server wires configuration and dependencies into an http.Handler.
@@ -113,6 +122,11 @@ func (s *Server) routes() {
 				// FEAT-042: visible model-egress / audit log.
 				if s.deps.AuditLog != nil {
 					RegisterAuditRoutes(r, s.deps.Workspaces, s.deps.AuditLog, s.logger)
+				}
+
+				// FEAT-004: session-scoped engine provisioning and ingest.
+				if s.deps.IngestDatasets != nil && s.deps.IngestPipeline != nil && s.deps.IngestTracker != nil {
+					RegisterIngestRoutes(r, s.deps.Workspaces, s.deps.IngestDatasets, s.deps.IngestPipeline, s.deps.IngestTracker, s.logger)
 				}
 			})
 		}

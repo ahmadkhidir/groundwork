@@ -18,6 +18,8 @@ import (
 	"github.com/ahmadkhidir/groundwork/server/internal/audit"
 	"github.com/ahmadkhidir/groundwork/server/internal/auth"
 	"github.com/ahmadkhidir/groundwork/server/internal/config"
+	"github.com/ahmadkhidir/groundwork/server/internal/engine"
+	"github.com/ahmadkhidir/groundwork/server/internal/ingest"
 	"github.com/ahmadkhidir/groundwork/server/internal/storage"
 	"github.com/ahmadkhidir/groundwork/server/internal/store/postgres"
 )
@@ -70,13 +72,27 @@ func run(logger *slog.Logger) error {
 		Region:          cfg.Storage.Region,
 	})
 
+	// The Engine Provider seam (internal/engine.Provider), wired here rather than in internal/api so
+	// no HTTP-layer package ever needs to know it's DuckDB, or engine.LocalProvider specifically —
+	// architecture.md's "implementation #1" of the seam, running in-process rather than as a Fly
+	// Machine (see engine/local_provider.go's doc comment).
+	engineProvider := engine.NewLocalProvider(cfg.EngineIdleTimeout, logger)
+
+	datasetRepo := postgres.NewDatasetRepository(pool)
+	ingestTracker := ingest.NewTracker()
+	ingestPipeline := ingest.NewPipeline(datasetRepo, objectStore, engineProvider, ingestTracker, logger)
+
 	deps := api.Dependencies{
 		AuthSecret: cfg.AuthSecret,
 		Workspaces: postgres.NewWorkspaceRepository(pool),
 		Users:      userRepo,
-		Datasets:   postgres.NewDatasetRepository(pool),
+		Datasets:   datasetRepo,
 		Objects:    objectStore,
 		AuditLog:   auditRepo,
+
+		IngestDatasets: datasetRepo,
+		IngestPipeline: ingestPipeline,
+		IngestTracker:  ingestTracker,
 	}
 
 	server := &http.Server{

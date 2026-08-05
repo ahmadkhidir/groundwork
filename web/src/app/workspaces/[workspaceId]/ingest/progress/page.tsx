@@ -1,20 +1,18 @@
 import type { Metadata } from "next";
-import { PlaceholderScreen } from "@/components/PlaceholderScreen";
+import { IngestProgressScreen } from "@/components/ingest/IngestProgressScreen";
 
 export const metadata: Metadata = { title: "Ingesting" };
 
-/** Route: `/workspaces/[workspaceId]/ingest/progress` — see docs/Groundwork/screens/06-ingest-progress.md */
+/**
+ * Route: `/workspaces/[workspaceId]/ingest/progress` — see docs/Groundwork/screens/06-ingest-progress.md.
+ *
+ * FEAT-004 (this wave) drives "Provisioning engine" and "Loading data". "Profiling columns" and
+ * "Finding relationships" are structurally present in the step indicator but not yet driven —
+ * FEAT-005 and FEAT-008 land in Wave 4. See IngestProgressScreen's doc comment.
+ */
 export default async function Page(props: PageProps<"/workspaces/[workspaceId]/ingest/progress">) {
   // params is a Promise in Next 16; synchronous access was removed.
-  const params = await props.params;
+  const { workspaceId } = await props.params;
 
-  return (
-    <PlaceholderScreen
-      screen="06 — Ingest Progress"
-      spec="screens/06-ingest-progress.md"
-      features="FEAT-004, FEAT-005"
-      phase="Phase 1"
-      params={params}
-    />
-  );
+  return <IngestProgressScreen workspaceId={workspaceId} />;
 }

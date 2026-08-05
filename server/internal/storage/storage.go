@@ -82,3 +82,26 @@ func (c *Client) PutObject(ctx context.Context, key string, content io.Reader, s
 func (c *Client) Bucket() string {
 	return c.bucket
 }
+
+// GetObject retrieves the object at key. Callers MUST Close the returned reader.
+//
+// Added by FEAT-004 (Wave 3): the Ingest Pipeline reads back the originally-uploaded file FEAT-003
+// wrote (at DatasetKey) so it can be loaded into the engine and normalized into Parquet. Additive to
+// this package's read path only — PutObject and DatasetKey's semantics are unchanged.
+func (c *Client) GetObject(ctx context.Context, key string) (io.ReadCloser, error) {
+	out, err := c.s3.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(c.bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("storage: getting object %q: %w", key, err)
+	}
+	return out.Body, nil
+}
+
+// NormalizedDatasetKey builds the object key for a dataset's normalized, canonical Parquet form —
+// the durable artifact FEAT-004's Ingest Pipeline writes, independent of the engine's lifecycle per
+// architecture.md's Data Architecture. Mirrors DatasetKey's convention.
+func NormalizedDatasetKey(workspaceID, datasetID string) string {
+	return fmt.Sprintf("workspaces/%s/datasets/%s/normalized/data.parquet", workspaceID, datasetID)
+}

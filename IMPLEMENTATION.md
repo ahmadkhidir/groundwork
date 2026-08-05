@@ -345,7 +345,7 @@ loaded via `next/font` and bound to `--font-display`, `--font-body`, `--font-mon
 | Phase | Features | Status |
 |---|---|---|
 | **A — Foundation** | Scaffold, theme tokens, schema entities, auth, routing skeleton, docker-compose | **Complete** |
-| **1 — Foundation: Workspace, Ingest & Trust** | FEAT-001 ✅ 002 ✅ 003 ✅ 042 ✅ 044 ✅ · 004, 005, 006, 007, 008, 009, 011 | In progress (wave 2 of 5) |
+| **1 — Foundation: Workspace, Ingest & Trust** | FEAT-001 ✅ 002 ✅ 003 ✅ 004 ✅ 042 ✅ 044 ✅ · 005, 006, 007, 008, 009, 011 | In progress (wave 3 of 5) |
 | **2 — Core Grounded Answer Loop** | FEAT-013, 014, 015, 016, 017, 018, 019, 020 | Not started |
 | **3 — Trust & Observability** | FEAT-022, 023, 024, 027, 028, 029, 030 | Not started |
 | **4 — Reports & Delivery** | FEAT-034, 035, 036, 041, 043 | Not started |
@@ -372,6 +372,14 @@ loaded via `next/font` and bound to `--font-display`, `--font-body`, `--font-mon
 
 **Placeholders are replaced, not wrapped.** A feature slice deletes the `PlaceholderScreen` call and
 the route's 501 handler; it does not build around them.
+
+### Open items from Wave 3 (FEAT-004) — for Wave 4 to close
+
+| Item | Detail | Owner |
+|---|---|---|
+| **Ingest ends at `profiling`, not `complete`** | The SSE stream emits `done` when the pipeline hands off at `ingest_status = "profiling"`, because nothing consumes that state yet. Gating on `complete` today would hang the screen forever. | FEAT-005 — move `done` to real completion |
+| **"Profiling columns" shows an active progress bar with nothing behind it** | Step 3 renders as in-progress on handoff. `branding.md`'s honest-status principle makes this the one visibly dishonest element in the flow, and it is only acceptable because FEAT-005 lands next. | FEAT-005 |
+| **Excel/SQLite ingest needs outbound network on first use** | `INSTALL spatial` / `INSTALL sqlite` fetch from `extensions.duckdb.org` at ingest time. Works locally; in a locked-down production container the first Excel or SQLite upload would fail. Preinstalling the extensions at image-build time is the fix. **Not covered by `risk_log.md`** — route to product-shaper. | Deployment / FEAT-011 |
 
 ### Known divergences — code behind docs
 
@@ -439,9 +447,16 @@ make test                            # Test
 make test-race                       # Test with race detector
 make fmt                             # gofmt check (reports; never rewrites)
 make check                           # fmt + vet + test — what CI runs
-goose -dir migrations postgres "$DATABASE_URL" up      # Apply migrations
-goose -dir migrations postgres "$DATABASE_URL" down    # Roll back one
-goose -dir migrations create <name> sql                # New migration
+# goose is NOT vendored or installed by the repo. Either install it once —
+#   go install github.com/pressly/goose/v3/cmd/goose@latest   (needs ~/go/bin on PATH)
+# — or run it without installing, which is what the commands below assume:
+GOOSE="go run github.com/pressly/goose/v3/cmd/goose@latest"
+export DATABASE_URL="postgres://groundwork:groundwork@localhost:5432/groundwork?sslmode=disable"
+
+$GOOSE -dir migrations postgres "$DATABASE_URL" up      # Apply migrations
+$GOOSE -dir migrations postgres "$DATABASE_URL" down    # Roll back one
+$GOOSE -dir migrations postgres "$DATABASE_URL" status  # What is applied
+$GOOSE -dir migrations create <name> sql                # New migration
 ```
 
 **Windows prerequisites** (Linux/macOS need none of this — they use the bundled static libraries,
