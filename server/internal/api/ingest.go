@@ -18,6 +18,11 @@ import (
 // state, satisfied by internal/store/postgres.DatasetRepository.
 type IngestDatasetStore interface {
 	ListInProgressByWorkspace(ctx context.Context, workspaceID string) ([]domain.Dataset, error)
+	// ListByWorkspace returns every dataset ever uploaded to the workspace, regardless of status.
+	// Used only to compute the batch's total file count for screens/06's "(if 2+ files)" condition on
+	// the "Finding relationships" step — ListInProgressByWorkspace alone under-counts that batch once
+	// any file in it has already reached "complete" and dropped out of the in-progress list.
+	ListByWorkspace(ctx context.Context, workspaceID string) ([]domain.Dataset, error)
 }
 
 // IngestPipeline is the seam RegisterIngestRoutes depends on for starting ingest, satisfied by
@@ -60,13 +65,20 @@ type publicIngestDataset struct {
 // ingestStreamEvent is the SSE payload screens/06-ingest-progress.md's step indicator renders from.
 type ingestStreamEvent struct {
 	Datasets []publicIngestDataset `json:"datasets"`
-	// OverallStep is the least-advanced step across every dataset in the batch — what the single,
-	// shared step indicator shows — or "failed" if any dataset failed.
+	// OverallStep is the least-advanced step across every dataset still in progress — what the
+	// single, shared step indicator shows — or "failed" if any dataset failed.
 	OverallStep string `json:"overall_step"`
-	// Done is true once every dataset has left this package's scope (handed off to "profiling" or
-	// beyond) or failed — the client's signal to stop polling and, on success, auto-navigate to
-	// Ingest Confirmation (screens/06's Data Flow step 3). It intentionally does NOT wait for
-	// profiling/relationship-inference to finish, since FEAT-004 hands off before those run.
+	// TotalDatasets is every dataset ever uploaded in this workspace, regardless of status — the
+	// count screens/06's "Finding relationships (if 2+ files)" condition is evaluated against. Kept
+	// separate from len(Datasets), which only reflects datasets still in progress and would
+	// under-count (and flicker the relationships step's visibility) the moment any one file in a
+	// multi-file batch reaches "complete" first.
+	TotalDatasets int `json:"total_datasets"`
+	// Done is true once every dataset in the workspace has reached a genuinely terminal state:
+	// ingest_status "complete" (profiling, and relationship inference when applicable, both
+	// finished — FEAT-005/FEAT-008's real completion, not FEAT-004's earlier "profiling" handoff) or
+	// "failed". This is the client's signal to stop polling and, on success, auto-navigate to Ingest
+	// Confirmation (screens/06's Data Flow step 3).
 	Done bool `json:"done"`
 }
 
@@ -178,6 +190,11 @@ func handleIngestStream(workspaces WorkspaceStore, datasets IngestDatasetStore, 
 
 // buildIngestStreamEvent computes the current aggregate ingest state for workspaceID.
 func buildIngestStreamEvent(ctx context.Context, datasets IngestDatasetStore, tracker *ingest.Tracker, workspaceID string) (ingestStreamEvent, error) {
+	total, err := datasets.ListByWorkspace(ctx, workspaceID)
+	if err != nil {
+		return ingestStreamEvent{}, fmt.Errorf("listing workspace datasets: %w", err)
+	}
+
 	inProgress, err := datasets.ListInProgressByWorkspace(ctx, workspaceID)
 	if err != nil {
 		return ingestStreamEvent{}, fmt.Errorf("listing in-progress datasets: %w", err)
@@ -185,16 +202,24 @@ func buildIngestStreamEvent(ctx context.Context, datasets IngestDatasetStore, tr
 
 	if len(inProgress) == 0 {
 		// Nothing pending, provisioning, profiling, or failed for this workspace — either nothing has
-		// ever been uploaded, or everything already reached "complete" in a later wave. Either way,
-		// there is nothing left for this screen to show.
-		return ingestStreamEvent{Datasets: []publicIngestDataset{}, OverallStep: string(ingest.StepProfiling), Done: true}, nil
+		// ever been uploaded, or every dataset has already reached the true terminal "complete" state
+		// (FEAT-005/FEAT-008 both finished, where applicable). Either way, there is nothing left for
+		// this screen to show, and it is genuinely done — not merely handed off.
+		return ingestStreamEvent{
+			Datasets:      []publicIngestDataset{},
+			OverallStep:   string(ingest.StepRelationships),
+			TotalDatasets: len(total),
+			Done:          true,
+		}, nil
 	}
 
-	event := ingestStreamEvent{Datasets: make([]publicIngestDataset, 0, len(inProgress))}
+	event := ingestStreamEvent{
+		Datasets:      make([]publicIngestDataset, 0, len(inProgress)),
+		TotalDatasets: len(total),
+	}
 
 	overall := ingest.StepRelationships // start at the most-advanced step; narrow down below
 	anyFailed := false
-	allHandedOff := true
 
 	for _, ds := range inProgress {
 		state := ingest.StateFor(tracker, ds)
@@ -210,9 +235,6 @@ func buildIngestStreamEvent(ctx context.Context, datasets IngestDatasetStore, tr
 			anyFailed = true
 			continue
 		}
-		if state.Step != ingest.StepProfiling && state.Step != ingest.StepRelationships {
-			allHandedOff = false
-		}
 		if stepOrder[state.Step] < stepOrder[overall] {
 			overall = state.Step
 		}
@@ -225,9 +247,10 @@ func buildIngestStreamEvent(ctx context.Context, datasets IngestDatasetStore, tr
 	}
 
 	event.OverallStep = string(overall)
-	// Done once FEAT-004 has handed every dataset in the batch off to profiling — this package's own
-	// scope ends there; it does not wait for FEAT-005/FEAT-008 to actually run.
-	event.Done = allHandedOff
+	// Not done: at least one dataset is still short of the true terminal "complete" state (the
+	// len(inProgress) == 0 branch above is what reports Done once every dataset has actually
+	// finished, including profiling and, when applicable, relationship inference).
+	event.Done = false
 	return event, nil
 }
 

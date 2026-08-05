@@ -183,6 +183,21 @@ func (r *DatasetRepository) CompleteLoad(ctx context.Context, id, parquetLocatio
 	return nil
 }
 
+// CompleteIngest marks a dataset's ingest_status "complete" — the true end of the whole pipeline,
+// reached once FEAT-005 (profiling) and, when applicable, FEAT-008 (relationship inference) have both
+// finished for this dataset. Added by Wave 4 to close the open item left by FEAT-004 (Wave 3):
+// CompleteLoad above deliberately stops at "profiling," which is not schema.md's terminal state.
+func (r *DatasetRepository) CompleteIngest(ctx context.Context, id string) error {
+	_, err := r.pool.Exec(ctx,
+		`UPDATE datasets SET ingest_status = $2, ingest_error = '' WHERE id = $1`,
+		id, string(domain.IngestComplete),
+	)
+	if err != nil {
+		return fmt.Errorf("completing ingest: %w", err)
+	}
+	return nil
+}
+
 // MarkFailed records a specific, actionable ingest failure reason and moves the dataset to its
 // terminal "failed" state — FEAT-004's acceptance criterion "Ingest failure surfaces a specific,
 // actionable error."

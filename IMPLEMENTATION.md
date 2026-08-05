@@ -345,7 +345,7 @@ loaded via `next/font` and bound to `--font-display`, `--font-body`, `--font-mon
 | Phase | Features | Status |
 |---|---|---|
 | **A — Foundation** | Scaffold, theme tokens, schema entities, auth, routing skeleton, docker-compose | **Complete** |
-| **1 — Foundation: Workspace, Ingest & Trust** | FEAT-001 ✅ 002 ✅ 003 ✅ 004 ✅ 042 ✅ 044 ✅ · 005, 006, 007, 008, 009, 011 | In progress (wave 3 of 5) |
+| **1 — Foundation: Workspace, Ingest & Trust** | FEAT-001 ✅ 002 ✅ 003 ✅ 004 ✅ 005 ✅ 008 ✅ 011 ✅ 042 ✅ 044 ✅ · 006, 007, 009 | In progress (wave 4 of 5) |
 | **2 — Core Grounded Answer Loop** | FEAT-013, 014, 015, 016, 017, 018, 019, 020 | Not started |
 | **3 — Trust & Observability** | FEAT-022, 023, 024, 027, 028, 029, 030 | Not started |
 | **4 — Reports & Delivery** | FEAT-034, 035, 036, 041, 043 | Not started |
@@ -373,13 +373,19 @@ loaded via `next/font` and bound to `--font-display`, `--font-body`, `--font-mon
 **Placeholders are replaced, not wrapped.** A feature slice deletes the `PlaceholderScreen` call and
 the route's 501 handler; it does not build around them.
 
-### Open items from Wave 3 (FEAT-004) — for Wave 4 to close
+### Open items
+
+Wave 3's first two items are **closed** by Wave 4: the ingest pipeline now runs through to
+`ingest_status = "complete"`, and "Profiling columns" reflects real work.
 
 | Item | Detail | Owner |
 |---|---|---|
-| **Ingest ends at `profiling`, not `complete`** | The SSE stream emits `done` when the pipeline hands off at `ingest_status = "profiling"`, because nothing consumes that state yet. Gating on `complete` today would hang the screen forever. | FEAT-005 — move `done` to real completion |
-| **"Profiling columns" shows an active progress bar with nothing behind it** | Step 3 renders as in-progress on handoff. `branding.md`'s honest-status principle makes this the one visibly dishonest element in the flow, and it is only acceptable because FEAT-005 lands next. | FEAT-005 |
-| **Excel/SQLite ingest needs outbound network on first use** | `INSTALL spatial` / `INSTALL sqlite` fetch from `extensions.duckdb.org` at ingest time. Works locally; in a locked-down production container the first Excel or SQLite upload would fail. Preinstalling the extensions at image-build time is the fix. **Not covered by `risk_log.md`** — route to product-shaper. | Deployment / FEAT-011 |
+| **Excel/SQLite ingest needs outbound network on first use** | `INSTALL spatial` / `INSTALL sqlite` fetch from `extensions.duckdb.org` at ingest time. Works locally; in a locked-down production container the first Excel or SQLite upload would fail. Preinstalling the extensions at image-build time is the fix. **Not covered by `risk_log.md`** — route to product-shaper. | Deployment |
+| **`type_confidence` and join-confidence formulas are undocumented** | Nothing in `docs/` defines either. The heuristics live in `profiling.go` (`confidenceBaseByType`) and `relationships.go` (weighted formula, `MinConfidenceToPersist`). These numbers are shown to users as trust signals, so leaving them to implementation discretion is a product decision by default — route to product-shaper. | Product |
+| **`features.md` FEAT-005 mentions min/max; `schema.md`'s `Column` has no such fields** | The two documents disagree, and the acceptance criteria don't require min/max. Either add `min_value`/`max_value` to the schema (+ migration) or drop it from the description. Nothing was invented in code. | Product |
+| **Screen 04's semantic-layer summary panel has no FEAT ID** | The only component on that screen without one. Assumed FEAT-019 in a code comment rather than guessed silently. | Product |
+| **Screen 04's "Upload data" button renders unconditionally** | Spec says "shown when no files ingested yet", but the screen has no dataset-presence endpoint. Documented in code; needs either an endpoint or a spec change. | Wave 5 / FEAT-034 |
+| **PII fields written as safe defaults** | Every profiled column gets `pii_flag: false`, `pii_pattern: ""` — PII detection is FEAT-007 (Wave 5), following the established "safe default until the owning feature lands" pattern. | FEAT-007 |
 
 ### Known divergences — code behind docs
 

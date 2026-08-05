@@ -41,10 +41,37 @@ type session struct {
 	// re-provisioned by a fresh Acquire — the timer captures the generation it was armed for and
 	// only tears down if the session is still on that generation when it fires.
 	generation int
+	// acquiring is true for the span between an Acquire deciding the engine needs to be (re)opened
+	// and ensureOpen returning — what Provider.Status reports as StatusWaking. FEAT-011's honest-
+	// status principle requires this to be observable even though the local implementation's own
+	// open is fast; a future remote/pooled Provider implementation behind the same seam may take
+	// much longer, and callers must never be able to tell the difference from Status's vocabulary
+	// alone.
+	acquiring bool
+
+	// notify is called on every observed sleeping/waking/ready transition for this session, or nil
+	// if the Provider was constructed without WithStatusChangeHook. See LocalProvider's doc comment
+	// on why this is a hook rather than a direct persistence call from this package.
+	notify StatusChangeFunc
 }
 
-func newSession(workspaceID string) *session {
-	return &session{workspaceID: workspaceID, sem: make(chan struct{}, 1)}
+func newSession(workspaceID string, notify StatusChangeFunc) *session {
+	return &session{workspaceID: workspaceID, sem: make(chan struct{}, 1), notify: notify}
+}
+
+// setAcquiring records whether this session is currently in the span between deciding to open the
+// engine and that open completing.
+func (s *session) setAcquiring(v bool) {
+	s.mu.Lock()
+	s.acquiring = v
+	s.mu.Unlock()
+}
+
+// isAcquiring reports the in-flight-open state Provider.Status surfaces as StatusWaking.
+func (s *session) isAcquiring() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.acquiring
 }
 
 // ensureOpen opens the DuckDB connection if this is the first Acquire since provisioning or the last
@@ -85,15 +112,24 @@ func (s *session) isOpen() bool {
 // guarding against a stale idle timer racing a fresh Acquire.
 func (s *session) teardown(expectGeneration int, logger *slog.Logger) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if s.db == nil || s.generation != expectGeneration {
+		s.mu.Unlock()
 		return
 	}
-	if err := s.db.Close(); err != nil {
+	err := s.db.Close()
+	s.db = nil
+	notify := s.notify
+	s.mu.Unlock()
+
+	if err != nil {
 		logger.Error("closing idle engine", slog.String("workspace_id", s.workspaceID), slog.String("error", err.Error()))
 	}
-	s.db = nil
+	// Notified AFTER releasing s.mu: the hook may itself call back into this Provider (e.g. a test
+	// asserting Status()), and Status takes p.mu, never s.mu directly, so there is no lock-ordering
+	// hazard here — this is simply hygiene against holding a lock across an external callback.
+	if notify != nil {
+		notify(s.workspaceID, StatusSleeping)
+	}
 }
 
 func (s *session) armIdleTimer(idleTimeout time.Duration, logger *slog.Logger) {
@@ -117,6 +153,37 @@ func (s *session) cancelIdleTimer() {
 	s.mu.Unlock()
 }
 
+// StatusChangeFunc is notified whenever a workspace's engine transitions between sleeping, waking,
+// and ready.
+//
+// Called synchronously from whichever goroutine drove the transition (Acquire or an idle-teardown
+// timer firing) and must not block or panic — a slow or failing hook must never stall the engine
+// lifecycle itself. Implementations that need to do I/O (e.g. persisting to Postgres) should apply
+// their own timeout and treat failure as log-and-continue, exactly as
+// postgres.WorkspaceRepository.EngineStatusHook does.
+type StatusChangeFunc func(workspaceID string, status Status)
+
+// Option configures optional LocalProvider behavior beyond its required constructor parameters.
+//
+// Additive by design: NewLocalProvider's existing positional parameters (idleTimeout, logger) never
+// change shape, so every existing call site — including internal/ingest's tests, which construct a
+// LocalProvider directly — keeps compiling unchanged as options are added.
+type Option func(*LocalProvider)
+
+// WithStatusChangeHook registers fn to be notified on every observed engine status transition, for
+// every workspace this Provider serves.
+//
+// This exists so a persisted record (e.g. workspaces.engine_status, read by screens like Workspace
+// List that display many workspaces without querying this Provider per row) can be kept honest as a
+// side effect of the transition, rather than staying frozen at whatever it was written as. The
+// Provider itself has no persistence dependency — it only calls the hook it was given, keeping
+// internal/engine's only job the engine lifecycle itself.
+func WithStatusChangeHook(fn StatusChangeFunc) Option {
+	return func(p *LocalProvider) {
+		p.onStatusChange = fn
+	}
+}
+
 // LocalProvider is a Provider backed by one in-process DuckDB connection per workspace.
 //
 // Safe for concurrent use across many workspaces: the top-level map is guarded by its own mutex, and
@@ -127,15 +194,29 @@ type LocalProvider struct {
 	sessions    map[string]*session
 	idleTimeout time.Duration
 	logger      *slog.Logger
+	// onStatusChange is nil unless WithStatusChangeHook was supplied; notifyStatus below is a no-op
+	// in that case.
+	onStatusChange StatusChangeFunc
 }
 
 // NewLocalProvider constructs a LocalProvider. idleTimeout is config.Config.EngineIdleTimeout —
 // architecture.md's ~10 minute idle-teardown threshold.
-func NewLocalProvider(idleTimeout time.Duration, logger *slog.Logger) *LocalProvider {
-	return &LocalProvider{
+func NewLocalProvider(idleTimeout time.Duration, logger *slog.Logger, opts ...Option) *LocalProvider {
+	p := &LocalProvider{
 		sessions:    make(map[string]*session),
 		idleTimeout: idleTimeout,
 		logger:      logger,
+	}
+	for _, opt := range opts {
+		opt(p)
+	}
+	return p
+}
+
+// notifyStatus calls the configured status-change hook, if any.
+func (p *LocalProvider) notifyStatus(workspaceID string, status Status) {
+	if p.onStatusChange != nil {
+		p.onStatusChange(workspaceID, status)
 	}
 }
 
@@ -145,7 +226,7 @@ func (p *LocalProvider) sessionFor(workspaceID string) *session {
 
 	s, ok := p.sessions[workspaceID]
 	if !ok {
-		s = newSession(workspaceID)
+		s = newSession(workspaceID, p.onStatusChange)
 		p.sessions[workspaceID] = s
 	}
 	return s
@@ -171,9 +252,25 @@ func (p *LocalProvider) Acquire(ctx context.Context, workspaceID string) (Handle
 
 	s.cancelIdleTimer()
 
-	if err := s.ensureOpen(); err != nil {
+	// Only the actually-cold path is a real wake: re-acquiring an engine that never went to sleep
+	// (the common case — most questions arrive while the previous one is still warm) must not flash
+	// a spurious "waking" at the status pill.
+	wasOpen := s.isOpen()
+	if !wasOpen {
+		s.setAcquiring(true)
+		p.notifyStatus(workspaceID, StatusWaking)
+	}
+
+	err := s.ensureOpen()
+	s.setAcquiring(false)
+
+	if err != nil {
 		<-s.sem // free the slot we took above — this Acquire never took the engine
 		return nil, fmt.Errorf("%w: %w", ErrEngineUnavailable, err)
+	}
+
+	if !wasOpen {
+		p.notifyStatus(workspaceID, StatusReady)
 	}
 
 	s.mu.Lock()
@@ -202,16 +299,23 @@ func (p *LocalProvider) Release(handle Handle) error {
 
 // Status implements Provider. It never provisions — a workspace with no session yet, or one whose
 // engine has idled out, honestly reports sleeping rather than triggering a wake as a side effect of
-// being looked at.
+// being looked at. It does not even create a session map entry for an unseen workspace, precisely so
+// that "being read" and "having ever been acquired" stay observably distinct.
 func (p *LocalProvider) Status(ctx context.Context, workspaceID string) (Status, error) {
 	p.mu.Lock()
 	s, ok := p.sessions[workspaceID]
 	p.mu.Unlock()
 
-	if !ok || !s.isOpen() {
+	if !ok {
 		return StatusSleeping, nil
 	}
-	return StatusReady, nil
+	if s.isAcquiring() {
+		return StatusWaking, nil
+	}
+	if s.isOpen() {
+		return StatusReady, nil
+	}
+	return StatusSleeping, nil
 }
 
 // localHandle is the Handle LocalProvider hands out. Not safe for concurrent use by multiple

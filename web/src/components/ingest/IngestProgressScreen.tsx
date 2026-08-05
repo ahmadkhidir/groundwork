@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { AlertTriangle } from "lucide-react";
+import { AlertTriangle, CheckCircle2 } from "lucide-react";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { api, subscribeToStream } from "@/lib/api-client";
@@ -14,9 +14,12 @@ export interface IngestProgressScreenProps {
   workspaceId: string;
 }
 
+/** How long the Success state (screens/06's states table) is shown before auto-navigating. */
+const SUCCESS_DISPLAY_MS = 600;
+
 /**
- * Screen 6: Ingest Progress (screens/06-ingest-progress.md) — FEAT-004 (provisioning + loading,
- * this wave) and FEAT-005/FEAT-008 (profiling + relationship inference, Wave 4, not yet built).
+ * Screen 6: Ingest Progress (screens/06-ingest-progress.md) — FEAT-004 (provisioning + loading),
+ * FEAT-005 (profiling), and FEAT-008 (relationship inference, when 2+ files).
  *
  * Non-interactive by design (the spec is explicit: "no user action available... intentionally
  * non-interactive but never a bare unlabeled spinner"). The only affordance is "Back to Upload" on
@@ -26,6 +29,7 @@ export function IngestProgressScreen({ workspaceId }: IngestProgressScreenProps)
   const router = useRouter();
   const [event, setEvent] = useState<IngestStreamEvent | null>(null);
   const [connectionError, setConnectionError] = useState(false);
+  const [showSuccess, setShowSuccess] = useState(false);
   const navigatedRef = useRef(false);
   // Mirrors `event`'s done-ness for the onError closure below, which is registered once (on mount)
   // and would otherwise only ever see its first render's stale value.
@@ -72,14 +76,18 @@ export function IngestProgressScreen({ workspaceId }: IngestProgressScreenProps)
     };
   }, [workspaceId]);
 
-  // On success, auto-navigate to Ingest Confirmation (screens/06's Data Flow step 3). See
-  // IngestStreamEvent's doc comment: `done` fires once FEAT-004 hands off to profiling, not once the
-  // full pipeline (FEAT-005/008, Wave 4) finishes — the honest current boundary of what this product
-  // can do today, not a premature claim of full completion.
+  // On success: show a brief Success state (screens/06's states table — "Brief success state before
+  // auto-navigating") rather than navigating instantly, then move on to Ingest Confirmation
+  // (screens/06's Data Flow step 3). `done` now fires only once the whole pipeline (FEAT-004 through
+  // FEAT-008, when applicable) has genuinely finished — see IngestStreamEvent's doc comment.
   useEffect(() => {
     if (event?.done && event.overall_step !== "failed" && !navigatedRef.current) {
       navigatedRef.current = true;
-      router.push(routes.ingestConfirm(workspaceId));
+      setShowSuccess(true);
+      const timer = setTimeout(() => {
+        router.push(routes.ingestConfirm(workspaceId));
+      }, SUCCESS_DISPLAY_MS);
+      return () => clearTimeout(timer);
     }
   }, [event, workspaceId, router]);
 
@@ -109,6 +117,11 @@ export function IngestProgressScreen({ workspaceId }: IngestProgressScreenProps)
               Back to Upload
             </Button>
           </div>
+        ) : showSuccess ? (
+          <div className="flex flex-col items-center gap-3 py-4 text-center" role="status">
+            <CheckCircle2 size={28} className="text-success" aria-hidden="true" />
+            <p className="text-body font-medium text-text-primary">Your data is ready</p>
+          </div>
         ) : (
           <div className="flex flex-col gap-6">
             <CardHeader
@@ -121,7 +134,7 @@ export function IngestProgressScreen({ workspaceId }: IngestProgressScreenProps)
             />
             <StepIndicator
               currentStep={event?.overall_step ?? "provisioning"}
-              showRelationships={(event?.datasets.length ?? 0) >= 2}
+              showRelationships={(event?.total_datasets ?? 0) >= 2}
             />
           </div>
         )}

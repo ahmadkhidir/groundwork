@@ -76,15 +76,26 @@ func run(logger *slog.Logger) error {
 	// no HTTP-layer package ever needs to know it's DuckDB, or engine.LocalProvider specifically —
 	// architecture.md's "implementation #1" of the seam, running in-process rather than as a Fly
 	// Machine (see engine/local_provider.go's doc comment).
-	engineProvider := engine.NewLocalProvider(cfg.EngineIdleTimeout, logger)
+	workspaceRepo := postgres.NewWorkspaceRepository(pool)
+
+	// The status-change hook persists sleeping/waking/ready to workspaces.engine_status as the
+	// lifecycle actually transitions (FEAT-011). Screens listing many workspaces can then read the
+	// stored value instead of asking the Provider per row — which matters because engine.Provider's
+	// contract forbids Status from provoking a wake: merely looking at a workspace must never bill
+	// engine-seconds.
+	engineProvider := engine.NewLocalProvider(cfg.EngineIdleTimeout, logger,
+		engine.WithStatusChangeHook(workspaceRepo.EngineStatusHook(logger)))
 
 	datasetRepo := postgres.NewDatasetRepository(pool)
+	columnRepo := postgres.NewColumnRepository(pool)
+	candidateJoinRepo := postgres.NewCandidateJoinRepository(pool)
 	ingestTracker := ingest.NewTracker()
-	ingestPipeline := ingest.NewPipeline(datasetRepo, objectStore, engineProvider, ingestTracker, logger)
+	ingestPipeline := ingest.NewPipeline(
+		datasetRepo, objectStore, engineProvider, columnRepo, candidateJoinRepo, ingestTracker, logger)
 
 	deps := api.Dependencies{
 		AuthSecret: cfg.AuthSecret,
-		Workspaces: postgres.NewWorkspaceRepository(pool),
+		Workspaces: workspaceRepo,
 		Users:      userRepo,
 		Datasets:   datasetRepo,
 		Objects:    objectStore,
@@ -93,6 +104,13 @@ func run(logger *slog.Logger) error {
 		IngestDatasets: datasetRepo,
 		IngestPipeline: ingestPipeline,
 		IngestTracker:  ingestTracker,
+
+		// One DatasetRepository satisfies three deliberately narrow seams; see Dependencies' doc.
+		ProfilingDatasets: datasetRepo,
+		Columns:           columnRepo,
+		CandidateJoins:    candidateJoinRepo,
+
+		EngineProvider: engineProvider,
 	}
 
 	server := &http.Server{

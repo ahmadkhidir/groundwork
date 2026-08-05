@@ -44,6 +44,18 @@ func (f *fakeIngestDatasetStore) ListInProgressByWorkspace(ctx context.Context, 
 	return out, nil
 }
 
+func (f *fakeIngestDatasetStore) ListByWorkspace(ctx context.Context, workspaceID string) ([]domain.Dataset, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []domain.Dataset
+	for _, ds := range f.byID {
+		if ds.WorkspaceID == workspaceID {
+			out = append(out, ds)
+		}
+	}
+	return out, nil
+}
+
 func (f *fakeIngestDatasetStore) setStatus(id string, status domain.IngestStatus) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -196,7 +208,7 @@ func readOneSSEEvent(t *testing.T, srv *httptest.Server, path, userID string, ti
 	return ingestStreamEvent{}
 }
 
-func TestIngestStreamReportsProvisioningThenDoneOnHandoff(t *testing.T) {
+func TestIngestStreamReportsProvisioningAndNotDone(t *testing.T) {
 	datasets := newFakeIngestDatasetStore(
 		domain.Dataset{ID: "ds-1", WorkspaceID: "ws-1", OriginalFilename: "a.csv", IngestStatus: domain.IngestProvisioning},
 	)
@@ -215,6 +227,75 @@ func TestIngestStreamReportsProvisioningThenDoneOnHandoff(t *testing.T) {
 	}
 	if len(event.Datasets) != 1 || event.Datasets[0].ID != "ds-1" {
 		t.Errorf("datasets = %+v, want exactly ds-1", event.Datasets)
+	}
+}
+
+// TestIngestStreamNotDoneWhileProfilingOrFindingRelationships is the Wave 4 regression case for the
+// bug Wave 3's handoff-based Done left behind: reaching "profiling" or "relationships" now means
+// FEAT-005/FEAT-008 are genuinely running, not that this package is merely done watching. The stream
+// must keep the connection open (and the client must keep waiting) through both.
+func TestIngestStreamNotDoneWhileProfilingOrFindingRelationships(t *testing.T) {
+	for _, status := range []domain.IngestStatus{domain.IngestProfiling} {
+		datasets := newFakeIngestDatasetStore(
+			domain.Dataset{ID: "ds-1", WorkspaceID: "ws-1", OriginalFilename: "a.csv", IngestStatus: status},
+		)
+		server, workspaces := newTestServerForIngest(t, datasets, &fakePipeline{})
+		workspaces.byID["ws-1"] = domain.Workspace{ID: "ws-1", OwnerID: "user-1"}
+
+		httpServer := httptest.NewServer(server)
+		event := readOneSSEEvent(t, httpServer, "/v1/workspaces/ws-1/ingest/stream", "user-1", domain.TierFree)
+		httpServer.Close()
+
+		if event.Done {
+			t.Errorf("status %q: stream reported done, but FEAT-005/FEAT-008 have not finished yet", status)
+		}
+	}
+}
+
+// TestIngestStreamReportsDoneOnceEveryDatasetIsActuallyComplete is the positive half of the same
+// regression: once every dataset in the workspace has reached the TRUE terminal "complete" state
+// (filtered out of ListInProgressByWorkspace), the stream reports done — this is FEAT-005's real
+// completion, not FEAT-004's earlier "profiling" handoff.
+func TestIngestStreamReportsDoneOnceEveryDatasetIsActuallyComplete(t *testing.T) {
+	datasets := newFakeIngestDatasetStore(
+		domain.Dataset{ID: "ds-1", WorkspaceID: "ws-1", OriginalFilename: "a.csv", IngestStatus: domain.IngestComplete},
+	)
+	server, workspaces := newTestServerForIngest(t, datasets, &fakePipeline{})
+	workspaces.byID["ws-1"] = domain.Workspace{ID: "ws-1", OwnerID: "user-1"}
+
+	httpServer := httptest.NewServer(server)
+	defer httpServer.Close()
+
+	event := readOneSSEEvent(t, httpServer, "/v1/workspaces/ws-1/ingest/stream", "user-1", domain.TierFree)
+	if !event.Done {
+		t.Error("stream should report done once every dataset has actually reached ingest_status complete")
+	}
+	if event.OverallStep == string(ingest.StepFailed) {
+		t.Error("overall_step should not be failed when nothing failed")
+	}
+}
+
+// TestIngestStreamTotalDatasetsCountsTheWholeBatchNotJustInProgress guards against the bug where a
+// 2-file upload's "Finding relationships" step would disappear from the client the moment one of the
+// two files finished first (since it then drops out of ListInProgressByWorkspace) — total_datasets is
+// computed from the full workspace history, not the in-progress subset.
+func TestIngestStreamTotalDatasetsCountsTheWholeBatchNotJustInProgress(t *testing.T) {
+	datasets := newFakeIngestDatasetStore(
+		domain.Dataset{ID: "ds-1", WorkspaceID: "ws-1", OriginalFilename: "a.csv", IngestStatus: domain.IngestComplete},
+		domain.Dataset{ID: "ds-2", WorkspaceID: "ws-1", OriginalFilename: "b.csv", IngestStatus: domain.IngestProfiling},
+	)
+	server, workspaces := newTestServerForIngest(t, datasets, &fakePipeline{})
+	workspaces.byID["ws-1"] = domain.Workspace{ID: "ws-1", OwnerID: "user-1"}
+
+	httpServer := httptest.NewServer(server)
+	defer httpServer.Close()
+
+	event := readOneSSEEvent(t, httpServer, "/v1/workspaces/ws-1/ingest/stream", "user-1", domain.TierFree)
+	if event.TotalDatasets != 2 {
+		t.Errorf("total_datasets = %d, want 2 (one already complete, one still profiling)", event.TotalDatasets)
+	}
+	if len(event.Datasets) != 1 {
+		t.Errorf("datasets (in-progress only) = %d, want 1", len(event.Datasets))
 	}
 }
 

@@ -18,6 +18,14 @@ func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+// newTestEngineProvider centralizes engine.NewLocalProvider construction for this package's tests.
+// engine.NewLocalProvider's exact signature belongs to the engine package (owned by a different
+// subagent in this wave, mid-rewrite) — keeping every call site funneled through this one helper
+// means a signature change there is a one-line fix here rather than an edit at every test.
+func newTestEngineProvider() *engine.LocalProvider {
+	return engine.NewLocalProvider(time.Minute, testLogger())
+}
+
 // fakeDatasetStore is an in-memory DatasetStore recording every state transition.
 type fakeDatasetStore struct {
 	mu   sync.Mutex
@@ -42,6 +50,18 @@ func (f *fakeDatasetStore) GetByID(ctx context.Context, id string) (domain.Datas
 	return ds, nil
 }
 
+func (f *fakeDatasetStore) ListByWorkspace(ctx context.Context, workspaceID string) ([]domain.Dataset, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []domain.Dataset
+	for _, ds := range f.byID {
+		if ds.WorkspaceID == workspaceID {
+			out = append(out, ds)
+		}
+	}
+	return out, nil
+}
+
 func (f *fakeDatasetStore) SetIngestStatus(ctx context.Context, id string, status domain.IngestStatus) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -58,6 +78,15 @@ func (f *fakeDatasetStore) CompleteLoad(ctx context.Context, id, parquetLocation
 	ds.ParquetLocation = parquetLocation
 	ds.RowCount = rowCount
 	ds.IngestStatus = domain.IngestProfiling
+	f.byID[id] = ds
+	return nil
+}
+
+func (f *fakeDatasetStore) CompleteIngest(ctx context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ds := f.byID[id]
+	ds.IngestStatus = domain.IngestComplete
 	f.byID[id] = ds
 	return nil
 }
@@ -108,9 +137,90 @@ func (f *fakeObjectStore) PutObject(ctx context.Context, key string, content io.
 	return nil
 }
 
+// fakeColumnStore is an in-memory ColumnStore.
+type fakeColumnStore struct {
+	mu        sync.Mutex
+	byDataset map[string][]domain.Column
+}
+
+func newFakeColumnStore() *fakeColumnStore {
+	return &fakeColumnStore{byDataset: make(map[string][]domain.Column)}
+}
+
+func (f *fakeColumnStore) BulkInsert(ctx context.Context, workspaceID string, cols []domain.Column) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, c := range cols {
+		f.byDataset[c.DatasetID] = append(f.byDataset[c.DatasetID], c)
+	}
+	return nil
+}
+
+func (f *fakeColumnStore) ListByDataset(ctx context.Context, datasetID string) ([]domain.Column, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]domain.Column(nil), f.byDataset[datasetID]...), nil
+}
+
+func (f *fakeColumnStore) countAll() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, cols := range f.byDataset {
+		n += len(cols)
+	}
+	return n
+}
+
+// fakeCandidateJoinStore is an in-memory CandidateJoinStore.
+type fakeCandidateJoinStore struct {
+	mu    sync.Mutex
+	joins []domain.CandidateJoin
+}
+
+func newFakeCandidateJoinStore() *fakeCandidateJoinStore {
+	return &fakeCandidateJoinStore{}
+}
+
+func (f *fakeCandidateJoinStore) Create(ctx context.Context, cj domain.CandidateJoin) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.joins = append(f.joins, cj)
+	return nil
+}
+
+func (f *fakeCandidateJoinStore) ExistsForPair(ctx context.Context, columnAID, columnBID string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, j := range f.joins {
+		if (j.SourceColumnID == columnAID && j.TargetColumnID == columnBID) ||
+			(j.SourceColumnID == columnBID && j.TargetColumnID == columnAID) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (f *fakeCandidateJoinStore) all() []domain.CandidateJoin {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]domain.CandidateJoin(nil), f.joins...)
+}
+
 // engineProviderAdapter adapts engine.LocalProvider to this package's narrower EngineProvider seam.
 type engineProviderAdapter struct {
 	*engine.LocalProvider
+}
+
+// newTestPipeline wires a Pipeline against fresh in-memory fakes, for tests that don't need to
+// inspect the fakes' contents beyond the dataset store.
+func newTestPipeline(datasets *fakeDatasetStore, objects *fakeObjectStore) (*Pipeline, *fakeColumnStore, *fakeCandidateJoinStore, *Tracker) {
+	provider := newTestEngineProvider()
+	tracker := NewTracker()
+	columns := newFakeColumnStore()
+	joins := newFakeCandidateJoinStore()
+	pipeline := NewPipeline(datasets, objects, engineProviderAdapter{provider}, columns, joins, tracker, testLogger())
+	return pipeline, columns, joins, tracker
 }
 
 func waitForTerminalStatus(t *testing.T, store *fakeDatasetStore, datasetID string) domain.Dataset {
@@ -118,16 +228,16 @@ func waitForTerminalStatus(t *testing.T, store *fakeDatasetStore, datasetID stri
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		ds := store.get(datasetID)
-		if ds.IngestStatus == domain.IngestProfiling || ds.IngestStatus == domain.IngestFailed {
+		if ds.IngestStatus == domain.IngestComplete || ds.IngestStatus == domain.IngestFailed {
 			return ds
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatal("ingest never reached a terminal state (profiling or failed)")
+	t.Fatal("ingest never reached a terminal state (complete or failed)")
 	return domain.Dataset{}
 }
 
-func TestPipelineIngestsCSVSuccessfully(t *testing.T) {
+func TestPipelineIngestsCSVSuccessfullyAndProfiles(t *testing.T) {
 	ws, dsID := "ws-1", "ds-1"
 	ds := domain.Dataset{
 		ID: dsID, WorkspaceID: ws, OriginalFilename: "orders.csv",
@@ -138,15 +248,13 @@ func TestPipelineIngestsCSVSuccessfully(t *testing.T) {
 	objects := newFakeObjectStore()
 	objects.objects["workspaces/ws-1/datasets/ds-1/original/orders.csv"] = []byte("id,total\n1,42.5\n2,10\n3,7.25\n")
 
-	provider := engine.NewLocalProvider(time.Minute, testLogger())
-	tracker := NewTracker()
-	pipeline := NewPipeline(datasets, objects, engineProviderAdapter{provider}, tracker, testLogger())
+	pipeline, columns, joins, tracker := newTestPipeline(datasets, objects)
 
 	pipeline.Start(dsID)
 
 	final := waitForTerminalStatus(t, datasets, dsID)
-	if final.IngestStatus != domain.IngestProfiling {
-		t.Fatalf("ingest_status = %q, want %q; check tracker error: %+v", final.IngestStatus, domain.IngestProfiling, tracker.states)
+	if final.IngestStatus != domain.IngestComplete {
+		t.Fatalf("ingest_status = %q, want %q; check tracker error: %+v", final.IngestStatus, domain.IngestComplete, tracker.states)
 	}
 	if final.RowCount != 3 {
 		t.Errorf("row_count = %d, want 3", final.RowCount)
@@ -158,9 +266,119 @@ func TestPipelineIngestsCSVSuccessfully(t *testing.T) {
 		t.Errorf("normalized parquet was not written to %q", final.ParquetLocation)
 	}
 
-	// This wave hands off at "profiling" without asserting further live progress.
+	cols, err := columns.ListByDataset(context.Background(), dsID)
+	if err != nil {
+		t.Fatalf("listing columns: %v", err)
+	}
+	if len(cols) != 2 {
+		t.Fatalf("got %d profiled columns, want 2 (id, total)", len(cols))
+	}
+	for _, c := range cols {
+		if c.DatasetID != dsID {
+			t.Errorf("column %q dataset_id = %q, want %q", c.Name, c.DatasetID, dsID)
+		}
+		if c.TypeConfidence <= 0 || c.TypeConfidence > 1 {
+			t.Errorf("column %q type_confidence = %v, want in (0,1]", c.Name, c.TypeConfidence)
+		}
+	}
+
+	// A single-file ingest must never trigger relationship inference.
+	if len(joins.all()) != 0 {
+		t.Errorf("got %d candidate joins for a single-file ingest, want 0", len(joins.all()))
+	}
+
 	if _, ok := tracker.Get(dsID); ok {
-		t.Error("tracker entry should be cleared once handed off to profiling")
+		t.Error("tracker entry should be cleared once ingest reaches a terminal state")
+	}
+}
+
+func TestPipelineInfersCandidateJoinsAcrossTwoFiles(t *testing.T) {
+	ws := "ws-2"
+	dsA := domain.Dataset{
+		ID: "ds-a", WorkspaceID: ws, OriginalFilename: "customers.csv",
+		Format: domain.FormatCSV, IngestStatus: domain.IngestPending,
+	}
+	dsB := domain.Dataset{
+		ID: "ds-b", WorkspaceID: ws, OriginalFilename: "orders.csv",
+		Format: domain.FormatCSV, IngestStatus: domain.IngestPending,
+	}
+
+	datasets := newFakeDatasetStore(dsA, dsB)
+	objects := newFakeObjectStore()
+	objects.objects["workspaces/ws-2/datasets/ds-a/original/customers.csv"] = []byte(
+		"customer_id,name\n1,Ada\n2,Grace\n3,Alan\n",
+	)
+	objects.objects["workspaces/ws-2/datasets/ds-b/original/orders.csv"] = []byte(
+		"order_id,customer_id\n100,1\n101,2\n102,1\n",
+	)
+
+	pipeline, columns, joins, _ := newTestPipeline(datasets, objects)
+
+	// Ingest sequentially rather than via Start's own goroutines: this test asserts the CONTENT of
+	// inferred joins, which requires both datasets to be fully profiled deterministically; the
+	// pipeline's own concurrency safety (two Start calls racing) is covered by
+	// TestPipelineSerializesRelationshipInferenceAcrossConcurrentSiblings below.
+	pipeline.Start(dsA.ID)
+	waitForTerminalStatus(t, datasets, dsA.ID)
+	pipeline.Start(dsB.ID)
+	final := waitForTerminalStatus(t, datasets, dsB.ID)
+
+	if final.IngestStatus != domain.IngestComplete {
+		t.Fatalf("second dataset ingest_status = %q, want %q", final.IngestStatus, domain.IngestComplete)
+	}
+
+	found := joins.all()
+	if len(found) == 0 {
+		t.Fatal("expected at least one candidate join between customer_id (customers.csv) and customer_id (orders.csv)")
+	}
+	for _, cj := range found {
+		if cj.WorkspaceID != ws {
+			t.Errorf("candidate join workspace_id = %q, want %q", cj.WorkspaceID, ws)
+		}
+		if cj.Status != domain.JoinPending {
+			t.Errorf("candidate join status = %q, want %q — never auto-applied", cj.Status, domain.JoinPending)
+		}
+		if cj.Basis == "" {
+			t.Error("candidate join has no basis — a confidence number alone is not an explanation")
+		}
+		if cj.ConfidenceScore <= 0 || cj.ConfidenceScore > 1 {
+			t.Errorf("confidence_score = %v, want in (0,1]", cj.ConfidenceScore)
+		}
+	}
+
+	if got := columns.countAll(); got != 4 {
+		t.Errorf("total profiled columns across both datasets = %d, want 4 (2 + 2)", got)
+	}
+}
+
+func TestPipelineSerializesRelationshipInferenceAcrossConcurrentSiblings(t *testing.T) {
+	ws := "ws-3"
+	dsA := domain.Dataset{
+		ID: "ds-a3", WorkspaceID: ws, OriginalFilename: "a.csv",
+		Format: domain.FormatCSV, IngestStatus: domain.IngestPending,
+	}
+	dsB := domain.Dataset{
+		ID: "ds-b3", WorkspaceID: ws, OriginalFilename: "b.csv",
+		Format: domain.FormatCSV, IngestStatus: domain.IngestPending,
+	}
+
+	datasets := newFakeDatasetStore(dsA, dsB)
+	objects := newFakeObjectStore()
+	objects.objects["workspaces/ws-3/datasets/ds-a3/original/a.csv"] = []byte("shared_id,x\n1,a\n2,b\n3,c\n")
+	objects.objects["workspaces/ws-3/datasets/ds-b3/original/b.csv"] = []byte("shared_id,y\n1,a\n2,b\n3,c\n")
+
+	pipeline, _, joins, _ := newTestPipeline(datasets, objects)
+
+	// Started concurrently, mirroring a real multi-file upload batch (handleStartIngest calls
+	// Pipeline.Start once per pending dataset without waiting between calls).
+	pipeline.Start(dsA.ID)
+	pipeline.Start(dsB.ID)
+
+	waitForTerminalStatus(t, datasets, dsA.ID)
+	waitForTerminalStatus(t, datasets, dsB.ID)
+
+	if len(joins.all()) == 0 {
+		t.Error("expected candidate joins between the two datasets even when both finish concurrently")
 	}
 }
 
@@ -180,9 +398,7 @@ func TestPipelineSurfacesSpecificErrorOnMalformedCSV(t *testing.T) {
 		"id,total\n1,\xc0\x80bad\n2,10\n",
 	)
 
-	provider := engine.NewLocalProvider(time.Minute, testLogger())
-	tracker := NewTracker()
-	pipeline := NewPipeline(datasets, objects, engineProviderAdapter{provider}, tracker, testLogger())
+	pipeline, _, _, tracker := newTestPipeline(datasets, objects)
 
 	pipeline.Start(dsID)
 
@@ -203,6 +419,48 @@ func TestPipelineSurfacesSpecificErrorOnMalformedCSV(t *testing.T) {
 	}
 }
 
+// TestPipelineStartIsIdempotentUnderConcurrentCalls guards against the race a manual end-to-end
+// verification pass actually hit: React Strict Mode double-invokes IngestProgressScreen's mount
+// effect in development, firing POST /ingest twice in quick succession. Both calls read the
+// dataset as still "pending" (the first goroutine hadn't yet persisted its status change), so both
+// used to spawn a full concurrent run() — duplicate profiling, duplicate column rows, and a
+// unique-constraint violation surfaced as a false "ingest failed."
+func TestPipelineStartIsIdempotentUnderConcurrentCalls(t *testing.T) {
+	ws, dsID := "ws-race", "ds-race"
+	ds := domain.Dataset{
+		ID: dsID, WorkspaceID: ws, OriginalFilename: "orders.csv",
+		Format: domain.FormatCSV, IngestStatus: domain.IngestPending,
+	}
+	datasets := newFakeDatasetStore(ds)
+	objects := newFakeObjectStore()
+	objects.objects["workspaces/ws-race/datasets/ds-race/original/orders.csv"] = []byte("id,total\n1,42.5\n2,10\n3,7.25\n")
+
+	pipeline, columns, _, _ := newTestPipeline(datasets, objects)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			pipeline.Start(dsID)
+		}()
+	}
+	wg.Wait()
+
+	final := waitForTerminalStatus(t, datasets, dsID)
+	if final.IngestStatus != domain.IngestComplete {
+		t.Fatalf("ingest_status = %q, want %q — a duplicate concurrent run corrupted the result", final.IngestStatus, domain.IngestComplete)
+	}
+
+	cols, err := columns.ListByDataset(context.Background(), dsID)
+	if err != nil {
+		t.Fatalf("listing columns: %v", err)
+	}
+	if len(cols) != 2 {
+		t.Errorf("got %d profiled columns, want exactly 2 (id, total) — duplicate runs would double this", len(cols))
+	}
+}
+
 func TestPipelineStartIsIdempotentForNonPendingDatasets(t *testing.T) {
 	ds := domain.Dataset{
 		ID: "ds-1", WorkspaceID: "ws-1", OriginalFilename: "orders.csv",
@@ -210,9 +468,7 @@ func TestPipelineStartIsIdempotentForNonPendingDatasets(t *testing.T) {
 	}
 	datasets := newFakeDatasetStore(ds)
 	objects := newFakeObjectStore() // deliberately has no object for this dataset
-	provider := engine.NewLocalProvider(time.Minute, testLogger())
-	tracker := NewTracker()
-	pipeline := NewPipeline(datasets, objects, engineProviderAdapter{provider}, tracker, testLogger())
+	pipeline, _, _, _ := newTestPipeline(datasets, objects)
 
 	pipeline.Start(ds.ID)
 
@@ -233,6 +489,7 @@ func TestStateForFallsBackToPersistedStatusWithoutATrackerEntry(t *testing.T) {
 		{domain.IngestPending, StepProvisioning},
 		{domain.IngestProvisioning, StepProvisioning},
 		{domain.IngestProfiling, StepProfiling},
+		{domain.IngestComplete, StepRelationships},
 		{domain.IngestFailed, StepFailed},
 	}
 	for _, c := range cases {

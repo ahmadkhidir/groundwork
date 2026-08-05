@@ -26,9 +26,8 @@ import (
 // change.
 type Dependencies struct {
 	// AuthSecret decodes the Auth.js session cookie the browser sends directly to this service — see
-	// internal/authsession's package doc for why that is the actual authorization boundary. Read
-	// directly from AUTH_SECRET by cmd/api/main.go rather than through internal/config, which is
-	// read-only to feature work; reported as a needed config.Config field.
+	// internal/authsession's package doc for why that is the actual authorization boundary. Supplied
+	// from config.Config.AuthSecret, which owns it as of Wave 2.
 	AuthSecret string
 
 	Workspaces WorkspaceStore
@@ -44,6 +43,24 @@ type Dependencies struct {
 	IngestDatasets IngestDatasetStore
 	IngestPipeline IngestPipeline
 	IngestTracker  *ingest.Tracker
+
+	// ProfilingDatasets, Columns, and CandidateJoins back FEAT-005/FEAT-008's read-only endpoints.
+	// Profiling statistics are stored at ingest and served from here, never recomputed per request —
+	// an explicit FEAT-005 acceptance criterion.
+	//
+	// ProfilingDatasets is its own field rather than reusing Datasets or IngestDatasets: those are
+	// FEAT-003's Create-only and FEAT-004's list-only seams respectively, and neither exposes
+	// GetByID. All three are satisfied by the same DatasetRepository; keeping the interfaces narrow
+	// is what lets each handler's test double stay small.
+	ProfilingDatasets ProfilingDatasetStore
+	Columns           ProfilingColumnStore
+	CandidateJoins    ProfilingCandidateJoinStore
+
+	// EngineProvider backs FEAT-011's honest engine status. Deliberately typed as the narrow
+	// EngineStatusProvider rather than *engine.LocalProvider: the handler only ever reads Status, and
+	// architecture.md's Engine Provider seam exists so a later non-DuckDB implementation can be
+	// swapped in without touching callers. Status must never provoke a wake — see engine.Provider.
+	EngineProvider EngineStatusProvider
 }
 
 // Server wires configuration and dependencies into an http.Handler.
@@ -127,6 +144,16 @@ func (s *Server) routes() {
 				// FEAT-004: session-scoped engine provisioning and ingest.
 				if s.deps.IngestDatasets != nil && s.deps.IngestPipeline != nil && s.deps.IngestTracker != nil {
 					RegisterIngestRoutes(r, s.deps.Workspaces, s.deps.IngestDatasets, s.deps.IngestPipeline, s.deps.IngestTracker, s.logger)
+				}
+
+				// FEAT-005 / FEAT-008: profiling statistics and inferred candidate joins.
+				if s.deps.ProfilingDatasets != nil && s.deps.Columns != nil && s.deps.CandidateJoins != nil {
+					RegisterProfilingRoutes(r, s.deps.Workspaces, s.deps.ProfilingDatasets, s.deps.Columns, s.deps.CandidateJoins, s.logger)
+				}
+
+				// FEAT-011: engine sleep/wake lifecycle and honest status.
+				if s.deps.EngineProvider != nil {
+					RegisterEngineRoutes(r, s.deps.Workspaces, s.deps.EngineProvider, s.logger)
 				}
 			})
 		}

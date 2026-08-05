@@ -5,9 +5,15 @@ import { api, subscribeToStream } from "@/lib/api-client";
 import type { IngestStreamEvent } from "./types";
 
 const pushMock = vi.fn();
+// A stable object, not a fresh literal per call: Next's real useRouter() returns a referentially
+// stable router across renders, which the Success-state timer's cleanup effect (see
+// IngestProgressScreen's navigate effect, dependent on `router`) relies on. A fresh `{ push: ... }`
+// literal on every render would make that effect re-run (and cancel its own pending timer) on the
+// very re-render `setShowSuccess` triggers — a mock-instability bug, not a real one.
+const routerMock = { push: pushMock };
 
 vi.mock("next/navigation", () => ({
-  useRouter: () => ({ push: pushMock }),
+  useRouter: () => routerMock,
 }));
 
 vi.mock("@/lib/api-client", async () => {
@@ -71,6 +77,7 @@ describe("IngestProgressScreen", () => {
     emit({
       datasets: [{ id: "ds-1", filename: "orders.csv", step: "loading" }],
       overall_step: "loading",
+      total_datasets: 1,
       done: false,
     });
 
@@ -80,25 +87,43 @@ describe("IngestProgressScreen", () => {
     });
   });
 
-  it("shows the Finding relationships step only when 2+ files are in the batch", async () => {
+  it("shows Profiling columns as active once the stream reports it", async () => {
+    const { emit } = captureStreamHandlers();
+    render(<IngestProgressScreen workspaceId="ws-1" />);
+
+    emit({
+      datasets: [{ id: "ds-1", filename: "orders.csv", step: "profiling" }],
+      overall_step: "profiling",
+      total_datasets: 1,
+      done: false,
+    });
+
+    await waitFor(() => {
+      const profilingRow = screen.getByText("Profiling columns").closest("li");
+      expect(profilingRow).toHaveTextContent("(in progress)");
+    });
+  });
+
+  it("shows the Finding relationships step based on total_datasets, not the in-progress count", async () => {
     const { emit } = captureStreamHandlers();
     render(<IngestProgressScreen workspaceId="ws-1" />);
 
     emit({
       datasets: [{ id: "ds-1", filename: "orders.csv", step: "provisioning" }],
       overall_step: "provisioning",
+      total_datasets: 1,
       done: false,
     });
     await waitFor(() => {
       expect(screen.queryByText("Finding relationships")).not.toBeInTheDocument();
     });
 
+    // Only ds-2 is still in progress (ds-1 already reached "complete" and dropped out of the
+    // in-progress list), but total_datasets still reports 2 — the step must stay visible.
     emit({
-      datasets: [
-        { id: "ds-1", filename: "orders.csv", step: "provisioning" },
-        { id: "ds-2", filename: "customers.csv", step: "provisioning" },
-      ],
-      overall_step: "provisioning",
+      datasets: [{ id: "ds-2", filename: "customers.csv", step: "profiling" }],
+      overall_step: "profiling",
+      total_datasets: 2,
       done: false,
     });
     await waitFor(() => {
@@ -120,6 +145,7 @@ describe("IngestProgressScreen", () => {
         },
       ],
       overall_step: "failed",
+      total_datasets: 1,
       done: true,
     });
 
@@ -133,18 +159,26 @@ describe("IngestProgressScreen", () => {
     expect(pushMock).not.toHaveBeenCalledWith("/workspaces/ws-1/ingest/confirm");
   });
 
-  it("navigates to Ingest Confirmation once the stream reports done and not failed", async () => {
+  it("shows a brief Success state before navigating to Ingest Confirmation once the stream reports done", async () => {
     const { emit } = captureStreamHandlers();
     render(<IngestProgressScreen workspaceId="ws-1" />);
 
     emit({
-      datasets: [{ id: "ds-1", filename: "orders.csv", step: "profiling" }],
-      overall_step: "profiling",
+      datasets: [],
+      overall_step: "relationships",
+      total_datasets: 1,
       done: true,
     });
 
-    await waitFor(() =>
-      expect(pushMock).toHaveBeenCalledWith("/workspaces/ws-1/ingest/confirm"),
+    await waitFor(() => {
+      expect(screen.getByText("Your data is ready")).toBeInTheDocument();
+    });
+    // Not an instant navigation — the Success state is genuinely shown first.
+    expect(pushMock).not.toHaveBeenCalledWith("/workspaces/ws-1/ingest/confirm");
+
+    await waitFor(
+      () => expect(pushMock).toHaveBeenCalledWith("/workspaces/ws-1/ingest/confirm"),
+      { timeout: 2000 },
     );
   });
 

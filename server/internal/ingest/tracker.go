@@ -60,6 +60,26 @@ func (t *Tracker) Set(datasetID string, step Step, errMsg string) {
 	t.states[datasetID] = State{Step: step, Error: errMsg, UpdatedAt: time.Now()}
 }
 
+// Claim atomically records datasetID as StepProvisioning and reports true, UNLESS this process
+// already has a live entry for it, in which case it changes nothing and reports false.
+//
+// This is Pipeline.Start's actual idempotency guard against a same-process race: Start's own
+// "ds.IngestStatus != pending" check reads Postgres, which is eventually consistent with a
+// just-started run — a second POST /ingest arriving before the first goroutine's SetIngestStatus
+// write lands would otherwise see "pending" too and spawn a second, fully concurrent run() for the
+// same dataset (duplicate profiling, duplicate column rows, a unique-constraint failure surfaced as
+// an honest-looking but false ingest failure). Claim closes that window in-process, instantly,
+// without waiting on a database round trip.
+func (t *Tracker) Claim(datasetID string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if _, exists := t.states[datasetID]; exists {
+		return false
+	}
+	t.states[datasetID] = State{Step: StepProvisioning, UpdatedAt: time.Now()}
+	return true
+}
+
 // Get returns datasetID's live state, if this process has one (it may not, e.g. after a restart or
 // for a dataset this process never started processing — callers fall back to the persisted
 // ingest_status in that case).

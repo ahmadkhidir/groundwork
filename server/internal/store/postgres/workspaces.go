@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
 	"github.com/ahmadkhidir/groundwork/server/internal/domain"
+	"github.com/ahmadkhidir/groundwork/server/internal/engine"
 )
 
 // ErrWorkspaceNotFound is returned when no workspace matches the given id (or the requesting user
@@ -100,6 +103,53 @@ func (r *WorkspaceRepository) GetByID(ctx context.Context, id string) (domain.Wo
 		return domain.Workspace{}, fmt.Errorf("querying workspace: %w", err)
 	}
 	return ws, nil
+}
+
+// UpdateEngineStatus persists a workspace's live engine status, keeping the `engine_status` column in
+// sync with engine.Provider's authoritative in-memory state (FEAT-011).
+//
+// Deliberately does NOT touch updated_at: screens/03-workspace-list.md sorts by "most recently
+// updated," and a workspace's engine idling out in the background is not user activity — bumping
+// updated_at here would reorder that list every ~10 minutes for a workspace nobody touched, which is
+// exactly the kind of dishonest-feeling behavior FEAT-011 exists to avoid, just inverted (surprising
+// the user instead of hiding state from them).
+func (r *WorkspaceRepository) UpdateEngineStatus(ctx context.Context, id string, status domain.EngineStatus) error {
+	_, err := r.pool.Exec(ctx,
+		`UPDATE workspaces SET engine_status = $2 WHERE id = $1`,
+		id, string(status),
+	)
+	if err != nil {
+		return fmt.Errorf("updating workspace engine status: %w", err)
+	}
+	return nil
+}
+
+// EngineStatusHook returns an engine.StatusChangeFunc that mirrors every observed engine transition
+// into this repository's `engine_status` column via UpdateEngineStatus.
+//
+// Wire it into engine.NewLocalProvider (or any future Provider implementation using the same hook
+// type) via engine.WithStatusChangeHook, so screens that read many workspaces without querying the
+// Provider per row — Workspace List's ListByOwner is the current example — reflect real engine state
+// rather than staying frozen at whatever engine_status was written as.
+//
+// Per StatusChangeFunc's own contract, failures here are logged and swallowed rather than propagated:
+// a Postgres hiccup persisting a status mirror must never block or fail the engine lifecycle itself,
+// and the live GET /v1/workspaces/:id path (api.handleGetWorkspace) queries the Provider directly
+// rather than trusting this mirror, so a transient write failure here does not desynchronize the one
+// place accuracy is load-bearing.
+func (r *WorkspaceRepository) EngineStatusHook(logger *slog.Logger) engine.StatusChangeFunc {
+	return func(workspaceID string, status engine.Status) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		if err := r.UpdateEngineStatus(ctx, workspaceID, domain.EngineStatus(status)); err != nil {
+			logger.Error("persisting engine status transition",
+				slog.String("workspace_id", workspaceID),
+				slog.String("status", string(status)),
+				slog.String("error", err.Error()),
+			)
+		}
+	}
 }
 
 // rowScanner is satisfied by both pgx.Row and pgx.Rows, letting scanWorkspace serve GetByID and
