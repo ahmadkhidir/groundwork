@@ -108,12 +108,14 @@ groundwork/
 - Files: Go `snake_case.go`; React components `PascalCase.tsx`.
 - Migrations: `NNNNN_short_description.sql`, goose `-- +goose Up` / `-- +goose Down`.
 
-**Route map** (from `docs/Groundwork/screens.md` — 17 screens):
+**Route map** (from `docs/Groundwork/screens.md` — 19 screens):
 
 | Route | Screen |
 |---|---|
 | `/` | Landing Page |
 | `/signup`, `/login` | Sign Up / Login |
+| `/forgot-password` | Forgot Password (18) |
+| `/reset-password` | Reset Password (19) |
 | `/workspaces` | Workspace List |
 | `/workspaces/:id` | Workspace Home |
 | `/workspaces/:id/upload` | File Upload |
@@ -304,7 +306,7 @@ loaded via `next/font` and bound to `--font-display`, `--font-body`, `--font-mon
 | Phase | Features | Status |
 |---|---|---|
 | **A — Foundation** | Scaffold, theme tokens, schema entities, auth, routing skeleton, docker-compose | **Complete** |
-| **1 — Foundation: Workspace, Ingest & Trust** | FEAT-001, 002, 003, 004, 005, 006, 007, 008, 009, 011, 042, 044 | Not started |
+| **1 — Foundation: Workspace, Ingest & Trust** | FEAT-001 ✅ · 002, 003, 004, 005, 006, 007, 008, 009, 011, 042, 044 | In progress (wave 1 of 5) |
 | **2 — Core Grounded Answer Loop** | FEAT-013, 014, 015, 016, 017, 018, 019, 020 | Not started |
 | **3 — Trust & Observability** | FEAT-022, 023, 024, 027, 028, 029, 030 | Not started |
 | **4 — Reports & Delivery** | FEAT-034, 035, 036, 041, 043 | Not started |
@@ -331,6 +333,22 @@ loaded via `next/font` and bound to `--font-display`, `--font-body`, `--font-mon
 
 **Placeholders are replaced, not wrapped.** A feature slice deletes the `PlaceholderScreen` call and
 the route's 501 handler; it does not build around them.
+
+### Known divergences — code behind docs
+
+Three items where the specs were corrected *after* FEAT-001 shipped, so the code is knowingly behind.
+Each is a real task, not a note to ignore. Close them in the wave that owns the surrounding work.
+
+| Divergence | Spec | Owner |
+|---|---|---|
+| Sign Up form has no optional **Display Name** field; the server derives it from the email local-part | `screens/02` now specifies the field, with the derived value as the blank-default | Any wave touching auth screens |
+| **No `login` audit entries are written** — the old schema made them unrepresentable | `AuditLogEntry.workspace_id` is now optional; `login` is account-scoped | **Wave 2 (FEAT-042)** |
+| Password reset tokens live in a **process-local in-memory store**; delivery is a log line | `PasswordResetToken` entity + Transactional Email Provider now specified | Deferred — needs a vendor decision and a migration |
+
+The reset-token store does not survive a restart or a multi-instance deploy. It is flagged as interim
+in `server/internal/auth/reset_store.go`, `ForgotPasswordForm.tsx`, and `ResetPasswordForm.tsx`.
+`schema.md` also now specifies storing a **hash** of the token rather than the token itself — the
+current implementation does not, which is a second reason this needs revisiting before production.
 
 Update this table at each phase checkpoint. It is how anyone tells what exists in the codebase from
 what is only documented.
