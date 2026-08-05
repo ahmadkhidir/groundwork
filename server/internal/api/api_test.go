@@ -20,7 +20,9 @@ func newTestServer() *Server {
 		MaxUploadBytes: config.MaxUploadBytesDefault,
 		Environment:    "development",
 	}
-	return NewServer(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	// authService is nil: these tests exercise routing, CORS, and the not-implemented shell, none of
+	// which touch FEAT-001. Auth-specific behavior is covered by internal/api/auth_test.go.
+	return NewServer(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 }
 
 func TestHealthEndpoint(t *testing.T) {
@@ -49,7 +51,6 @@ func TestUnimplementedEndpointsReport501WithOwningFeature(t *testing.T) {
 		method string
 		path   string
 	}{
-		{http.MethodPost, "/v1/auth/login"},
 		{http.MethodGet, "/v1/workspaces/"},
 		{http.MethodPost, "/v1/workspaces/"},
 	}

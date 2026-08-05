@@ -28,6 +28,14 @@ export const routes = {
   /* -- Authentication ---------------------------------------------------------------------- */
   signup: () => "/signup",
   login: () => "/login",
+  /**
+   * Password reset request and confirmation.
+   *
+   * Both must be reachable while signed OUT — a user who cannot log in is by definition
+   * unauthenticated — so they are also registered in PUBLIC_ROUTE_PATTERNS below.
+   */
+  forgotPassword: () => "/forgot-password",
+  resetPassword: () => "/reset-password",
 
   /* -- Workspaces -------------------------------------------------------------------------- */
   /** Workspace list — the post-login destination. */
@@ -84,6 +92,9 @@ export const PUBLIC_ROUTE_PATTERNS: readonly RegExp[] = [
   /^\/$/,
   /^\/login$/,
   /^\/signup$/,
+  // A user who needs a password reset cannot be signed in to reach these.
+  /^\/forgot-password$/,
+  /^\/reset-password$/,
   /^\/shared\/[^/]+$/,
 ] as const;
 

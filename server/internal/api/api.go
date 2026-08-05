@@ -14,6 +14,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"github.com/ahmadkhidir/groundwork/server/internal/auth"
 	"github.com/ahmadkhidir/groundwork/server/internal/config"
 )
 
@@ -22,14 +23,20 @@ type Server struct {
 	cfg    config.Config
 	logger *slog.Logger
 	router chi.Router
+
+	authService *auth.Service
 }
 
 // NewServer constructs a Server with all routes registered.
-func NewServer(cfg config.Config, logger *slog.Logger) *Server {
+//
+// authService may be nil only in tests that don't exercise auth-backed routes; production callers
+// (cmd/api/main.go) always supply one.
+func NewServer(cfg config.Config, logger *slog.Logger, authService *auth.Service) *Server {
 	s := &Server{
-		cfg:    cfg,
-		logger: logger,
-		router: chi.NewRouter(),
+		cfg:         cfg,
+		logger:      logger,
+		router:      chi.NewRouter(),
+		authService: authService,
 	}
 	s.routes()
 	return s
@@ -58,9 +65,12 @@ func (s *Server) routes() {
 	s.router.Get("/healthz", s.handleHealth)
 
 	s.router.Route("/v1", func(r chi.Router) {
-		// Credential verification for the Next.js auth tier. The web layer never reads the user
-		// table itself — see architecture.md's boundary rule.
-		r.Post("/auth/login", s.handleNotImplemented("FEAT-001", "Phase 1"))
+		// FEAT-001: signup, login (credential verification for the Next.js Credentials provider —
+		// the web layer never reads the users table itself, per architecture.md's boundary rule),
+		// and password reset.
+		if s.authService != nil {
+			RegisterAuthRoutes(r, s.authService, s.logger)
+		}
 
 		r.Route("/workspaces", func(r chi.Router) {
 			r.Get("/", s.handleNotImplemented("FEAT-002", "Phase 1"))

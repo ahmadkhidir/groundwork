@@ -15,7 +15,9 @@ import (
 	"time"
 
 	"github.com/ahmadkhidir/groundwork/server/internal/api"
+	"github.com/ahmadkhidir/groundwork/server/internal/auth"
 	"github.com/ahmadkhidir/groundwork/server/internal/config"
+	"github.com/ahmadkhidir/groundwork/server/internal/store/postgres"
 )
 
 func main() {
@@ -39,9 +41,23 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
+	// A startup timeout, distinct from the request-scoped contexts used once the server is serving
+	// traffic: connecting to Postgres must not be allowed to hang forever if the database is
+	// unreachable.
+	startupCtx, cancelStartup := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelStartup()
+
+	pool, err := postgres.NewPool(startupCtx, cfg.DatabaseURL)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+
+	authService := auth.NewService(postgres.NewUserRepository(pool), logger)
+
 	server := &http.Server{
 		Addr:    ":" + cfg.Port,
-		Handler: api.NewServer(cfg, logger),
+		Handler: api.NewServer(cfg, logger, authService),
 		// Timeouts are set explicitly: Go's defaults are none, which leaves the service open to
 		// slow-client resource exhaustion.
 		ReadHeaderTimeout: 10 * time.Second,

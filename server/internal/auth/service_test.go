@@ -1,0 +1,265 @@
+package auth
+
+import (
+	"context"
+	"errors"
+	"io"
+	"log/slog"
+	"testing"
+	"time"
+
+	"github.com/ahmadkhidir/groundwork/server/internal/domain"
+)
+
+// fakeUserStore is an in-memory UserStore, keyed by email, for exercising Service without a real
+// database — Service depends on the UserStore interface specifically so this is possible.
+type fakeUserStore struct {
+	byEmail map[string]domain.User
+	byID    map[string]domain.User
+	hashes  map[string]string // keyed by user id
+}
+
+func newFakeUserStore() *fakeUserStore {
+	return &fakeUserStore{
+		byEmail: make(map[string]domain.User),
+		byID:    make(map[string]domain.User),
+		hashes:  make(map[string]string),
+	}
+}
+
+func (f *fakeUserStore) Create(ctx context.Context, user domain.User, passwordHash string) error {
+	if _, exists := f.byEmail[user.Email]; exists {
+		return ErrEmailTaken
+	}
+	f.byEmail[user.Email] = user
+	f.byID[user.ID] = user
+	f.hashes[user.ID] = passwordHash
+	return nil
+}
+
+func (f *fakeUserStore) FindByEmail(ctx context.Context, email string) (domain.User, string, error) {
+	user, ok := f.byEmail[email]
+	if !ok {
+		return domain.User{}, "", ErrUserNotFound
+	}
+	return user, f.hashes[user.ID], nil
+}
+
+func (f *fakeUserStore) FindByID(ctx context.Context, id string) (domain.User, string, error) {
+	user, ok := f.byID[id]
+	if !ok {
+		return domain.User{}, "", ErrUserNotFound
+	}
+	return user, f.hashes[id], nil
+}
+
+func (f *fakeUserStore) UpdatePasswordHash(ctx context.Context, userID, passwordHash string) error {
+	if _, ok := f.byID[userID]; !ok {
+		return ErrUserNotFound
+	}
+	f.hashes[userID] = passwordHash
+	return nil
+}
+
+func newTestService() *Service {
+	return NewService(newFakeUserStore(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
+
+func TestSignUpCreatesAnAccount(t *testing.T) {
+	svc := newTestService()
+
+	user, err := svc.SignUp(context.Background(), "Chidinma@Example.com", "a-real-password")
+	if err != nil {
+		t.Fatalf("SignUp() error = %v", err)
+	}
+
+	// Acceptance criterion: user can create an account with email and password.
+	if user.Email != "chidinma@example.com" {
+		t.Errorf("Email = %q, want normalized lowercase chidinma@example.com", user.Email)
+	}
+	if user.ID == "" {
+		t.Error("ID is empty")
+	}
+	if user.Tier != domain.TierFree {
+		t.Errorf("Tier = %q, want %q for a new account", user.Tier, domain.TierFree)
+	}
+	if user.DisplayName == "" {
+		t.Error("DisplayName is empty — schema.md requires it")
+	}
+}
+
+func TestSignUpRejectsDuplicateEmail(t *testing.T) {
+	svc := newTestService()
+	ctx := context.Background()
+
+	if _, err := svc.SignUp(ctx, "tunde@example.com", "first-password"); err != nil {
+		t.Fatalf("first SignUp() error = %v", err)
+	}
+
+	_, err := svc.SignUp(ctx, "tunde@example.com", "second-password")
+	if !errors.Is(err, ErrEmailTaken) {
+		t.Errorf("second SignUp() error = %v, want ErrEmailTaken", err)
+	}
+}
+
+func TestSignUpRejectsInvalidEmail(t *testing.T) {
+	svc := newTestService()
+
+	_, err := svc.SignUp(context.Background(), "not-an-email", "a-password")
+	if !errors.Is(err, ErrInvalidEmail) {
+		t.Errorf("SignUp() error = %v, want ErrInvalidEmail", err)
+	}
+}
+
+func TestSignUpRejectsEmptyPassword(t *testing.T) {
+	svc := newTestService()
+
+	_, err := svc.SignUp(context.Background(), "ngozi@example.com", "")
+	if !errors.Is(err, ErrPasswordRequired) {
+		t.Errorf("SignUp() error = %v, want ErrPasswordRequired", err)
+	}
+}
+
+func TestAuthenticateSucceedsWithCorrectCredentials(t *testing.T) {
+	svc := newTestService()
+	ctx := context.Background()
+	if _, err := svc.SignUp(ctx, "chidinma@example.com", "correct-password"); err != nil {
+		t.Fatalf("SignUp() error = %v", err)
+	}
+
+	user, err := svc.Authenticate(ctx, "chidinma@example.com", "correct-password")
+	if err != nil {
+		t.Fatalf("Authenticate() error = %v", err)
+	}
+	if user.Email != "chidinma@example.com" {
+		t.Errorf("Email = %q, want chidinma@example.com", user.Email)
+	}
+}
+
+func TestAuthenticateSucceedsCaseInsensitiveEmail(t *testing.T) {
+	svc := newTestService()
+	ctx := context.Background()
+	if _, err := svc.SignUp(ctx, "chidinma@example.com", "correct-password"); err != nil {
+		t.Fatalf("SignUp() error = %v", err)
+	}
+
+	if _, err := svc.Authenticate(ctx, "Chidinma@Example.com", "correct-password"); err != nil {
+		t.Errorf("Authenticate() error = %v, want nil for a differently-cased email", err)
+	}
+}
+
+// No-account-enumeration is the load-bearing security property of this feature: a wrong password
+// and a nonexistent account must produce the exact same error to the caller.
+func TestAuthenticateDoesNotDistinguishWrongPasswordFromNoSuchAccount(t *testing.T) {
+	svc := newTestService()
+	ctx := context.Background()
+	if _, err := svc.SignUp(ctx, "tunde@example.com", "correct-password"); err != nil {
+		t.Fatalf("SignUp() error = %v", err)
+	}
+
+	_, wrongPasswordErr := svc.Authenticate(ctx, "tunde@example.com", "wrong-password")
+	_, noSuchAccountErr := svc.Authenticate(ctx, "nobody@example.com", "anything")
+
+	if !errors.Is(wrongPasswordErr, ErrInvalidCredentials) {
+		t.Errorf("wrong password error = %v, want ErrInvalidCredentials", wrongPasswordErr)
+	}
+	if !errors.Is(noSuchAccountErr, ErrInvalidCredentials) {
+		t.Errorf("no such account error = %v, want ErrInvalidCredentials", noSuchAccountErr)
+	}
+	if !errors.Is(wrongPasswordErr, noSuchAccountErr) && wrongPasswordErr.Error() != noSuchAccountErr.Error() {
+		t.Error("wrong-password and no-such-account errors are distinguishable — enumeration risk")
+	}
+}
+
+func TestPasswordResetRequestThenConfirmChangesThePassword(t *testing.T) {
+	svc := newTestService()
+	ctx := context.Background()
+	if _, err := svc.SignUp(ctx, "ngozi@example.com", "old-password"); err != nil {
+		t.Fatalf("SignUp() error = %v", err)
+	}
+
+	if err := svc.RequestPasswordReset(ctx, "ngozi@example.com"); err != nil {
+		t.Fatalf("RequestPasswordReset() error = %v", err)
+	}
+
+	// The service logs the token rather than returning it (see ResetTokenStore's doc comment), so
+	// the test reaches into the store the way an operator relaying the logged token effectively
+	// would — it's the only handle available without a real delivery channel.
+	var token string
+	for tok := range svc.resets.entries {
+		token = tok
+	}
+	if token == "" {
+		t.Fatal("no reset token was issued")
+	}
+
+	if err := svc.ConfirmPasswordReset(ctx, token, "new-password"); err != nil {
+		t.Fatalf("ConfirmPasswordReset() error = %v", err)
+	}
+
+	if _, err := svc.Authenticate(ctx, "ngozi@example.com", "old-password"); !errors.Is(err, ErrInvalidCredentials) {
+		t.Error("old password still authenticates after reset")
+	}
+	if _, err := svc.Authenticate(ctx, "ngozi@example.com", "new-password"); err != nil {
+		t.Errorf("Authenticate() with new password error = %v, want nil", err)
+	}
+}
+
+func TestPasswordResetRequestIsSilentForUnknownEmail(t *testing.T) {
+	svc := newTestService()
+
+	// Must return nil, not an error a handler could turn into a different response — that would
+	// itself be an enumeration oracle.
+	if err := svc.RequestPasswordReset(context.Background(), "nobody@example.com"); err != nil {
+		t.Errorf("RequestPasswordReset() error = %v, want nil for an unknown email", err)
+	}
+}
+
+func TestConfirmPasswordResetRejectsUnknownToken(t *testing.T) {
+	svc := newTestService()
+
+	err := svc.ConfirmPasswordReset(context.Background(), "not-a-real-token", "new-password")
+	if !errors.Is(err, ErrInvalidResetToken) {
+		t.Errorf("ConfirmPasswordReset() error = %v, want ErrInvalidResetToken", err)
+	}
+}
+
+func TestConfirmPasswordResetTokenIsSingleUse(t *testing.T) {
+	svc := newTestService()
+	ctx := context.Background()
+	if _, err := svc.SignUp(ctx, "ngozi@example.com", "old-password"); err != nil {
+		t.Fatalf("SignUp() error = %v", err)
+	}
+	if err := svc.RequestPasswordReset(ctx, "ngozi@example.com"); err != nil {
+		t.Fatalf("RequestPasswordReset() error = %v", err)
+	}
+	var token string
+	for tok := range svc.resets.entries {
+		token = tok
+	}
+
+	if err := svc.ConfirmPasswordReset(ctx, token, "new-password-1"); err != nil {
+		t.Fatalf("first ConfirmPasswordReset() error = %v", err)
+	}
+
+	err := svc.ConfirmPasswordReset(ctx, token, "new-password-2")
+	if !errors.Is(err, ErrInvalidResetToken) {
+		t.Errorf("second ConfirmPasswordReset() error = %v, want ErrInvalidResetToken", err)
+	}
+}
+
+// Sanity check that the clock seam works as intended, in case a future test needs to freeze time
+// (e.g. to test reset-token expiry through the Service rather than the store directly).
+func TestServiceClockSeam(t *testing.T) {
+	svc := newTestService()
+	fixed := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	svc.clock = func() time.Time { return fixed }
+
+	user, err := svc.SignUp(context.Background(), "fixed-clock@example.com", "password")
+	if err != nil {
+		t.Fatalf("SignUp() error = %v", err)
+	}
+	if !user.CreatedAt.Equal(fixed) {
+		t.Errorf("CreatedAt = %v, want %v", user.CreatedAt, fixed)
+	}
+}

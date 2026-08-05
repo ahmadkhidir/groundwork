@@ -18,12 +18,18 @@ describe("route builders", () => {
 });
 
 describe("authentication gate", () => {
-  it.each(["/", "/login", "/signup", "/shared/tok_abc123"])(
-    "treats %s as public",
-    (path) => {
-      expect(isPublicRoute(path)).toBe(true);
-    },
-  );
+  it.each([
+    "/",
+    "/login",
+    "/signup",
+    // A user who cannot log in cannot be signed in to reach these. Gating them behind the auth
+    // check would make password reset unreachable for exactly the users who need it.
+    "/forgot-password",
+    "/reset-password",
+    "/shared/tok_abc123",
+  ])("treats %s as public", (path) => {
+    expect(isPublicRoute(path)).toBe(true);
+  });
 
   it.each([
     "/workspaces",
