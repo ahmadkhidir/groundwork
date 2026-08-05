@@ -15,8 +15,10 @@ import (
 	"time"
 
 	"github.com/ahmadkhidir/groundwork/server/internal/api"
+	"github.com/ahmadkhidir/groundwork/server/internal/audit"
 	"github.com/ahmadkhidir/groundwork/server/internal/auth"
 	"github.com/ahmadkhidir/groundwork/server/internal/config"
+	"github.com/ahmadkhidir/groundwork/server/internal/storage"
 	"github.com/ahmadkhidir/groundwork/server/internal/store/postgres"
 )
 
@@ -53,11 +55,33 @@ func run(logger *slog.Logger) error {
 	}
 	defer pool.Close()
 
-	authService := auth.NewService(postgres.NewUserRepository(pool), logger)
+	userRepo := postgres.NewUserRepository(pool)
+	auditRepo := postgres.NewAuditRepository(pool)
+	auditWriter := audit.NewWriter(auditRepo)
+
+	authService := auth.NewService(userRepo, logger)
+	authService.SetLoginAuditor(auditWriter)
+
+	objectStore := storage.NewClient(storage.Config{
+		Endpoint:        cfg.Storage.Endpoint,
+		Bucket:          cfg.Storage.Bucket,
+		AccessKeyID:     cfg.Storage.AccessKeyID,
+		SecretAccessKey: cfg.Storage.SecretAccessKey,
+		Region:          cfg.Storage.Region,
+	})
+
+	deps := api.Dependencies{
+		AuthSecret: cfg.AuthSecret,
+		Workspaces: postgres.NewWorkspaceRepository(pool),
+		Users:      userRepo,
+		Datasets:   postgres.NewDatasetRepository(pool),
+		Objects:    objectStore,
+		AuditLog:   auditRepo,
+	}
 
 	server := &http.Server{
 		Addr:    ":" + cfg.Port,
-		Handler: api.NewServer(cfg, logger, authService),
+		Handler: api.NewServer(cfg, logger, authService, deps),
 		// Timeouts are set explicitly: Go's defaults are none, which leaves the service open to
 		// slow-client resource exhaustion.
 		ReadHeaderTimeout: 10 * time.Second,

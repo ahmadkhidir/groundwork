@@ -81,7 +81,7 @@ func newTestServerWithAuth(t *testing.T) *Server {
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	service := auth.NewService(newFakeUserStore(), logger)
-	return NewServer(cfg, logger, service)
+	return NewServer(cfg, logger, service, Dependencies{})
 }
 
 func doJSON(t *testing.T, server *Server, method, path string, body any) *httptest.ResponseRecorder {

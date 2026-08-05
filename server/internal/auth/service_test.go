@@ -136,6 +136,76 @@ func TestAuthenticateSucceedsWithCorrectCredentials(t *testing.T) {
 	}
 }
 
+// fakeLoginAuditor is an in-memory LoginAuditor for verifying Authenticate's audit write without a
+// real database, matching the fakeUserStore pattern above.
+type fakeLoginAuditor struct {
+	loggedUserIDs []string
+	failNext      bool
+}
+
+func (f *fakeLoginAuditor) WriteLogin(ctx context.Context, userID string) error {
+	if f.failNext {
+		return errors.New("simulated audit write failure")
+	}
+	f.loggedUserIDs = append(f.loggedUserIDs, userID)
+	return nil
+}
+
+func TestAuthenticateWritesLoginAuditEntry(t *testing.T) {
+	svc := newTestService()
+	auditor := &fakeLoginAuditor{}
+	svc.SetLoginAuditor(auditor)
+	ctx := context.Background()
+
+	user, err := svc.SignUp(ctx, "chidinma@example.com", "correct-password")
+	if err != nil {
+		t.Fatalf("SignUp() error = %v", err)
+	}
+
+	if _, err := svc.Authenticate(ctx, "chidinma@example.com", "correct-password"); err != nil {
+		t.Fatalf("Authenticate() error = %v", err)
+	}
+
+	if len(auditor.loggedUserIDs) != 1 || auditor.loggedUserIDs[0] != user.ID {
+		t.Errorf("loggedUserIDs = %v, want [%s]", auditor.loggedUserIDs, user.ID)
+	}
+}
+
+func TestAuthenticateDoesNotWriteLoginAuditEntryOnFailure(t *testing.T) {
+	svc := newTestService()
+	auditor := &fakeLoginAuditor{}
+	svc.SetLoginAuditor(auditor)
+	ctx := context.Background()
+
+	if _, err := svc.SignUp(ctx, "chidinma@example.com", "correct-password"); err != nil {
+		t.Fatalf("SignUp() error = %v", err)
+	}
+
+	if _, err := svc.Authenticate(ctx, "chidinma@example.com", "wrong-password"); err == nil {
+		t.Fatal("expected Authenticate to fail with the wrong password")
+	}
+
+	if len(auditor.loggedUserIDs) != 0 {
+		t.Errorf("loggedUserIDs = %v, want none on a failed login", auditor.loggedUserIDs)
+	}
+}
+
+func TestAuthenticateSucceedsEvenWhenAuditWriteFails(t *testing.T) {
+	svc := newTestService()
+	auditor := &fakeLoginAuditor{failNext: true}
+	svc.SetLoginAuditor(auditor)
+	ctx := context.Background()
+
+	if _, err := svc.SignUp(ctx, "chidinma@example.com", "correct-password"); err != nil {
+		t.Fatalf("SignUp() error = %v", err)
+	}
+
+	// An audit-log outage must not become a login outage — see Authenticate's doc comment.
+	if _, err := svc.Authenticate(ctx, "chidinma@example.com", "correct-password"); err != nil {
+		t.Fatalf("Authenticate() error = %v, want login to succeed despite the audit write failing", err)
+	}
+}
+
 func TestAuthenticateSucceedsCaseInsensitiveEmail(t *testing.T) {
 	svc := newTestService()
 	ctx := context.Background()

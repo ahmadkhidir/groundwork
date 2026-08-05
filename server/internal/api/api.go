@@ -15,8 +15,27 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/ahmadkhidir/groundwork/server/internal/auth"
+	"github.com/ahmadkhidir/groundwork/server/internal/authsession"
 	"github.com/ahmadkhidir/groundwork/server/internal/config"
 )
+
+// Dependencies bundles every wave-2-and-later collaborator NewServer needs, beyond auth. Grouped
+// into a struct (rather than growing NewServer's positional parameter list every wave) so a later
+// wave adding, say, the orchestrator or engine provider doesn't force every existing call site to
+// change.
+type Dependencies struct {
+	// AuthSecret decodes the Auth.js session cookie the browser sends directly to this service — see
+	// internal/authsession's package doc for why that is the actual authorization boundary. Read
+	// directly from AUTH_SECRET by cmd/api/main.go rather than through internal/config, which is
+	// read-only to feature work; reported as a needed config.Config field.
+	AuthSecret string
+
+	Workspaces WorkspaceStore
+	Users      UserTierLookup
+	Datasets   DatasetStore
+	Objects    ObjectStore
+	AuditLog   AuditStore
+}
 
 // Server wires configuration and dependencies into an http.Handler.
 type Server struct {
@@ -25,18 +44,21 @@ type Server struct {
 	router chi.Router
 
 	authService *auth.Service
+	deps        Dependencies
 }
 
 // NewServer constructs a Server with all routes registered.
 //
 // authService may be nil only in tests that don't exercise auth-backed routes; production callers
-// (cmd/api/main.go) always supply one.
-func NewServer(cfg config.Config, logger *slog.Logger, authService *auth.Service) *Server {
+// (cmd/api/main.go) always supply one. deps' fields are likewise only required for the routes that
+// use them — tests exercising just /healthz or /v1/auth/* can pass a zero-value Dependencies.
+func NewServer(cfg config.Config, logger *slog.Logger, authService *auth.Service, deps Dependencies) *Server {
 	s := &Server{
 		cfg:         cfg,
 		logger:      logger,
 		router:      chi.NewRouter(),
 		authService: authService,
+		deps:        deps,
 	}
 	s.routes()
 	return s
@@ -72,10 +94,28 @@ func (s *Server) routes() {
 			RegisterAuthRoutes(r, s.authService, s.logger)
 		}
 
-		r.Route("/workspaces", func(r chi.Router) {
-			r.Get("/", s.handleNotImplemented("FEAT-002", "Phase 1"))
-			r.Post("/", s.handleNotImplemented("FEAT-002", "Phase 1"))
-		})
+		// Everything below requires an authenticated session — see internal/authsession's package
+		// doc for why this middleware, not web/src/proxy.ts's redirect, is the actual authorization
+		// boundary. Guarded on deps.Workspaces being wired so a test server built with a zero-value
+		// Dependencies (e.g. this package's own routing/CORS tests) doesn't panic on a nil store.
+		if s.deps.Workspaces != nil {
+			r.Group(func(r chi.Router) {
+				r.Use(authsession.RequireAuth(s.deps.AuthSecret))
+
+				// FEAT-002: create and list workspaces.
+				RegisterWorkspaceRoutes(r, s.deps.Workspaces, s.deps.Users, s.logger)
+
+				// FEAT-003: file upload.
+				if s.deps.Datasets != nil && s.deps.Objects != nil {
+					RegisterUploadRoutes(r, s.deps.Workspaces, s.deps.Datasets, s.deps.Objects, s.cfg.MaxUploadBytes, s.logger)
+				}
+
+				// FEAT-042: visible model-egress / audit log.
+				if s.deps.AuditLog != nil {
+					RegisterAuditRoutes(r, s.deps.Workspaces, s.deps.AuditLog, s.logger)
+				}
+			})
+		}
 	})
 }
 

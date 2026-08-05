@@ -257,6 +257,17 @@ loaded via `next/font` and bound to `--font-display`, `--font-body`, `--font-mon
 5. **The Next.js layer must never** perform run orchestration, engine access, semantic-layer mutation,
    or any DuckDB access. Rendering, routing, auth-session handling, and BFF proxying only.
    (`architecture.md` boundary rule.)
+
+   **How a browser request authenticates against Go:** the browser calls the Go API *directly* with
+   `credentials: "include"`, so the only thing that travels is the Auth.js session cookie.
+   `server/internal/authsession` decodes that cookie (JWE, `dir` + `A256CBC-HS512`, HKDF-derived
+   key) using the shared `AUTH_SECRET`. **That decode — not `proxy.ts` — is the authorization
+   boundary.** `proxy.ts` only redirects for UX. Every protected route composes
+   `authsession.RequireAuth` → `requireWorkspaceOwnership`.
+
+   Two consequences: `AUTH_SECRET` must be **byte-identical** in `web/.env.local` and `server/.env`,
+   and in production both tiers must share a cookie-eligible parent domain. Local dev works
+   regardless, because host-only cookies ignore the port.
 6. **The model never answers from data in context.** It plans and writes SQL; the engine returns
    facts; the model narrates over those facts. There is no bypass code path — this is foundational.
 7. **Every payload sent to the model is written to the audit/egress log in the same code path as the
@@ -330,7 +341,7 @@ loaded via `next/font` and bound to `--font-display`, `--font-body`, `--font-mon
 | Phase | Features | Status |
 |---|---|---|
 | **A — Foundation** | Scaffold, theme tokens, schema entities, auth, routing skeleton, docker-compose | **Complete** |
-| **1 — Foundation: Workspace, Ingest & Trust** | FEAT-001 ✅ · 002, 003, 004, 005, 006, 007, 008, 009, 011, 042, 044 | In progress (wave 1 of 5) |
+| **1 — Foundation: Workspace, Ingest & Trust** | FEAT-001 ✅ 002 ✅ 003 ✅ 042 ✅ 044 ✅ · 004, 005, 006, 007, 008, 009, 011 | In progress (wave 2 of 5) |
 | **2 — Core Grounded Answer Loop** | FEAT-013, 014, 015, 016, 017, 018, 019, 020 | Not started |
 | **3 — Trust & Observability** | FEAT-022, 023, 024, 027, 028, 029, 030 | Not started |
 | **4 — Reports & Delivery** | FEAT-034, 035, 036, 041, 043 | Not started |
@@ -366,7 +377,7 @@ Each is a real task, not a note to ignore. Close them in the wave that owns the 
 | Divergence | Spec | Owner |
 |---|---|---|
 | Sign Up form has no optional **Display Name** field; the server derives it from the email local-part | `screens/02` now specifies the field, with the derived value as the blank-default | Any wave touching auth screens |
-| **No `login` audit entries are written** — the old schema made them unrepresentable | `AuditLogEntry.workspace_id` is now optional; `login` is account-scoped | **Wave 2 (FEAT-042)** |
+| ~~No `login` audit entries~~ — **closed in Wave 2** by migration `00002` + the audit hook in `auth.Service` | — | done |
 | Password reset tokens live in a **process-local in-memory store**; delivery is a log line | `PasswordResetToken` entity + Transactional Email Provider now specified | Deferred — needs a vendor decision and a migration |
 
 The reset-token store does not survive a restart or a multi-instance deploy. It is flagged as interim

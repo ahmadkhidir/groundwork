@@ -43,11 +43,25 @@ type UserStore interface {
 	UpdatePasswordHash(ctx context.Context, userID, passwordHash string) error
 }
 
+// LoginAuditor writes the account-scoped `login` entry to the combined audit/egress log
+// (FEAT-042), satisfied by internal/audit.Writer.
+//
+// Defined consumer-side, matching UserStore's shape, so this package stays unit-testable without
+// importing internal/audit or internal/store/postgres.
+type LoginAuditor interface {
+	WriteLogin(ctx context.Context, userID string) error
+}
+
 // Service implements FEAT-001: account creation, credential verification, and password reset.
 type Service struct {
 	users  UserStore
 	resets *ResetTokenStore
 	logger *slog.Logger
+	// loginAuditor is nil until SetLoginAuditor is called. Kept optional (rather than a required
+	// constructor argument) so every existing caller of NewService — including this package's own
+	// tests and internal/api's — keeps compiling unchanged; cmd/api/main.go is the one production
+	// caller that wires a real one.
+	loginAuditor LoginAuditor
 	// clock is overridden in tests; defaults to time.Now.
 	clock func() time.Time
 }
@@ -60,6 +74,13 @@ func NewService(users UserStore, logger *slog.Logger) *Service {
 		logger: logger,
 		clock:  time.Now,
 	}
+}
+
+// SetLoginAuditor wires the login-audit write path. Until called, Authenticate succeeds without
+// writing an audit entry — the same "unwired dependency is a no-op, not a failure" shape as the rest
+// of this Service's optional collaborators.
+func (s *Service) SetLoginAuditor(a LoginAuditor) {
+	s.loginAuditor = a
 }
 
 // SignUp creates a new account for email/password.
@@ -116,6 +137,17 @@ func (s *Service) Authenticate(ctx context.Context, email, password string) (dom
 	if err != nil || !ok {
 		return domain.User{}, ErrInvalidCredentials
 	}
+
+	// Written in the SAME code path as the successful login, per IMPLEMENTATION.md §5 rule 7 — never
+	// reconciled after the fact. A write failure here is logged but does not fail the login itself:
+	// an audit-log outage becoming a login outage would trade a monitoring problem for an
+	// availability one, and nothing in FEAT-042 requires login to be blocked on it.
+	if s.loginAuditor != nil {
+		if err := s.loginAuditor.WriteLogin(ctx, user.ID); err != nil {
+			s.logger.Error("writing login audit entry", slog.String("error", err.Error()), slog.String("user_id", user.ID))
+		}
+	}
+
 	return user, nil
 }
 

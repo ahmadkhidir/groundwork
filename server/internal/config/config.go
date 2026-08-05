@@ -9,7 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -49,6 +51,27 @@ type Config struct {
 
 	// Environment is "development", "staging", or "production". Controls error verbosity.
 	Environment string
+
+	// AuthSecret is the Auth.js signing secret, shared with the web tier.
+	//
+	// The browser calls this service directly and authenticates with the Auth.js session cookie, so
+	// this service must decode that cookie itself (see internal/authsession). This value MUST be
+	// byte-identical to the web tier's AUTH_SECRET or every authenticated request fails.
+	AuthSecret string
+
+	// Storage is the S3-compatible object storage configuration: MinIO locally, Cloudflare R2 in
+	// production.
+	Storage StorageConfig
+}
+
+// StorageConfig describes the S3-compatible object store holding uploaded and normalized datasets.
+type StorageConfig struct {
+	Endpoint        string
+	Bucket          string
+	AccessKeyID     string
+	SecretAccessKey string
+	// Region defaults to "auto", which is what Cloudflare R2 expects.
+	Region string
 }
 
 // IsProduction reports whether the service is running in the production environment.
@@ -90,8 +113,35 @@ func Load() (Config, error) {
 		cfg.EngineIdleTimeout = parsed
 	}
 
-	if cfg.DatabaseURL == "" {
-		return Config{}, errors.New("DATABASE_URL is required")
+	cfg.AuthSecret = os.Getenv("AUTH_SECRET")
+
+	cfg.Storage = StorageConfig{
+		Endpoint:        os.Getenv("S3_ENDPOINT"),
+		Bucket:          os.Getenv("S3_BUCKET"),
+		AccessKeyID:     os.Getenv("S3_ACCESS_KEY_ID"),
+		SecretAccessKey: os.Getenv("S3_SECRET_ACCESS_KEY"),
+		Region:          envOrDefault("S3_REGION", "auto"),
+	}
+
+	// Everything required is validated in one place and reported together, so a fresh developer
+	// fixes their whole .env in one pass instead of rediscovering one missing key per restart.
+	var missing []string
+	for name, value := range map[string]string{
+		"DATABASE_URL":         cfg.DatabaseURL,
+		"AUTH_SECRET":          cfg.AuthSecret,
+		"S3_ENDPOINT":          cfg.Storage.Endpoint,
+		"S3_BUCKET":            cfg.Storage.Bucket,
+		"S3_ACCESS_KEY_ID":     cfg.Storage.AccessKeyID,
+		"S3_SECRET_ACCESS_KEY": cfg.Storage.SecretAccessKey,
+	} {
+		if value == "" {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		// Sorted so the message is deterministic; Go map iteration order is not.
+		sort.Strings(missing)
+		return Config{}, fmt.Errorf("missing required environment variables: %s", strings.Join(missing, ", "))
 	}
 
 	return cfg, nil

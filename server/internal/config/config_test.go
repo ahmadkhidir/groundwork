@@ -15,6 +15,34 @@ func TestMaxUploadBytesDefaultIs500MB(t *testing.T) {
 	}
 }
 
+// requiredEnv is the minimum set that lets Load succeed. Tests start from this and override or
+// remove individual keys, so adding a new required variable breaks one obvious place rather than
+// every case at once.
+func requiredEnv() map[string]string {
+	return map[string]string{
+		"DATABASE_URL":         "postgres://localhost/groundwork",
+		"AUTH_SECRET":          "test-secret",
+		"S3_ENDPOINT":          "http://localhost:9000",
+		"S3_BUCKET":            "groundwork-datasets",
+		"S3_ACCESS_KEY_ID":     "test-key",
+		"S3_SECRET_ACCESS_KEY": "test-secret-key",
+	}
+}
+
+// withEnv returns the required set with the given overrides applied. A "" value removes the key,
+// which is how a test asserts that a variable really is required.
+func withEnv(overrides map[string]string) map[string]string {
+	env := requiredEnv()
+	for key, value := range overrides {
+		if value == "" {
+			delete(env, key)
+			continue
+		}
+		env[key] = value
+	}
+	return env
+}
+
 func TestLoad(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -24,7 +52,7 @@ func TestLoad(t *testing.T) {
 	}{
 		{
 			name: "applies documented defaults",
-			env:  map[string]string{"DATABASE_URL": "postgres://localhost/groundwork"},
+			env:  requiredEnv(),
 			check: func(t *testing.T, cfg Config) {
 				if cfg.MaxUploadBytes != MaxUploadBytesDefault {
 					t.Errorf("MaxUploadBytes = %d, want %d", cfg.MaxUploadBytes, MaxUploadBytesDefault)
@@ -38,20 +66,20 @@ func TestLoad(t *testing.T) {
 				if cfg.IsProduction() {
 					t.Error("IsProduction() = true, want false for the development default")
 				}
+				if cfg.Storage.Region != "auto" {
+					t.Errorf("Storage.Region = %q, want auto (Cloudflare R2's expected value)", cfg.Storage.Region)
+				}
 			},
 		},
 		{
 			// Refusing to start beats starting against the wrong database, or none.
 			name:    "rejects a missing database URL",
-			env:     map[string]string{},
+			env:     withEnv(map[string]string{"DATABASE_URL": ""}),
 			wantErr: true,
 		},
 		{
 			name: "allows overriding the upload ceiling per environment",
-			env: map[string]string{
-				"DATABASE_URL":     "postgres://localhost/groundwork",
-				"MAX_UPLOAD_BYTES": "1048576",
-			},
+			env:  withEnv(map[string]string{"MAX_UPLOAD_BYTES": "1048576"}),
 			check: func(t *testing.T, cfg Config) {
 				if cfg.MaxUploadBytes != 1048576 {
 					t.Errorf("MaxUploadBytes = %d, want 1048576", cfg.MaxUploadBytes)
@@ -59,39 +87,51 @@ func TestLoad(t *testing.T) {
 			},
 		},
 		{
-			name: "rejects a non-numeric upload ceiling",
-			env: map[string]string{
-				"DATABASE_URL":     "postgres://localhost/groundwork",
-				"MAX_UPLOAD_BYTES": "500MB",
-			},
+			name:    "rejects a non-numeric upload ceiling",
+			env:     withEnv(map[string]string{"MAX_UPLOAD_BYTES": "500MB"}),
 			wantErr: true,
 		},
 		{
 			// A zero or negative ceiling would reject every upload — fail loudly at boot instead.
-			name: "rejects a non-positive upload ceiling",
-			env: map[string]string{
-				"DATABASE_URL":     "postgres://localhost/groundwork",
-				"MAX_UPLOAD_BYTES": "0",
-			},
+			name:    "rejects a non-positive upload ceiling",
+			env:     withEnv(map[string]string{"MAX_UPLOAD_BYTES": "0"}),
 			wantErr: true,
 		},
 		{
-			name: "rejects an unparseable idle timeout",
-			env: map[string]string{
-				"DATABASE_URL":        "postgres://localhost/groundwork",
-				"ENGINE_IDLE_TIMEOUT": "ten minutes",
-			},
+			name:    "rejects an unparseable idle timeout",
+			env:     withEnv(map[string]string{"ENGINE_IDLE_TIMEOUT": "ten minutes"}),
 			wantErr: true,
 		},
 		{
 			name: "detects the production environment",
-			env: map[string]string{
-				"DATABASE_URL": "postgres://localhost/groundwork",
-				"ENVIRONMENT":  "production",
-			},
+			env:  withEnv(map[string]string{"ENVIRONMENT": "production"}),
 			check: func(t *testing.T, cfg Config) {
 				if !cfg.IsProduction() {
 					t.Error("IsProduction() = false, want true")
+				}
+			},
+		},
+		{
+			// The web tier and this service must share AUTH_SECRET byte-for-byte, or every
+			// authenticated request fails at cookie decode. Starting without it is never useful.
+			name:    "rejects a missing AUTH_SECRET",
+			env:     withEnv(map[string]string{"AUTH_SECRET": ""}),
+			wantErr: true,
+		},
+		{
+			name:    "rejects missing object storage settings",
+			env:     withEnv(map[string]string{"S3_BUCKET": ""}),
+			wantErr: true,
+		},
+		{
+			name: "reads object storage settings into Storage",
+			env:  requiredEnv(),
+			check: func(t *testing.T, cfg Config) {
+				if cfg.Storage.Bucket != "groundwork-datasets" {
+					t.Errorf("Storage.Bucket = %q", cfg.Storage.Bucket)
+				}
+				if cfg.AuthSecret != "test-secret" {
+					t.Errorf("AuthSecret = %q", cfg.AuthSecret)
 				}
 			},
 		},
@@ -105,7 +145,10 @@ func TestLoad(t *testing.T) {
 				t.Setenv(key, value)
 			}
 			// Ensure inherited values from the developer's shell cannot influence the result.
-			for _, key := range []string{"MAX_UPLOAD_BYTES", "ENGINE_IDLE_TIMEOUT", "ENVIRONMENT", "PORT", "DATABASE_URL"} {
+			for _, key := range []string{
+				"MAX_UPLOAD_BYTES", "ENGINE_IDLE_TIMEOUT", "ENVIRONMENT", "PORT", "DATABASE_URL",
+				"AUTH_SECRET", "S3_ENDPOINT", "S3_BUCKET", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY", "S3_REGION",
+			} {
 				if _, set := tt.env[key]; !set {
 					t.Setenv(key, "")
 				}

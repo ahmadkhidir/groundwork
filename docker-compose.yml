@@ -20,7 +20,11 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - postgres-data:/var/lib/postgresql/data
+      # Mount point is /var/lib/postgresql, NOT /var/lib/postgresql/data.
+      # Postgres 18+ stores data in a version-numbered subdirectory and refuses to start when the
+      # volume is mounted directly at the old data path. Mounting one level up breaks the container
+      # outright, not subtly — it never becomes healthy.
+      - postgres-data:/var/lib/postgresql
     healthcheck:
       # The API service and migrations both depend on this being genuinely ready, not merely
       # started — Postgres accepts connections briefly before it is able to serve them.

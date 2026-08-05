@@ -20,9 +20,10 @@ func newTestServer() *Server {
 		MaxUploadBytes: config.MaxUploadBytesDefault,
 		Environment:    "development",
 	}
-	// authService is nil: these tests exercise routing, CORS, and the not-implemented shell, none of
-	// which touch FEAT-001. Auth-specific behavior is covered by internal/api/auth_test.go.
-	return NewServer(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	// authService is nil and Dependencies is the zero value: these tests exercise routing and CORS
+	// only, none of which touch FEAT-001/002/003/042. Auth-specific behavior is covered by
+	// internal/api/auth_test.go; workspace/upload/audit-log behavior by their own _test.go files.
+	return NewServer(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, Dependencies{})
 }
 
 func TestHealthEndpoint(t *testing.T) {
@@ -46,37 +47,31 @@ func TestHealthEndpoint(t *testing.T) {
 
 // An unbuilt endpoint must say so, and say which feature will build it. A 404 would be
 // indistinguishable from a typo in the path.
-func TestUnimplementedEndpointsReport501WithOwningFeature(t *testing.T) {
-	tests := []struct {
-		method string
-		path   string
-	}{
-		{http.MethodGet, "/v1/workspaces/"},
-		{http.MethodPost, "/v1/workspaces/"},
+//
+// FEAT-002/003/042 replaced the /v1/workspaces/ placeholders this test originally exercised (Wave 2)
+// — per IMPLEMENTATION.md, "a feature slice deletes the... 501 handler; it does not build around
+// it." handleNotImplemented itself remains live infrastructure for whatever a later wave still needs
+// it for, so it is exercised directly here rather than through a route this wave has since built.
+func TestHandleNotImplementedReports501WithOwningFeature(t *testing.T) {
+	handler := (&Server{}).handleNotImplemented("FEAT-999", "Some Future Phase")
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/whatever", nil)
+	rec := httptest.NewRecorder()
+	handler(rec, req)
+
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotImplemented)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.method+" "+tt.path, func(t *testing.T) {
-			req := httptest.NewRequest(tt.method, tt.path, nil)
-			rec := httptest.NewRecorder()
-
-			newTestServer().ServeHTTP(rec, req)
-
-			if rec.Code != http.StatusNotImplemented {
-				t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotImplemented)
-			}
-
-			var body map[string]string
-			if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
-				t.Fatalf("decoding body: %v", err)
-			}
-			if body["feature"] == "" {
-				t.Error("response omits the owning feature id")
-			}
-			if body["code"] != "not_implemented" {
-				t.Errorf("code = %q, want not_implemented", body["code"])
-			}
-		})
+	var body map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decoding body: %v", err)
+	}
+	if body["feature"] != "FEAT-999" {
+		t.Errorf("feature = %q, want FEAT-999", body["feature"])
+	}
+	if body["code"] != "not_implemented" {
+		t.Errorf("code = %q, want not_implemented", body["code"])
 	}
 }
 
