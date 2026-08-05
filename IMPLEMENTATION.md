@@ -211,9 +211,21 @@ loaded via `next/font` and bound to `--font-display`, `--font-body`, `--font-mon
 11. **Orchestrator correctness is not retrofitted.** Leases with heartbeats, per-step idempotency
     keys, and retry/backoff ship with the `steps` row from day one, with dedicated tests for lease
     expiry, retry idempotency, and fork semantics. (`risk_log.md` R-005, R-012.)
-12. **Tunable thresholds live in `server/internal/config`** — never as scattered literals. Currently:
-    upload size ceiling (FEAT-004), reconciliation exclusion threshold (FEAT-029), engine idle
-    teardown (~10 min). Values pending confirmation from the product owner.
+12. **Tunable thresholds live in `server/internal/config`** — never as scattered literals:
+
+    | Threshold | Value | Source |
+    |---|---|---|
+    | Upload size ceiling, per file | **500 MB** | Product owner, confirmed 2026-08-05. `features.md` FEAT-004 says only "a stated size ceiling" |
+    | Engine idle teardown | ~10 min | `architecture.md` §107 |
+    | Reconciliation exclusion threshold | *pending* | FEAT-029, Phase 3 |
+
+    The upload ceiling applies **per file, across all tiers** — `monetization.md` gates usage
+    allotments (engine-seconds, storage, tokens), not per-file size. It is enforced **twice**:
+    client-side before the upload starts (`user_flow.md`, `screens/05-file-upload.md` §39) and
+    server-side on receipt, since client validation is a UX affordance and not a control. The
+    rejection message **states the 500 MB figure explicitly** — a generic "file too large" is a
+    spec violation (`screens/05-file-upload.md` §54). One exported constant feeds the validator,
+    the server check, and the message; the number appears in code exactly once.
 13. Run tests and lint before declaring any unit of work complete.
 14. **Commit messages are Conventional Commits**, with the feature IDs delivered listed in an
     `Implements:` footer:
