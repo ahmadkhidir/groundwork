@@ -72,6 +72,20 @@ func (w *Writer) WriteModelCall(ctx context.Context, workspaceID, userID, payloa
 	})
 }
 
+// WritePIIOverride records a user explicitly clearing or confirming a column's PII flag (FEAT-007).
+//
+// Called from the override handler itself, in the same code path as the column write — this package's
+// one rule. A PII override decides what the model may see; a log that could drift from the decisions
+// actually made would not be evidence of anything. See screens/17-egress-audit-log.md, which renders
+// these entries alongside every other workspace-scoped action.
+func (w *Writer) WritePIIOverride(ctx context.Context, workspaceID, userID string) error {
+	return w.write(ctx, domain.AuditLogEntry{
+		WorkspaceID: workspaceID,
+		UserID:      userID,
+		ActionType:  domain.ActionPIIOverride,
+	})
+}
+
 // WriteExport records a report/data export. Reserved for FEAT-035 (Phase 4).
 func (w *Writer) WriteExport(ctx context.Context, workspaceID, userID string) error {
 	return w.write(ctx, domain.AuditLogEntry{

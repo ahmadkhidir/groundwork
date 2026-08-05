@@ -118,8 +118,10 @@ func run(logger *slog.Logger) error {
 		ConfirmationColumns:        columnRepo,
 		ConfirmationCandidateJoins: candidateJoinRepo,
 		Relationships:              relationshipRepo,
+		ConfirmationAudit:          auditWriter,
 
 		EngineProvider: engineProvider,
+		EngineDatasets: datasetRepo,
 	}
 
 	server := &http.Server{

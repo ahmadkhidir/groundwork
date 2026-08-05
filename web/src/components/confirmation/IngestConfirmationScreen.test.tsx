@@ -187,6 +187,49 @@ describe("IngestConfirmationScreen", () => {
     );
   });
 
+  // FEAT-007: a column reviewed and cleared must not read the same as one that was never flagged.
+  it("distinguishes a reviewed-and-cleared column from a never-flagged one", async () => {
+    mockLoad([
+      column({ id: "col-1", name: "never_reviewed", pii_flag: false }),
+      column({
+        id: "col-2",
+        name: "cleared_by_user",
+        pii_flag: false,
+        pii_reviewed_at: "2026-08-05T10:00:00Z",
+      }),
+    ]);
+    render(<IngestConfirmationScreen workspaceId="ws-1" />);
+    await waitFor(() => expect(screen.getByText("Confirm your data")).toBeInTheDocument());
+
+    await userEvent.click(screen.getByRole("tab", { name: /Sensitive columns/ }));
+
+    expect(screen.getAllByText("not sensitive").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("cleared by you").length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/You reviewed this on/).length).toBeGreaterThan(0);
+  });
+
+  it("shows the reviewed state after the user clears a flag", async () => {
+    mockLoad([column({ id: "col-1", name: "email", pii_flag: true, pii_pattern: "email" })]);
+    patchMock.mockResolvedValue({
+      column: column({
+        id: "col-1",
+        name: "email",
+        pii_flag: false,
+        pii_pattern: "",
+        pii_reviewed_at: "2026-08-05T10:00:00Z",
+      }),
+    });
+    render(<IngestConfirmationScreen workspaceId="ws-1" />);
+    await waitFor(() => expect(screen.getByText("Confirm your data")).toBeInTheDocument());
+
+    await userEvent.click(screen.getByRole("tab", { name: /Sensitive columns/ }));
+    await userEvent.click(screen.getAllByRole("button", { name: "Mark not sensitive" })[0]);
+
+    await waitFor(() =>
+      expect(screen.getAllByText("cleared by you").length).toBeGreaterThan(0),
+    );
+  });
+
   it("accepts a candidate join and shows it as accepted", async () => {
     mockLoad(
       [column({ id: "col-1", dataset_id: "ds-1" }), column({ id: "col-2", dataset_id: "ds-2" })],

@@ -23,9 +23,33 @@ type EngineStatusProvider interface {
 	Status(ctx context.Context, workspaceID string) (engine.Status, error)
 }
 
+// WorkspaceDatasetPresence answers "does this workspace have any dataset at all?", satisfied by
+// internal/store/postgres.DatasetRepository.
+//
+// A derived aggregate over existing Dataset rows, not a stored field: screens/04-workspace-home.md
+// specifies has_datasets on this endpoint, and schema.md's Workspace gained no property for it. A
+// persisted boolean would be a second source of truth that could disagree with the datasets table.
+type WorkspaceDatasetPresence interface {
+	ExistsForWorkspace(ctx context.Context, workspaceID string) (bool, error)
+}
+
 // RegisterEngineRoutes wires FEAT-011's endpoint onto r.
-func RegisterEngineRoutes(r chi.Router, workspaces WorkspaceStore, provider EngineStatusProvider, logger *slog.Logger) {
-	r.Get("/workspaces/{workspaceId}", handleGetWorkspace(workspaces, provider, logger))
+func RegisterEngineRoutes(r chi.Router, workspaces WorkspaceStore, provider EngineStatusProvider, datasets WorkspaceDatasetPresence, logger *slog.Logger) {
+	r.Get("/workspaces/{workspaceId}", handleGetWorkspace(workspaces, provider, datasets, logger))
+}
+
+// publicWorkspaceDetail is the single-workspace GET's payload: the shared workspace shape plus the
+// screen-specific derived fields screens/04-workspace-home.md asks this endpoint for.
+//
+// publicWorkspace is embedded (and so flattened into the same JSON object) rather than extended in
+// place, because the workspace LIST endpoint returns the same shape and has no has_datasets
+// requirement — reporting `has_datasets: false` there for every row would be a fabricated answer,
+// not an omitted one.
+type publicWorkspaceDetail struct {
+	publicWorkspace
+	// HasDatasets is true once at least one Dataset exists for this workspace. Screen 04's "Upload
+	// data" button is shown while it is false and hidden once it is true.
+	HasDatasets bool `json:"has_datasets"`
 }
 
 // handleGetWorkspace serves screens/04-workspace-home.md's GET /api/workspaces/:id: the workspace's
@@ -40,7 +64,7 @@ func RegisterEngineRoutes(r chi.Router, workspaces WorkspaceStore, provider Engi
 // This handler instead asks engine.Provider directly, so the status pill on Workspace Home is never
 // a stale read — Provider.Status's own contract guarantees that asking never itself triggers a wake,
 // so this is safe to poll on every screen visit.
-func handleGetWorkspace(workspaces WorkspaceStore, provider EngineStatusProvider, logger *slog.Logger) http.HandlerFunc {
+func handleGetWorkspace(workspaces WorkspaceStore, provider EngineStatusProvider, datasets WorkspaceDatasetPresence, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
@@ -53,7 +77,24 @@ func handleGetWorkspace(workspaces WorkspaceStore, provider EngineStatusProvider
 			return
 		}
 
-		out := toPublicWorkspace(ws)
+		out := publicWorkspaceDetail{publicWorkspace: toPublicWorkspace(ws)}
+
+		// Unlike live engine status below, this one is NOT allowed to fall back: has_datasets drives
+		// whether screen 04 offers the "Upload data" CTA, and a guessed `false` would tell a user
+		// with data that they have none. Failing the request is the honest outcome.
+		hasDatasets, err := datasets.ExistsForWorkspace(r.Context(), workspaceID)
+		if err != nil {
+			logger.Error("checking dataset presence",
+				slog.String("workspace_id", workspaceID),
+				slog.String("error", err.Error()),
+			)
+			respondJSON(w, http.StatusInternalServerError, map[string]string{
+				"error": "Something went wrong. Try again.",
+				"code":  "internal_error",
+			})
+			return
+		}
+		out.HasDatasets = hasDatasets
 
 		// A failure to read live status is NOT the same failure class as a failure to read the
 		// workspace itself — the record loaded fine, only the extra honesty layer on top of it

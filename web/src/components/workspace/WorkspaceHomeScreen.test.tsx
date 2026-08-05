@@ -15,12 +15,13 @@ vi.mock("@/lib/api-client", async () => {
 
 const getMock = vi.mocked(api.get);
 
-function workspaceWith(engineStatus: EngineStatus) {
+function workspaceWith(engineStatus: EngineStatus, hasDatasets = false) {
   return {
     id: "ws-1",
     name: "Q3 Numbers",
     owner_id: "user-1",
     engine_status: engineStatus,
+    has_datasets: hasDatasets,
     created_at: "2026-01-01T00:00:00Z",
     updated_at: "2026-01-01T00:00:00Z",
   };
@@ -135,5 +136,29 @@ describe("WorkspaceHomeScreen", () => {
       "href",
       "/workspaces/ws-1/upload",
     );
+  });
+
+  // screens/04-workspace-home.md: "Upload data prompt... Shown when no files ingested yet."
+  it("offers the Upload data CTA while the workspace has no datasets", async () => {
+    getMock.mockResolvedValue({
+      workspace: workspaceWith(EngineStatus.Sleeping, false),
+    });
+
+    render(<WorkspaceHomeScreen workspaceId="ws-1" />);
+
+    await waitFor(() =>
+      expect(screen.getByRole("link", { name: /upload data/i })).toBeInTheDocument(),
+    );
+  });
+
+  it("hides the Upload data CTA once the workspace has datasets", async () => {
+    getMock.mockResolvedValue({
+      workspace: workspaceWith(EngineStatus.Ready, true),
+    });
+
+    render(<WorkspaceHomeScreen workspaceId="ws-1" />);
+
+    await waitFor(() => expect(screen.getByText("Q3 Numbers")).toBeInTheDocument());
+    expect(screen.queryByRole("link", { name: /upload data/i })).not.toBeInTheDocument();
   });
 });

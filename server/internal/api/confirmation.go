@@ -36,7 +36,19 @@ type ConfirmationColumnStore interface {
 	ListByWorkspace(ctx context.Context, workspaceID string) ([]domain.Column, error)
 	GetByIDForWorkspace(ctx context.Context, id, workspaceID string) (domain.Column, error)
 	UpdateInferredType(ctx context.Context, id string, t domain.InferredType) error
-	UpdatePII(ctx context.Context, id string, flag bool, pattern string) error
+	UpdatePII(ctx context.Context, id string, flag bool, pattern string, reviewedAt time.Time) error
+}
+
+// ConfirmationAuditWriter is the seam the PII override handler uses to record FEAT-007's explicit
+// user decision in the audit log, satisfied by internal/audit.Writer.
+//
+// It is a required collaborator of the override route, not an optional extra: schema.md pairs
+// Column.pii_reviewed_at with a `pii_override` AuditLogEntry, and IMPLEMENTATION.md rule 7 requires
+// a trust-surface write to happen in the same code path as the action it records. A handler that
+// could be constructed without an audit writer is a handler that can silently stop producing
+// evidence.
+type ConfirmationAuditWriter interface {
+	WritePIIOverride(ctx context.Context, workspaceID, userID string) error
 }
 
 // ConfirmationCandidateJoinStore is the persistence seam for reviewing and deciding candidate joins
@@ -68,10 +80,11 @@ func RegisterConfirmationRoutes(
 	columns ConfirmationColumnStore,
 	joins ConfirmationCandidateJoinStore,
 	relationshipStore ConfirmationRelationshipStore,
+	auditWriter ConfirmationAuditWriter,
 	logger *slog.Logger,
 ) {
 	r.Get("/workspaces/{workspaceId}/columns", handleListWorkspaceColumns(workspaces, datasets, columns, logger))
-	r.Patch("/workspaces/{workspaceId}/columns/{columnId}", handleUpdateColumn(workspaces, columns, logger))
+	r.Patch("/workspaces/{workspaceId}/columns/{columnId}", handleUpdateColumn(workspaces, columns, auditWriter, logger))
 	r.Patch("/workspaces/{workspaceId}/candidate-joins/{joinId}", handleUpdateCandidateJoin(workspaces, columns, datasets, joins, relationshipStore, logger))
 }
 
@@ -103,14 +116,17 @@ func toPublicRelationship(rel domain.Relationship) publicRelationship {
 // screen reviews every column across an entire ingest batch (potentially several files) at once and
 // needs to label which file each column belongs to.
 type publicConfirmationColumn struct {
-	ID                string  `json:"id"`
-	DatasetID         string  `json:"dataset_id"`
-	DatasetFilename   string  `json:"dataset_filename"`
-	Name              string  `json:"name"`
-	InferredType      string  `json:"inferred_type"`
-	TypeConfidence    float64 `json:"type_confidence"`
-	PIIFlag           bool    `json:"pii_flag"`
-	PIIPattern        string  `json:"pii_pattern,omitempty"`
+	ID              string  `json:"id"`
+	DatasetID       string  `json:"dataset_id"`
+	DatasetFilename string  `json:"dataset_filename"`
+	Name            string  `json:"name"`
+	InferredType    string  `json:"inferred_type"`
+	TypeConfidence  float64 `json:"type_confidence"`
+	PIIFlag         bool    `json:"pii_flag"`
+	PIIPattern      string  `json:"pii_pattern,omitempty"`
+	// PIIReviewedAt is RFC 3339, or "" when no user has ever reviewed this column's flag — the
+	// distinction FEAT-007 requires between reviewed-and-cleared and never-flagged.
+	PIIReviewedAt     string  `json:"pii_reviewed_at,omitempty"`
 	ExcludedFromModel bool    `json:"excluded_from_model"`
 	NullRate          float64 `json:"null_rate"`
 	DistinctCount     int64   `json:"distinct_count"`
@@ -167,6 +183,7 @@ func handleListWorkspaceColumns(workspaces WorkspaceStore, datasets Confirmation
 				TypeConfidence:    c.TypeConfidence,
 				PIIFlag:           c.PIIFlag,
 				PIIPattern:        c.PIIPattern,
+				PIIReviewedAt:     c.PIIReviewedAt,
 				ExcludedFromModel: c.ExcludedFromModel,
 				NullRate:          c.NullRate,
 				DistinctCount:     c.DistinctCount,
@@ -202,7 +219,7 @@ type updateColumnRequest struct {
 // handleUpdateColumn serves PATCH /v1/workspaces/:id/columns/:columnId — FEAT-006's type-review
 // override and FEAT-007's PII-flag override, both landing on the same column resource since
 // screens/07 reviews them as two tabs/steps over the same underlying rows.
-func handleUpdateColumn(workspaces WorkspaceStore, columns ConfirmationColumnStore, logger *slog.Logger) http.HandlerFunc {
+func handleUpdateColumn(workspaces WorkspaceStore, columns ConfirmationColumnStore, auditWriter ConfirmationAuditWriter, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
@@ -278,7 +295,11 @@ func handleUpdateColumn(workspaces WorkspaceStore, columns ConfirmationColumnSto
 					pattern = col.PIIPattern
 				}
 			}
-			if err := columns.UpdatePII(r.Context(), columnID, *req.PIIFlag, pattern); err != nil {
+			// One timestamp for both writes below, so the column's pii_reviewed_at and its
+			// pii_override audit entry describe the same instant rather than two instants a
+			// round trip apart.
+			reviewedAt := time.Now().UTC()
+			if err := columns.UpdatePII(r.Context(), columnID, *req.PIIFlag, pattern, reviewedAt); err != nil {
 				logger.Error("updating column pii flag", slog.String("error", err.Error()))
 				respondJSON(w, http.StatusInternalServerError, map[string]string{
 					"error": "Something went wrong. Try again.",
@@ -288,6 +309,23 @@ func handleUpdateColumn(workspaces WorkspaceStore, columns ConfirmationColumnSto
 			}
 			col.PIIFlag = *req.PIIFlag
 			col.PIIPattern = pattern
+			col.PIIReviewedAt = reviewedAt.Format(time.RFC3339)
+
+			// FEAT-007: the override is logged as an explicit user decision here, in the same code
+			// path as the write it describes (IMPLEMENTATION.md rule 7) — never reconciled later.
+			//
+			// A failed audit write fails the request. The alternative — persisting the override and
+			// logging a warning — would leave a column whose model exposure changed with no record
+			// of who changed it, which is the exact state schema.md's pii_override action type was
+			// added to prevent. The column update is idempotent, so a retry is safe.
+			if err := auditWriter.WritePIIOverride(r.Context(), workspaceID, claims.UserID); err != nil {
+				logger.Error("writing pii override audit entry", slog.String("error", err.Error()))
+				respondJSON(w, http.StatusInternalServerError, map[string]string{
+					"error": "Something went wrong. Try again.",
+					"code":  "internal_error",
+				})
+				return
+			}
 		}
 
 		respondJSON(w, http.StatusOK, map[string]any{"column": publicColumn{
@@ -298,6 +336,7 @@ func handleUpdateColumn(workspaces WorkspaceStore, columns ConfirmationColumnSto
 			TypeConfidence:    col.TypeConfidence,
 			PIIFlag:           col.PIIFlag,
 			PIIPattern:        col.PIIPattern,
+			PIIReviewedAt:     col.PIIReviewedAt,
 			ExcludedFromModel: col.ExcludedFromModel,
 			NullRate:          col.NullRate,
 			DistinctCount:     col.DistinctCount,

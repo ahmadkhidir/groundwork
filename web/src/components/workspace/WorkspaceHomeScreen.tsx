@@ -19,13 +19,26 @@ export interface WorkspaceHomeScreenProps {
   workspaceId: string;
 }
 
+/**
+ * The single-workspace GET's payload: the `Workspace` entity plus the derived fields
+ * screens/04-workspace-home.md asks this endpoint for.
+ *
+ * `has_datasets` lives here rather than on `Workspace` in `@/types/schema` deliberately — that file
+ * mirrors `schema.md`'s entities, and `has_datasets` is not a stored property of a workspace. It is
+ * an aggregate the server computes over existing `Dataset` rows for this screen.
+ */
+interface WorkspaceDetail extends Workspace {
+  /** True once at least one dataset exists in this workspace. */
+  has_datasets: boolean;
+}
+
 interface GetWorkspaceResponse {
-  workspace: Workspace;
+  workspace: WorkspaceDetail;
 }
 
 type ScreenState =
   | { status: "loading" }
-  | { status: "loaded"; workspace: Workspace }
+  | { status: "loaded"; workspace: WorkspaceDetail }
   | { status: "error"; message: string };
 
 /**
@@ -58,7 +71,7 @@ export function WorkspaceHomeScreen({ workspaceId }: WorkspaceHomeScreenProps) {
   // Preserves the last-known engine status across a poll that fails or is still in flight, per
   // screens/04's Loading state: "engine status pill shows last-known state... rather than a neutral
   // skeleton" once at least one successful fetch has happened.
-  const lastKnownWorkspace = useRef<Workspace | null>(null);
+  const lastKnownWorkspace = useRef<WorkspaceDetail | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -151,21 +164,25 @@ export function WorkspaceHomeScreen({ workspaceId }: WorkspaceHomeScreenProps) {
         <AskPanel />
       </Card>
 
-      {/* Upload CTA is always offered as a valid entry point to File Upload (FEAT-003/004, already
-          shipped). Whether to HIDE it once a workspace already has ingested data — per
-          screens/04-workspace-home.md's "Upload data prompt... shown when no files ingested yet" —
-          depends on a dataset-presence check this screen has no endpoint for yet; reported as a gap
-          for whichever wave wires FEAT-034's reports list (the natural place to also learn whether a
-          workspace has any data). */}
-      <div className="mb-6">
-        <Link
-          href={routes.upload(workspaceId)}
-          className={buttonClassNames("secondary")}
-        >
-          <UploadCloud size={16} aria-hidden="true" />
-          Upload data
-        </Link>
-      </div>
+      {/* "Upload data prompt... Shown when no files ingested yet" (screens/04-workspace-home.md) —
+          driven by has_datasets from the same workspace fetch as the status pill, per that screen's
+          Data Flow step 5. Hidden once the workspace has data; File Upload stays reachable from the
+          workspace navigation and from Workspace List either way, so hiding the CTA removes a
+          redundant prompt rather than the route itself.
+
+          Rendered only once the workspace has actually loaded: showing the CTA during the first
+          fetch would make it flash and vanish on every visit to a workspace that has data. */}
+      {workspace && !workspace.has_datasets && (
+        <div className="mb-6">
+          <Link
+            href={routes.upload(workspaceId)}
+            className={buttonClassNames("secondary")}
+          >
+            <UploadCloud size={16} aria-hidden="true" />
+            Upload data
+          </Link>
+        </div>
+      )}
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-[2fr_1fr]">
         <div>

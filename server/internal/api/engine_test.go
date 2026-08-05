@@ -47,14 +47,31 @@ func (f *fakeEngineStatusProvider) Status(ctx context.Context, workspaceID strin
 // mirroring exactly how api.go mounts every other protected route (RequireAuth, then the
 // feature's Register*Routes), without requiring a Dependencies field this wave doesn't own.
 func newTestEngineRouter(workspaces WorkspaceStore, provider EngineStatusProvider) http.Handler {
+	return newTestEngineRouterWithDatasets(workspaces, provider, &fakeDatasetPresence{})
+}
+
+func newTestEngineRouterWithDatasets(workspaces WorkspaceStore, provider EngineStatusProvider, datasets WorkspaceDatasetPresence) http.Handler {
 	r := chi.NewRouter()
 	r.Route("/v1", func(r chi.Router) {
 		r.Group(func(r chi.Router) {
 			r.Use(authsession.RequireAuth(testAuthSecret))
-			RegisterEngineRoutes(r, workspaces, provider, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			RegisterEngineRoutes(r, workspaces, provider, datasets, slog.New(slog.NewTextHandler(io.Discard, nil)))
 		})
 	})
 	return r
+}
+
+// fakeDatasetPresence is an in-memory WorkspaceDatasetPresence backing screen 04's has_datasets.
+type fakeDatasetPresence struct {
+	withDatasets map[string]bool
+	err          error
+}
+
+func (f *fakeDatasetPresence) ExistsForWorkspace(ctx context.Context, workspaceID string) (bool, error) {
+	if f.err != nil {
+		return false, f.err
+	}
+	return f.withDatasets[workspaceID], nil
 }
 
 func TestGetWorkspaceRequiresAuthentication(t *testing.T) {
@@ -176,5 +193,62 @@ func TestGetWorkspaceNotFoundForMissingWorkspace(t *testing.T) {
 
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+}
+
+// TestGetWorkspaceReportsDatasetPresence covers screens/04-workspace-home.md's has_datasets field,
+// which drives whether the "Upload data" CTA is shown.
+func TestGetWorkspaceReportsDatasetPresence(t *testing.T) {
+	cases := []struct {
+		name string
+		has  bool
+	}{
+		{"no files ingested yet", false},
+		{"at least one dataset", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			workspaces := newFakeWorkspaceStore()
+			workspaces.byID["ws-1"] = domain.Workspace{ID: "ws-1", OwnerID: "user-1", EngineStatus: domain.EngineSleeping}
+			datasets := &fakeDatasetPresence{withDatasets: map[string]bool{"ws-1": tc.has}}
+			router := newTestEngineRouterWithDatasets(workspaces, newFakeEngineStatusProvider(), datasets)
+
+			req := authedRequest(t, http.MethodGet, "/v1/workspaces/ws-1", nil, "user-1", domain.TierFree)
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+			}
+			var body struct {
+				Workspace struct {
+					HasDatasets bool `json:"has_datasets"`
+				} `json:"workspace"`
+			}
+			if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+				t.Fatalf("decoding body: %v", err)
+			}
+			if body.Workspace.HasDatasets != tc.has {
+				t.Errorf("has_datasets = %v, want %v", body.Workspace.HasDatasets, tc.has)
+			}
+		})
+	}
+}
+
+// TestGetWorkspaceFailsWhenDatasetPresenceIsUnknown: unlike live engine status, has_datasets has no
+// honest fallback. Defaulting to false would tell a user who already uploaded files that they have
+// none, and offer them an "upload your first file" prompt.
+func TestGetWorkspaceFailsWhenDatasetPresenceIsUnknown(t *testing.T) {
+	workspaces := newFakeWorkspaceStore()
+	workspaces.byID["ws-1"] = domain.Workspace{ID: "ws-1", OwnerID: "user-1"}
+	datasets := &fakeDatasetPresence{err: errors.New("database unavailable")}
+	router := newTestEngineRouterWithDatasets(workspaces, newFakeEngineStatusProvider(), datasets)
+
+	req := authedRequest(t, http.MethodGet, "/v1/workspaces/ws-1", nil, "user-1", domain.TierFree)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusInternalServerError)
 	}
 }

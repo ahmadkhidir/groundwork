@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -81,11 +82,27 @@ func (f *fakeConfirmationColumnStore) UpdateInferredType(ctx context.Context, id
 	return nil
 }
 
-func (f *fakeConfirmationColumnStore) UpdatePII(ctx context.Context, id string, flag bool, pattern string) error {
+func (f *fakeConfirmationColumnStore) UpdatePII(ctx context.Context, id string, flag bool, pattern string, reviewedAt time.Time) error {
 	c := f.byID[id]
 	c.PIIFlag = flag
 	c.PIIPattern = pattern
+	c.PIIReviewedAt = reviewedAt.Format(time.RFC3339)
 	f.byID[id] = c
+	return nil
+}
+
+// fakeConfirmationAuditWriter records FEAT-007's pii_override entries so a test can assert the
+// override and its audit entry happen together, in the one handler.
+type fakeConfirmationAuditWriter struct {
+	entries []struct{ workspaceID, userID string }
+	err     error
+}
+
+func (f *fakeConfirmationAuditWriter) WritePIIOverride(ctx context.Context, workspaceID, userID string) error {
+	if f.err != nil {
+		return f.err
+	}
+	f.entries = append(f.entries, struct{ workspaceID, userID string }{workspaceID, userID})
 	return nil
 }
 
@@ -126,10 +143,22 @@ func newTestConfirmationRouter(
 	joins ConfirmationCandidateJoinStore,
 	relationshipStore ConfirmationRelationshipStore,
 ) http.Handler {
+	return newTestConfirmationRouterWithAudit(workspaces, datasets, columns, joins, relationshipStore, &fakeConfirmationAuditWriter{})
+}
+
+func newTestConfirmationRouterWithAudit(
+	workspaces WorkspaceStore,
+	datasets ConfirmationDatasetStore,
+	columns ConfirmationColumnStore,
+	joins ConfirmationCandidateJoinStore,
+	relationshipStore ConfirmationRelationshipStore,
+	auditWriter ConfirmationAuditWriter,
+) http.Handler {
 	r := chi.NewRouter()
 	r.Route("/v1", func(r chi.Router) {
 		r.Use(authsession.RequireAuth(testAuthSecret))
-		RegisterConfirmationRoutes(r, workspaces, datasets, columns, joins, relationshipStore, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		RegisterConfirmationRoutes(r, workspaces, datasets, columns, joins, relationshipStore, auditWriter,
+			slog.New(slog.NewTextHandler(io.Discard, nil)))
 	})
 	return r
 }
@@ -438,5 +467,102 @@ func TestUpdateCandidateJoinNotFound(t *testing.T) {
 
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+}
+
+// TestUpdateColumnPIIOverrideStampsReviewedAtAndWritesAuditEntry is FEAT-007's distinguishability
+// criterion at the API layer: clearing a flag must leave behind both a timestamp on the column and a
+// pii_override audit entry, so a reviewed-and-cleared column is never mistaken for one that was
+// simply never flagged.
+func TestUpdateColumnPIIOverrideStampsReviewedAtAndWritesAuditEntry(t *testing.T) {
+	workspaces := newFakeWorkspaceStore()
+	workspaces.byID["ws-1"] = domain.Workspace{ID: "ws-1", OwnerID: "user-1"}
+	columns := newFakeConfirmationColumnStore()
+	columns.put("ws-1", domain.Column{ID: "col-1", DatasetID: "ds-1", Name: "email", InferredType: domain.TypeString, PIIFlag: true, PIIPattern: "email"})
+	auditWriter := &fakeConfirmationAuditWriter{}
+	router := newTestConfirmationRouterWithAudit(workspaces, &fakeConfirmationDatasetStore{byID: map[string]domain.Dataset{}}, columns,
+		&fakeConfirmationCandidateJoinStore{byID: map[string]domain.CandidateJoin{}}, &fakeRelationshipStore{}, auditWriter)
+
+	req := authedRequest(t, http.MethodPatch, "/v1/workspaces/ws-1/columns/col-1", map[string]any{"pii_flag": false}, "user-1", domain.TierFree)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+
+	updated := columns.byID["col-1"]
+	if updated.PIIReviewedAt == "" {
+		t.Error("pii_reviewed_at is empty after an explicit override — a cleared flag is now indistinguishable from one that was never set")
+	}
+	if _, err := time.Parse(time.RFC3339, updated.PIIReviewedAt); err != nil {
+		t.Errorf("pii_reviewed_at = %q, want RFC 3339: %v", updated.PIIReviewedAt, err)
+	}
+
+	if len(auditWriter.entries) != 1 {
+		t.Fatalf("got %d pii_override audit entries, want exactly 1 written in the same code path as the override", len(auditWriter.entries))
+	}
+	if auditWriter.entries[0].workspaceID != "ws-1" || auditWriter.entries[0].userID != "user-1" {
+		t.Errorf("audit entry = %+v, want workspace ws-1 / user user-1", auditWriter.entries[0])
+	}
+
+	var body struct {
+		Column struct {
+			PIIReviewedAt string `json:"pii_reviewed_at"`
+		} `json:"column"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decoding body: %v", err)
+	}
+	if body.Column.PIIReviewedAt == "" {
+		t.Error("response body omits pii_reviewed_at, so the review step cannot show the reviewed state")
+	}
+}
+
+// TestUpdateColumnTypeOverrideWritesNoPIIAuditEntry keeps the pii_override action type meaning what
+// schema.md says it means. A type correction is a different decision and must not inflate the PII
+// review trail.
+func TestUpdateColumnTypeOverrideWritesNoPIIAuditEntry(t *testing.T) {
+	workspaces := newFakeWorkspaceStore()
+	workspaces.byID["ws-1"] = domain.Workspace{ID: "ws-1", OwnerID: "user-1"}
+	columns := newFakeConfirmationColumnStore()
+	columns.put("ws-1", domain.Column{ID: "col-1", DatasetID: "ds-1", Name: "amount", InferredType: domain.TypeString})
+	auditWriter := &fakeConfirmationAuditWriter{}
+	router := newTestConfirmationRouterWithAudit(workspaces, &fakeConfirmationDatasetStore{byID: map[string]domain.Dataset{}}, columns,
+		&fakeConfirmationCandidateJoinStore{byID: map[string]domain.CandidateJoin{}}, &fakeRelationshipStore{}, auditWriter)
+
+	req := authedRequest(t, http.MethodPatch, "/v1/workspaces/ws-1/columns/col-1", map[string]any{"inferred_type": "number"}, "user-1", domain.TierFree)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+	if len(auditWriter.entries) != 0 {
+		t.Errorf("got %d pii_override entries for a type-only correction, want 0", len(auditWriter.entries))
+	}
+	if columns.byID["col-1"].PIIReviewedAt != "" {
+		t.Error("a type correction stamped pii_reviewed_at, claiming a PII review that never happened")
+	}
+}
+
+// TestUpdateColumnPIIOverrideFailsWhenAuditWriteFails: the override and its evidence ship together
+// or not at all. Reporting success while the audit write failed would leave a column whose model
+// exposure changed with no record of who changed it.
+func TestUpdateColumnPIIOverrideFailsWhenAuditWriteFails(t *testing.T) {
+	workspaces := newFakeWorkspaceStore()
+	workspaces.byID["ws-1"] = domain.Workspace{ID: "ws-1", OwnerID: "user-1"}
+	columns := newFakeConfirmationColumnStore()
+	columns.put("ws-1", domain.Column{ID: "col-1", DatasetID: "ds-1", Name: "email", InferredType: domain.TypeString, PIIFlag: true, PIIPattern: "email"})
+	auditWriter := &fakeConfirmationAuditWriter{err: errors.New("audit store unavailable")}
+	router := newTestConfirmationRouterWithAudit(workspaces, &fakeConfirmationDatasetStore{byID: map[string]domain.Dataset{}}, columns,
+		&fakeConfirmationCandidateJoinStore{byID: map[string]domain.CandidateJoin{}}, &fakeRelationshipStore{}, auditWriter)
+
+	req := authedRequest(t, http.MethodPatch, "/v1/workspaces/ws-1/columns/col-1", map[string]any{"pii_flag": false}, "user-1", domain.TierFree)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d when the audit entry could not be written", rec.Code, http.StatusInternalServerError)
 	}
 }

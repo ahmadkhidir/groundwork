@@ -1,8 +1,44 @@
 import { ShieldAlert } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { StatusPill } from "@/components/ui/StatusPill";
+import { isPresent } from "@/types/schema";
 import { RowError } from "./TypeReviewStep";
 import type { ConfirmationColumn } from "./types";
+
+/**
+ * The PII state of one column, as three distinct readings rather than two.
+ *
+ * FEAT-007 requires that "a column that was reviewed-and-cleared is distinguishable later from one
+ * that was simply never flagged" — so an unreviewed unflagged column and a deliberately cleared one
+ * must not render identically, even though both carry `pii_flag: false`.
+ *
+ * Every state carries a text label, never colour alone (branding.md's colour-independence rule).
+ */
+function PIIStatus({ column }: { column: ConfirmationColumn }) {
+  const reviewed = isPresent(column.pii_reviewed_at);
+  const reviewedLabel = reviewed
+    ? `You reviewed this on ${new Date(column.pii_reviewed_at as string).toLocaleDateString(undefined, {
+        year: "numeric",
+        month: "short",
+        day: "numeric",
+      })}`
+    : null;
+
+  return (
+    <div className="flex flex-col items-start gap-1">
+      {column.pii_flag ? (
+        <StatusPill variant="warning">{column.pii_pattern || "flagged"}</StatusPill>
+      ) : reviewed ? (
+        <StatusPill variant="neutral">cleared by you</StatusPill>
+      ) : (
+        <StatusPill variant="neutral">not sensitive</StatusPill>
+      )}
+      {reviewedLabel && (
+        <span className="text-caption text-text-secondary">{reviewedLabel}</span>
+      )}
+    </div>
+  );
+}
 
 export interface PIIReviewStepProps {
   columns: ConfirmationColumn[];
@@ -18,10 +54,11 @@ export interface PIIReviewStepProps {
  * Per FEAT-007's acceptance criteria, a flagged column already defaults to name-and-type-only
  * exposure — this step exists so the user can review that automatic decision and override it
  * without needing to understand the underlying detection method (name heuristics, value-shape
- * regexes) at all. Overriding a flag to "not sensitive" is an explicit, logged decision — see
- * ColumnRepository.UpdatePII's doc comment on IMPLEMENTATION.md's open-items table for the one gap
- * this wave could not close: schema.md has no field distinguishing that explicit-override history
- * from a column that was simply never flagged.
+ * regexes) at all.
+ *
+ * Overriding a flag is an explicit, logged decision: the server stamps `Column.pii_reviewed_at` and
+ * writes a `pii_override` audit entry in the same request, and PIIStatus below renders that reviewed
+ * state so a cleared column reads differently from one that was never flagged.
  */
 export function PIIReviewStep({ columns, savingIds, errors, onToggleFlag }: PIIReviewStepProps) {
   if (columns.length === 0) {
@@ -50,13 +87,9 @@ export function PIIReviewStep({ columns, savingIds, errors, onToggleFlag }: PIIR
             <div className="mb-1 text-caption uppercase tracking-wide text-text-secondary">
               {col.dataset_filename}
             </div>
-            <div className="mb-2 flex items-center justify-between gap-2">
+            <div className="mb-2 flex items-start justify-between gap-2">
               <span className="font-medium text-text-primary">{col.name}</span>
-              {col.pii_flag ? (
-                <StatusPill variant="warning">{col.pii_pattern || "flagged"}</StatusPill>
-              ) : (
-                <StatusPill variant="neutral">not sensitive</StatusPill>
-              )}
+              <PIIStatus column={col} />
             </div>
             <Button
               variant="outline"
@@ -87,11 +120,7 @@ export function PIIReviewStep({ columns, savingIds, errors, onToggleFlag }: PIIR
                 <td className="px-2 py-2 text-body-small text-text-secondary">{col.dataset_filename}</td>
                 <td className="px-2 py-2 font-medium text-text-primary">{col.name}</td>
                 <td className="px-2 py-2">
-                  {col.pii_flag ? (
-                    <StatusPill variant="warning">{col.pii_pattern || "flagged"}</StatusPill>
-                  ) : (
-                    <StatusPill variant="neutral">not sensitive</StatusPill>
-                  )}
+                  <PIIStatus column={col} />
                 </td>
                 <td className="px-2 py-2">
                   <Button

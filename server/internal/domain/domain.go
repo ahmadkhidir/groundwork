@@ -223,6 +223,10 @@ const (
 	ActionExport        AuditActionType = "export"
 	ActionDeletion      AuditActionType = "deletion"
 	ActionLogin         AuditActionType = "login"
+	// ActionPIIOverride records a user explicitly clearing or confirming a column's PII flag
+	// (FEAT-007). Workspace-scoped. It has its own action type because it governs what the model is
+	// allowed to see — a trust-surface decision, not internal bookkeeping.
+	ActionPIIOverride AuditActionType = "pii_override"
 )
 
 // DeletedCategory is a category of derived state a deletion cascade confirms destroyed.
@@ -310,6 +314,17 @@ type Column struct {
 	PIIFlag        bool    `json:"pii_flag"`
 	// PIIPattern is the detected pattern when PIIFlag is set, e.g. "email". Empty otherwise.
 	PIIPattern string `json:"pii_pattern,omitempty"`
+	// PIIReviewedAt is when a user last made an explicit reviewed decision about PIIFlag — clearing
+	// it, or confirming it as correct — as an RFC 3339 timestamp. Empty when no user has ever
+	// reviewed this column, which is exactly what distinguishes a reviewed-and-cleared column from
+	// one that was simply never flagged (FEAT-007).
+	//
+	// A string rather than *time.Time deliberately: schema.md models this field's absence as the
+	// empty string, the same convention Column.PIIPattern and Run.ParentRunID already follow, and a
+	// nil pointer would encode absence a second, conflicting way. The database column is nullable;
+	// internal/store/postgres converts NULL <-> "" at the boundary, as migration 00002 established
+	// for audit_log_entries.workspace_id.
+	PIIReviewedAt string `json:"pii_reviewed_at,omitempty"`
 	// ExcludedFromModel keeps this column out of every model payload. The engine may still query
 	// it — exclusion governs egress, not access.
 	ExcludedFromModel bool `json:"excluded_from_model"`

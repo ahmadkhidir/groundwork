@@ -16,6 +16,13 @@ export interface ConfirmationColumn {
   pii_flag: boolean;
   /** Detected (or "manual") pattern when pii_flag is true. Empty string otherwise. */
   pii_pattern?: string;
+  /**
+   * When a user last made an explicit decision about `pii_flag` — clearing it, or confirming it.
+   * Empty/absent when nobody ever has, which is exactly what distinguishes a column reviewed and
+   * cleared from one that was simply never flagged (FEAT-007). Use {@link isPresent} rather than a
+   * truthiness check, per the empty-string-means-absent convention.
+   */
+  pii_reviewed_at?: string;
   excluded_from_model: boolean;
   null_rate: number;
   distinct_count: number;

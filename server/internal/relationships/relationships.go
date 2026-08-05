@@ -44,6 +44,22 @@ const MinConfidenceToPersist = 0.35
 // this kind of inference tunable lives — never inlined at the call site.
 const UniqueCardinalityThreshold = 0.95
 
+// ValueOverlapOnlyCeiling is the highest confidence a candidate join may report when its only
+// meaningful evidence is value overlap on a non-identifier-shaped numeric column.
+//
+// features.md FEAT-008 makes this a hard, presentation-facing requirement rather than a tunable:
+// such a join "must be capped at MEDIUM, never reported as HIGH", because two unrelated numeric
+// measure columns overlapping in value by chance is common and is not, on its own, evidence of a
+// relationship. schema.md's bands are HIGH >= 0.85 / MEDIUM 0.6-0.84 / LOW < 0.6, so this sits at the
+// top of MEDIUM. Raising it to 0.85 or above would silently void the rule.
+const ValueOverlapOnlyCeiling = 0.84
+
+// meaningfulNameSimilarity is the name-similarity score at or above which two column names count as
+// real evidence in their own right, rather than coincidence. Shared with basis(), which uses the same
+// threshold to decide whether to mention names in its explanation at all — the cap and the
+// user-facing rationale therefore always agree about what the evidence was.
+const meaningfulNameSimilarity = 0.7
+
 // pruneFloor is the combined name+type signal below which a column pair is skipped entirely, before
 // ever running a value-overlap query. Bounds cost to roughly (columns in A) x (columns in B)
 // candidate pairs actually worth sampling, rather than every pair unconditionally — a wide pair of
@@ -82,6 +98,12 @@ func Infer(ctx context.Context, h Execer, a, b DatasetInput) ([]domain.Candidate
 			if confidence > 1 {
 				confidence = 1
 			}
+
+			capped := valueOverlapOnly(colA, colB, a.RowCount, b.RowCount, nameScore)
+			if capped && confidence > ValueOverlapOnlyCeiling {
+				confidence = ValueOverlapOnlyCeiling
+			}
+
 			if confidence < MinConfidenceToPersist {
 				continue
 			}
@@ -90,7 +112,7 @@ func Infer(ctx context.Context, h Execer, a, b DatasetInput) ([]domain.Candidate
 				SourceColumnID:  colA.ID,
 				TargetColumnID:  colB.ID,
 				ConfidenceScore: confidence,
-				Basis:           basis(colA.Name, colB.Name, nameScore, typeScore, overlapPct, cardinalityScore, colA.InferredType, colB.InferredType),
+				Basis:           basis(colA.Name, colB.Name, nameScore, typeScore, overlapPct, cardinalityScore, colA.InferredType, colB.InferredType, capped),
 				Status:          domain.JoinPending,
 			})
 		}
@@ -99,15 +121,76 @@ func Infer(ctx context.Context, h Execer, a, b DatasetInput) ([]domain.Candidate
 	return out, nil
 }
 
+// valueOverlapOnly reports whether FEAT-008's MEDIUM cap applies to this pair: the only meaningful
+// evidence is value overlap on a column that is not identifier-shaped.
+//
+// Three conditions, all taken directly from FEAT-008's wording, all required:
+//
+//  1. Both sides are numeric. The rule is scoped to "a non-identifier-shaped NUMERIC column" —
+//     overlapping text values (a name, a country code, an account reference) are not the coincidence
+//     this cap exists to suppress, and widening it to them would invent a rule the doc doesn't state.
+//  2. Neither side is identifier-shaped, where FEAT-008 defines identifier-shaped as
+//     "`id`/`key`/`code`-named or near-unique" — see identifierShaped and Uniqueness.
+//  3. The names are not meaningfully similar. When two columns share a name (or near enough), name
+//     similarity is independent evidence, so value overlap is no longer the ONLY evidence and the
+//     rule's precondition fails.
+//
+// Type compatibility deliberately does not count as evidence here: every numeric column is
+// type-compatible with every other numeric column, so it distinguishes nothing among exactly the
+// pairs this cap is about.
+func valueOverlapOnly(colA, colB domain.Column, rowCountA, rowCountB int64, nameScore float64) bool {
+	if !isNumeric(colA.InferredType) || !isNumeric(colB.InferredType) {
+		return false
+	}
+	if identifierShaped(colA, rowCountA) || identifierShaped(colB, rowCountB) {
+		return false
+	}
+	return nameScore < meaningfulNameSimilarity
+}
+
+// isNumeric reports whether t is one of schema.md's numeric inferred types.
+func isNumeric(t domain.InferredType) bool {
+	return t == domain.TypeInteger || t == domain.TypeNumber
+}
+
+// identifierShaped reports whether col looks like an identifier rather than a measure, per FEAT-008's
+// "`id`/`key`/`code`-named or near-unique column".
+//
+// Name test: a normalized name that IS, STARTS WITH, or ENDS WITH one of id/key/code — the shapes
+// real exports use (`id`, `customer_id`, `id_customer`, `order_key`, `branch_code`). Deliberately not
+// a substring match anywhere in the name, which would read `code` inside `discount_code_value` fine
+// but also read `id` inside `paid`, `void`, or `residual` and quietly exempt real measure columns
+// from a cap that exists for them.
+//
+// Uniqueness test: distinct values at or above UniqueCardinalityThreshold of the row count — the same
+// key-like signal the confirmation API already uses to default a confirmed relationship's
+// cardinality, rather than a second definition of "looks like a key".
+func identifierShaped(col domain.Column, rowCount int64) bool {
+	if uniqueness(col.DistinctCount, rowCount) >= UniqueCardinalityThreshold {
+		return true
+	}
+	name := normalizeName(col.Name)
+	for _, token := range [...]string{"id", "key", "code"} {
+		if name == token || strings.HasPrefix(name, token+"_") || strings.HasSuffix(name, "_"+token) {
+			return true
+		}
+	}
+	return false
+}
+
 // basis renders the plain-language rationale schema.md's CandidateJoin.Basis requires — "a confidence
 // number alone is not an explanation." Only signals that meaningfully contributed are mentioned.
-func basis(nameA, nameB string, nameScore, typeScore, overlapPct, cardinalityScore float64, typeA, typeB domain.InferredType) string {
+//
+// capped adds FEAT-008's required disclosure: when the MEDIUM cap applies, the basis must say so, so
+// a user reading "78% sampled value overlap" is also told why that overlap is not being treated as a
+// strong signal.
+func basis(nameA, nameB string, nameScore, typeScore, overlapPct, cardinalityScore float64, typeA, typeB domain.InferredType, capped bool) string {
 	var parts []string
 
 	switch {
 	case nameA == nameB:
 		parts = append(parts, fmt.Sprintf("identical column name (%q)", nameA))
-	case nameScore >= 0.7:
+	case nameScore >= meaningfulNameSimilarity:
 		parts = append(parts, fmt.Sprintf("similar column names (%q / %q)", nameA, nameB))
 	}
 
@@ -125,6 +208,12 @@ func basis(nameA, nameB string, nameScore, typeScore, overlapPct, cardinalitySco
 
 	if cardinalityScore >= 0.9 {
 		parts = append(parts, "one side is nearly unique, consistent with a key")
+	}
+
+	if capped {
+		parts = append(parts,
+			"capped at medium: value overlap only, not an identifier column — two numeric measure "+
+				"columns can overlap by chance, so this is never reported as high confidence")
 	}
 
 	if len(parts) == 0 {

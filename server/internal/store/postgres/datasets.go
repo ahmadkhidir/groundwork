@@ -76,6 +76,26 @@ func (r *DatasetRepository) ListByWorkspace(ctx context.Context, workspaceID str
 	return out, nil
 }
 
+// ExistsForWorkspace reports whether workspaceID has at least one dataset, backing
+// screens/04-workspace-home.md's derived has_datasets field.
+//
+// Deliberately EXISTS rather than a count or a ListByWorkspace length check: the caller only needs
+// the boolean, and this stops at the first matching row instead of materializing every dataset row
+// on a screen that renders none of them.
+//
+// Dataset presence, not ingest completion: a file still being ingested is data the user already
+// uploaded, so screen 04's "Upload your first file" prompt would be wrong to keep showing.
+func (r *DatasetRepository) ExistsForWorkspace(ctx context.Context, workspaceID string) (bool, error) {
+	var exists bool
+	if err := r.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM datasets WHERE workspace_id = $1)`,
+		workspaceID,
+	).Scan(&exists); err != nil {
+		return false, fmt.Errorf("checking dataset presence: %w", err)
+	}
+	return exists, nil
+}
+
 // GetByID returns the dataset with id, or ErrDatasetNotFound.
 func (r *DatasetRepository) GetByID(ctx context.Context, id string) (domain.Dataset, error) {
 	var (

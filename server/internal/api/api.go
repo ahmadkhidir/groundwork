@@ -69,11 +69,21 @@ type Dependencies struct {
 	ConfirmationCandidateJoins ConfirmationCandidateJoinStore
 	Relationships              ConfirmationRelationshipStore
 
+	// ConfirmationAudit records FEAT-007's PII override as a `pii_override` audit entry, written in
+	// the same handler that writes the override itself. Satisfied by internal/audit.Writer, the same
+	// instance behind AuditLog's read side.
+	ConfirmationAudit ConfirmationAuditWriter
+
 	// EngineProvider backs FEAT-011's honest engine status. Deliberately typed as the narrow
 	// EngineStatusProvider rather than *engine.LocalProvider: the handler only ever reads Status, and
 	// architecture.md's Engine Provider seam exists so a later non-DuckDB implementation can be
 	// swapped in without touching callers. Status must never provoke a wake — see engine.Provider.
 	EngineProvider EngineStatusProvider
+
+	// EngineDatasets backs the has_datasets field screens/04-workspace-home.md requires on the
+	// single-workspace GET. Same DatasetRepository as the seams above, narrowed to one existence
+	// question.
+	EngineDatasets WorkspaceDatasetPresence
 }
 
 // Server wires configuration and dependencies into an http.Handler.
@@ -167,14 +177,16 @@ func (s *Server) routes() {
 				// FEAT-006 / FEAT-007 / FEAT-009: ingest confirmation — type review, PII flag review,
 				// and candidate join accept/reject. screens/07-ingest-confirmation.md.
 				if s.deps.ConfirmationDatasets != nil && s.deps.ConfirmationColumns != nil &&
-					s.deps.ConfirmationCandidateJoins != nil && s.deps.Relationships != nil {
+					s.deps.ConfirmationCandidateJoins != nil && s.deps.Relationships != nil &&
+					s.deps.ConfirmationAudit != nil {
 					RegisterConfirmationRoutes(r, s.deps.Workspaces, s.deps.ConfirmationDatasets,
-						s.deps.ConfirmationColumns, s.deps.ConfirmationCandidateJoins, s.deps.Relationships, s.logger)
+						s.deps.ConfirmationColumns, s.deps.ConfirmationCandidateJoins, s.deps.Relationships,
+						s.deps.ConfirmationAudit, s.logger)
 				}
 
 				// FEAT-011: engine sleep/wake lifecycle and honest status.
-				if s.deps.EngineProvider != nil {
-					RegisterEngineRoutes(r, s.deps.Workspaces, s.deps.EngineProvider, s.logger)
+				if s.deps.EngineProvider != nil && s.deps.EngineDatasets != nil {
+					RegisterEngineRoutes(r, s.deps.Workspaces, s.deps.EngineProvider, s.deps.EngineDatasets, s.logger)
 				}
 			})
 		}

@@ -38,8 +38,8 @@ func writeSQLiteFixture(t *testing.T, h engine.Handle, path string, tables []str
 	t.Helper()
 	ctx := context.Background()
 
-	if _, err := h.Exec(ctx, "INSTALL sqlite; LOAD sqlite;"); err != nil {
-		t.Skipf("sqlite extension unavailable (needs network on first install): %v", err)
+	if _, err := h.Exec(ctx, "INSTALL sqlite_scanner; LOAD sqlite_scanner;"); err != nil {
+		t.Skipf("sqlite_scanner extension unavailable (needs network on first install): %v", err)
 	}
 	if _, err := h.Exec(ctx, "ATTACH "+sqlQuote(path)+" AS fixture (TYPE SQLITE)"); err != nil {
 		t.Fatalf("attaching fixture: %v", err)
@@ -115,9 +115,12 @@ func TestNormalizeToParquetIngestsExcelFile(t *testing.T) {
 	source := filepath.Join(dir, "book.xlsx")
 	target := filepath.Join(dir, "out.parquet")
 
-	// The spatial extension both writes and reads xlsx, so the fixture needs no Excel library.
+	// spatial is used HERE ONLY, to WRITE the fixture: the `excel` extension the production path
+	// uses reads xlsx but does not write it, and GDAL's xlsx driver is the simplest way to produce a
+	// real spreadsheet without vendoring an Excel library into the test. The ingest path under test
+	// must never touch spatial — see normalizeToParquet's doc comment and risk_log.md R-017.
 	if _, err := handle.Exec(ctx, "INSTALL spatial; LOAD spatial;"); err != nil {
-		t.Skipf("spatial extension unavailable (needs network on first install): %v", err)
+		t.Skipf("spatial extension unavailable for fixture writing (needs network on first install): %v", err)
 	}
 	writeFixture := "COPY (SELECT 1 AS id, 'alice' AS name UNION ALL SELECT 2, 'bob') TO " +
 		sqlQuote(source) + " WITH (FORMAT GDAL, DRIVER 'xlsx')"

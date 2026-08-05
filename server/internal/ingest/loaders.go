@@ -24,18 +24,22 @@ type execer interface {
 // driver error.
 //
 // Paths are embedded as quoted SQL string literals rather than passed as `?` bind parameters:
-// DuckDB's table functions (read_csv, read_parquet, st_read) and COPY ... TO need their path argument
+// DuckDB's table functions (read_csv, read_parquet, read_xlsx) and COPY ... TO need their path argument
 // at bind/plan time, before a driver-level parameter would be substituted, and testing against this
 // driver confirmed COPY's target path specifically does not accept a bound parameter (it is parsed,
 // not bound). Every path here is server-generated (a local temp file this package created), never
 // user input, so literal embedding carries no injection risk — sqlQuote still escapes it defensively.
 //
-// CSV and Parquet are implemented against capability verified end to end ahead of this wave (CSV type
-// sniffing via read_csv, Parquet write via COPY ... FORMAT parquet — see IMPLEMENTATION.md §2).
-// Excel and SQLite use DuckDB's standard `spatial` and `sqlite` extensions respectively; unlike the
-// CSV/Parquet path, these two were NOT exercised against real files during this wave (no verified
-// Excel/SQLite fixture was available, and extension installation needs network access at ingest
-// time) — flagged in this wave's report as needing a follow-up verification pass.
+// CSV and Parquet need no DuckDB extension at all. Excel and SQLite need exactly two, and they are
+// named here to match architecture.md and risk_log.md R-017 exactly: `excel` (via read_xlsx) and
+// `sqlite_scanner`. Those are the two a production container image must preinstall.
+//
+// Do not substitute `spatial` for Excel, which an earlier revision of this file did via st_read.
+// It works — spatial reads xlsx through GDAL — but it silently defeats R-017's mitigation: an image
+// that preinstalled the documented `excel` extension would still attempt a runtime fetch of
+// `spatial` from extensions.duckdb.org, and the first Excel upload on a locked-down production
+// network would fail in exactly the way R-017 describes. It is also far heavier, pulling in all of
+// GDAL to read a spreadsheet.
 func normalizeToParquet(ctx context.Context, h execer, format domain.DatasetFormat, sourcePath, parquetPath string) error {
 	switch format {
 	case domain.FormatCSV:
@@ -49,11 +53,11 @@ func normalizeToParquet(ctx context.Context, h execer, format domain.DatasetForm
 			parquetPath, "Parquet")
 
 	case domain.FormatExcel:
-		if _, err := h.Exec(ctx, "INSTALL spatial; LOAD spatial;"); err != nil {
+		if _, err := h.Exec(ctx, "INSTALL excel; LOAD excel;"); err != nil {
 			return fmt.Errorf("could not load Excel support for this engine: %s", cleanDriverError(err))
 		}
 		return copyToParquet(ctx, h,
-			fmt.Sprintf("SELECT * FROM st_read(%s)", sqlQuote(sourcePath)),
+			fmt.Sprintf("SELECT * FROM read_xlsx(%s)", sqlQuote(sourcePath)),
 			parquetPath, "Excel")
 
 	case domain.FormatSQLite:
@@ -77,7 +81,11 @@ func copyToParquet(ctx context.Context, h execer, selectSQL, parquetPath, format
 // actionable message rather than guessing which table the user meant — this release does not attempt
 // to split a SQLite file into multiple Datasets.
 func normalizeSQLite(ctx context.Context, h execer, sourcePath, parquetPath string) error {
-	if _, err := h.Exec(ctx, "INSTALL sqlite; LOAD sqlite;"); err != nil {
+	// sqlite_scanner is the canonical extension name; `INSTALL sqlite` is an alias that resolves to
+	// it. The canonical name is used here so this line matches architecture.md and risk_log.md
+	// R-017 literally — those documents name the two extensions a production image must preinstall,
+	// and an alias in the code is one more step between reading the mitigation and checking it.
+	if _, err := h.Exec(ctx, "INSTALL sqlite_scanner; LOAD sqlite_scanner;"); err != nil {
 		return fmt.Errorf("could not load SQLite support for this engine: %s", cleanDriverError(err))
 	}
 

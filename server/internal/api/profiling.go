@@ -41,13 +41,17 @@ func RegisterProfilingRoutes(r chi.Router, workspaces WorkspaceStore, datasets P
 }
 
 type publicColumn struct {
-	ID                string  `json:"id"`
-	DatasetID         string  `json:"dataset_id"`
-	Name              string  `json:"name"`
-	InferredType      string  `json:"inferred_type"`
-	TypeConfidence    float64 `json:"type_confidence"`
-	PIIFlag           bool    `json:"pii_flag"`
-	PIIPattern        string  `json:"pii_pattern,omitempty"`
+	ID             string  `json:"id"`
+	DatasetID      string  `json:"dataset_id"`
+	Name           string  `json:"name"`
+	InferredType   string  `json:"inferred_type"`
+	TypeConfidence float64 `json:"type_confidence"`
+	PIIFlag        bool    `json:"pii_flag"`
+	PIIPattern     string  `json:"pii_pattern,omitempty"`
+	// PIIReviewedAt is RFC 3339, or "" when no user has ever explicitly reviewed this column's PII
+	// flag. Per schema.md, that emptiness is what distinguishes a column that was reviewed and
+	// cleared from one that was simply never flagged (FEAT-007).
+	PIIReviewedAt     string  `json:"pii_reviewed_at,omitempty"`
 	ExcludedFromModel bool    `json:"excluded_from_model"`
 	NullRate          float64 `json:"null_rate"`
 	DistinctCount     int64   `json:"distinct_count"`
@@ -62,6 +66,7 @@ func toPublicColumn(c domain.Column) publicColumn {
 		TypeConfidence:    c.TypeConfidence,
 		PIIFlag:           c.PIIFlag,
 		PIIPattern:        c.PIIPattern,
+		PIIReviewedAt:     c.PIIReviewedAt,
 		ExcludedFromModel: c.ExcludedFromModel,
 		NullRate:          c.NullRate,
 		DistinctCount:     c.DistinctCount,
