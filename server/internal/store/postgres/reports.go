@@ -67,18 +67,41 @@ func (r *ReportRepository) Create(ctx context.Context, report domain.Report) err
 // report belonging to a different workspace reads as "not found" at the store, which is exactly the
 // non-enumeration contract the API layer promises (the same stance handleGetRun documents for runs).
 func (r *ReportRepository) GetByID(ctx context.Context, workspaceID, id string) (domain.Report, error) {
+	return r.scanReport(r.pool.QueryRow(ctx,
+		`SELECT id, workspace_id, run_id, title, narrative, chart_spec, reconciliation_summary,
+		        parent_report_id, created_at
+		 FROM reports WHERE id = $1 AND workspace_id = $2`,
+		id, workspaceID,
+	))
+}
+
+// GetByRunID returns the report materialized by runID within workspaceID, or ErrReportNotFound when
+// no report exists for that run. Backed by idx_reports_run (migration 00001).
+//
+// FEAT-018 uses this to attach report_id to the GET run response so the Run Viewer can navigate to
+// the Report on completion. Workspace scoping lives in the SQL for the same non-enumeration reason
+// as GetByID: a run belongs to one workspace, and its report must never be disclosed to a caller who
+// owns only a different workspace.
+func (r *ReportRepository) GetByRunID(ctx context.Context, workspaceID, runID string) (domain.Report, error) {
+	return r.scanReport(r.pool.QueryRow(ctx,
+		`SELECT id, workspace_id, run_id, title, narrative, chart_spec, reconciliation_summary,
+		        parent_report_id, created_at
+		 FROM reports WHERE run_id = $1 AND workspace_id = $2`,
+		runID, workspaceID,
+	))
+}
+
+// scanReport decodes the shared report row shape selected by GetByID and GetByRunID. The reports
+// table stores chart_spec and reconciliation_summary as JSONB; provenance links live in their own
+// table (FEAT-030), so this wave always materializes an empty array rather than a JSON null.
+func (r *ReportRepository) scanReport(row pgx.Row) (domain.Report, error) {
 	var (
 		report         domain.Report
 		chartSpecJSON  []byte
 		reconJSON      []byte
 		parentReportID *string
 	)
-	err := r.pool.QueryRow(ctx,
-		`SELECT id, workspace_id, run_id, title, narrative, chart_spec, reconciliation_summary,
-		        parent_report_id, created_at
-		 FROM reports WHERE id = $1 AND workspace_id = $2`,
-		id, workspaceID,
-	).Scan(&report.ID, &report.WorkspaceID, &report.RunID, &report.Title, &report.Narrative,
+	err := row.Scan(&report.ID, &report.WorkspaceID, &report.RunID, &report.Title, &report.Narrative,
 		&chartSpecJSON, &reconJSON, &parentReportID, &report.CreatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -97,9 +120,6 @@ func (r *ReportRepository) GetByID(ctx context.Context, workspaceID, id string) 
 		report.ParentReportID = *parentReportID
 	}
 
-	// FEAT-030 (Phase 3) populates provenance_links; this wave's reports always carry an empty
-	// array. A nil slice would serialize as JSON null, and schema.md requires an array — so always
-	// materialize an empty one rather than ever returning null.
 	report.ProvenanceLinks = []string{}
 	return report, nil
 }

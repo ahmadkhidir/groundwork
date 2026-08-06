@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -70,6 +71,7 @@ type fakeRunExecutor struct {
 	mu      sync.Mutex
 	userIDs []string
 	runs    []domain.Run
+	sqls    []string
 }
 
 func (f *fakeRunExecutor) Submit(userID string, run domain.Run) {
@@ -79,11 +81,29 @@ func (f *fakeRunExecutor) Submit(userID string, run domain.Run) {
 	f.runs = append(f.runs, run)
 }
 
+// SubmitWithSQL records the submitted run AND the edited SQL it was seeded with, mirroring
+// handleCreateRun's FEAT-018 branch (sql present → this path; blank/absent → Submit).
+func (f *fakeRunExecutor) SubmitWithSQL(userID string, run domain.Run, sql string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.userIDs = append(f.userIDs, userID)
+	f.runs = append(f.runs, run)
+	f.sqls = append(f.sqls, sql)
+}
+
 func (f *fakeRunExecutor) submitted() []domain.Run {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	out := make([]domain.Run, len(f.runs))
 	copy(out, f.runs)
+	return out
+}
+
+func (f *fakeRunExecutor) submittedSQL() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.sqls))
+	copy(out, f.sqls)
 	return out
 }
 
@@ -181,6 +201,40 @@ func TestCreateRunSucceeds(t *testing.T) {
 	}
 	if len(executor.userIDs) != 1 || executor.userIDs[0] != "user-1" {
 		t.Errorf("submitted user ids = %v, want [user-1]", executor.userIDs)
+	}
+}
+
+// TestCreateRunWithEditedSQLPins the FEAT-018 fetch: a create patch with the edited SQL must route
+// the run through SubmitWithSQL (never Submit), passing question_text and the SQL verbatim, and still
+// return the persisted queued run.
+func TestCreateRunWithEditedSQLUsesSeededPath(t *testing.T) {
+	server, workspaces, _, _, executor := newRunsTestServer(t)
+	workspaces.byID["ws-1"] = domain.Workspace{ID: "ws-1", OwnerID: "user-1"}
+
+	edited := "SELECT region, SUM(amount) FROM dataset_sales_csv_d5f3e2a1 GROUP BY region"
+	req := authedRequest(t, http.MethodPost, "/v1/workspaces/ws-1/runs",
+		map[string]string{"question_text": "How many customers per region?", "sql": edited}, "user-1", domain.TierFree)
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+
+	// The seeded submission carries the run AND the exact SQL; nothing was submitted via Submit.
+	sqls := executor.submittedSQL()
+	if len(sqls) != 1 || sqls[0] != edited {
+		t.Fatalf("seeded SQL submissions = %v, want [%q]", sqls, edited)
+	}
+	submitted := executor.submitted()
+	if len(submitted) != 1 {
+		t.Fatalf("executor submissions = %d, want exactly the one seeded run", len(submitted))
+	}
+	if submitted[0].QuestionText != "How many customers per region?" {
+		t.Errorf("submitted question = %q", submitted[0].QuestionText)
+	}
+	if strings.Contains(rec.Body.String(), `"sql"`) {
+		t.Errorf("response body leaks the edited SQL field: %s", rec.Body.String())
 	}
 }
 

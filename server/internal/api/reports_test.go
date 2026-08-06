@@ -42,6 +42,20 @@ func (f *fakeReportRepo) GetByID(_ context.Context, workspaceID, id string) (dom
 	return report, nil
 }
 
+func (f *fakeReportRepo) GetByRunID(_ context.Context, workspaceID, runID string) (domain.Report, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return domain.Report{}, f.err
+	}
+	for _, report := range f.reports {
+		if report.RunID == runID && report.WorkspaceID == workspaceID {
+			return report, nil
+		}
+	}
+	return domain.Report{}, errors.New("report not found")
+}
+
 // newReportsTestServer wires the report endpoint's fakes plus the workspace store the ownership
 // middleware needs, mirroring newRunsTestServer.
 func newReportsTestServer(t *testing.T) (*Server, *fakeWorkspaceStore, *fakeReportRepo) {

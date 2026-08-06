@@ -10,14 +10,18 @@ import (
 	"github.com/ahmadkhidir/groundwork/server/internal/domain"
 )
 
-// ReportStore is the read seam RegisterReportRoutes depends on, satisfied by
+// ReportStore is the read seam the report endpoints depend on, satisfied by
 // internal/store/postgres.ReportRepository.
 //
 // GetByID is workspace-scoped at the store: a report id that exists only in another workspace reads
 // as not-found, which is the non-enumeration stance every other read endpoint takes (see
 // handleGetRun's doc comment).
+//
+// GetByRunID backs the GET run response's report_id (FEAT-018): the run viewer uses it to auto-
+// navigate to the report a completed run materialized.
 type ReportStore interface {
 	GetByID(ctx context.Context, workspaceID, id string) (domain.Report, error)
+	GetByRunID(ctx context.Context, workspaceID, runID string) (domain.Report, error)
 }
 
 // RegisterReportRoutes wires FEAT-014's report read endpoint onto r. Mounted under the

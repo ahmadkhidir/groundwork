@@ -249,7 +249,7 @@ func (s *Server) routes() {
 				// FEAT-013: ask-a-question run lifecycle — create a run and watch it execute.
 				// screens/04-workspace-home.md, screens/08-run-viewer.md.
 				if s.deps.Runs != nil && s.deps.RunSteps != nil && s.deps.RunExecutor != nil {
-					RegisterRunRoutes(r, s.deps.Workspaces, s.deps.Runs, s.deps.RunSteps, s.deps.RunExecutor, s.logger)
+					RegisterRunRoutes(r, s.deps.Workspaces, s.deps.Runs, s.deps.RunSteps, s.deps.Reports, s.deps.RunExecutor, s.logger)
 				}
 
 				// FEAT-014: read a completed run's materialized Report — screens/09-report-view.md.

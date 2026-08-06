@@ -167,6 +167,21 @@ func (e *Executor) Submit(userID string, run domain.Run) {
 	go e.execute(context.Background(), userID, run)
 }
 
+// SubmitWithSQL starts run's background execution with generate_sql seeded by the user's edited SQL
+// (FEAT-018's Phase 2 boundary, IMPLEMENTATION.md "Phase 2 boundary assumptions": edited SQL starts
+// a NEW run carrying the user's SQL as generate_sql output).
+//
+// The seeded path deliberately skips plan and the model's generate_sql call entirely: the edited
+// query IS the plan, so no plan step row is created and no model round-trip decides what to run. The
+// run then continues through the same execute → chart_spec → narrate → report materialization tail
+// as a normal run, so the resulting Report is built from exactly the edited query's result set.
+//
+// sql is trimmed before being persisted; a whitespace-only value fails the run at the generate_sql
+// step with an honest message rather than executing nothing.
+func (e *Executor) SubmitWithSQL(userID string, run domain.Run, sql string) {
+	go e.executeSeeded(context.Background(), userID, run, sql)
+}
+
 // stepContext carries the identity fields every step write needs.
 type stepContext struct {
 	runID       string
@@ -175,14 +190,27 @@ type stepContext struct {
 }
 
 // execute advances run through its pipeline: wake the engine, plan, generate_sql, execute, then a
-// single terminal status. Every branch that cannot continue marks the run failed before returning.
+// single terminal status. It is the normal (model-driven) path; see executeSeeded for FEAT-018.
 func (e *Executor) execute(ctx context.Context, userID string, run domain.Run) {
+	e.executePipeline(ctx, userID, run, nil)
+}
+
+// executeSeeded is the FEAT-018 path: the run's generate_sql step is seeded with the user's edited
+// SQL instead of being produced by plan + the model.
+func (e *Executor) executeSeeded(ctx context.Context, userID string, run domain.Run, sql string) {
+	e.executePipeline(ctx, userID, run, &sql)
+}
+
+// executePipeline advances run through its pipeline to a single terminal status. seedSQL is nil for
+// a normal run (plan → model generate_sql) and non-nil for FEAT-018's edited-SQL path (generate_sql
+// seeded directly, plan skipped entirely). Every branch that cannot continue marks the run failed.
+func (e *Executor) executePipeline(ctx context.Context, userID string, run domain.Run, seedSQL *string) {
 	log := e.logger.With(slog.String("run_id", run.ID), slog.String("workspace_id", run.WorkspaceID))
 	sc := stepContext{runID: run.ID, workspaceID: run.WorkspaceID, userID: userID}
 
 	// Waking is reported BEFORE Acquire blocks: screens/04-workspace-home.md and 08-run-viewer.md
 	// specify that a question submitted while the engine is sleeping queues and shows "Waking
-	// engine..." — the queued run announcing the wake it is about to cause.
+	// engine..." — the engine queued run announcing the wake it is about to cause.
 	if err := e.runs.UpdateStatus(ctx, run.ID, domain.RunWaking); err != nil {
 		log.Error("marking run waking", slog.String("error", err.Error()))
 		e.failRun(ctx, log, run.ID)
@@ -213,44 +241,61 @@ func (e *Executor) execute(ctx context.Context, userID string, run domain.Run) {
 		return
 	}
 
-	// plan
-	planOutput, err := e.execStep(ctx, sc, domain.StepPlan, "", log, func() (string, error) {
-		return e.runPlan(ctx, sc, run, log)
-	})
-	if err != nil {
-		log.Error("plan step failed", slog.String("error", err.Error()))
-		e.failRun(ctx, log, run.ID)
-		return
-	}
-
-	var plan domain.PlanStepOutput
-	if err := json.Unmarshal([]byte(planOutput), &plan); err != nil {
-		log.Error("parsing plan output", slog.String("error", err.Error()))
-		e.failRun(ctx, log, run.ID)
-		return
-	}
-
-	// FEAT-033 boundary (Phase 2 form): an ambiguous or unanswerable question fails the run with a
-	// plain-language reason rather than proceeding to generate_sql on a guess. The reason lives in
-	// the completed plan step's output, where the Run Viewer reads it verbatim.
-	if !plan.Answerable {
-		reason := plan.Reason
-		if strings.TrimSpace(reason) == "" {
-			reason = "This question couldn't be answered from the available data."
+	// The generate_sql step's input differs by path: the plan output when the model plans it, the
+	// empty string when the user's edited SQL is the plan. The rest of the pipeline is identical.
+	var generateSQLOutput string
+	if seedSQL != nil {
+		// FEAT-018 seeded path: no plan step row and no model generate_sql call. The user's exact
+		// edited SQL is persisted as the generate_sql step output, so the Run Viewer and the Report
+		// show the query that actually ran.
+		generateSQLOutput, err = e.execStep(ctx, sc, domain.StepGenerateSQL, "", log, func() (string, error) {
+			return e.seedGenerateSQL(*seedSQL)
+		})
+		if err != nil {
+			log.Error("generate_sql step failed", slog.String("error", err.Error()))
+			e.failRun(ctx, log, run.ID)
+			return
 		}
-		log.Info("run failed: question not answerable", slog.String("reason", reason))
-		e.failRun(ctx, log, run.ID)
-		return
-	}
+	} else {
+		// plan
+		planOutput, err := e.execStep(ctx, sc, domain.StepPlan, "", log, func() (string, error) {
+			return e.runPlan(ctx, sc, run, log)
+		})
+		if err != nil {
+			log.Error("plan step failed", slog.String("error", err.Error()))
+			e.failRun(ctx, log, run.ID)
+			return
+		}
 
-	// generate_sql
-	generateSQLOutput, err := e.execStep(ctx, sc, domain.StepGenerateSQL, planOutput, log, func() (string, error) {
-		return e.runGenerateSQL(ctx, sc, run, plan, log)
-	})
-	if err != nil {
-		log.Error("generate_sql step failed", slog.String("error", err.Error()))
-		e.failRun(ctx, log, run.ID)
-		return
+		var plan domain.PlanStepOutput
+		if err := json.Unmarshal([]byte(planOutput), &plan); err != nil {
+			log.Error("parsing plan output", slog.String("error", err.Error()))
+			e.failRun(ctx, log, run.ID)
+			return
+		}
+
+		// FEAT-033 boundary (Phase 2 form): an ambiguous or unanswerable question fails the run
+		// with a plain-language reason rather than proceeding to generate_sql on a guess. The
+		// reason lives in the completed plan step's output, where the Run Viewer reads it verbatim.
+		if !plan.Answerable {
+			reason := plan.Reason
+			if strings.TrimSpace(reason) == "" {
+				reason = "This question couldn't be answered from the available data."
+			}
+			log.Info("run failed: question not answerable", slog.String("reason", reason))
+			e.failRun(ctx, log, run.ID)
+			return
+		}
+
+		// generate_sql
+		generateSQLOutput, err = e.execStep(ctx, sc, domain.StepGenerateSQL, planOutput, log, func() (string, error) {
+			return e.runGenerateSQL(ctx, sc, run, plan, log)
+		})
+		if err != nil {
+			log.Error("generate_sql step failed", slog.String("error", err.Error()))
+			e.failRun(ctx, log, run.ID)
+			return
+		}
 	}
 
 	var genSQL domain.GenerateSQLStepOutput
@@ -429,6 +474,22 @@ func (e *Executor) runGenerateSQL(ctx context.Context, sc stepContext, run domai
 	encoded, err := json.Marshal(out)
 	if err != nil {
 		return "", fmt.Errorf("encoding generate_sql output: %w", err)
+	}
+	return string(encoded), nil
+}
+
+// seedGenerateSQL builds the generate_sql step output for FEAT-018's edited-SQL path: the user's
+// SQL, verbatim (outer whitespace trimmed), wrapped in the same GenerateSQLStepOutput shape execute
+// consumes — so the seeded run is indistinguishable downstream from one whose query the model wrote.
+// A whitespace-only value is rejected here rather than persisted, so a run never executes nothing.
+func (e *Executor) seedGenerateSQL(sql string) (string, error) {
+	trimmed := strings.TrimSpace(sql)
+	if trimmed == "" {
+		return "", errors.New("edited SQL is empty")
+	}
+	encoded, err := json.Marshal(domain.GenerateSQLStepOutput{SQL: trimmed})
+	if err != nil {
+		return "", fmt.Errorf("encoding seeded generate_sql output: %w", err)
 	}
 	return string(encoded), nil
 }

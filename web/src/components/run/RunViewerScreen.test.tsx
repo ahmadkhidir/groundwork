@@ -9,15 +9,20 @@ vi.mock("@/lib/api-client", async () => {
     await vi.importActual<typeof import("@/lib/api-client")>("@/lib/api-client");
   return {
     ...actual,
-    api: { ...actual.api, get: vi.fn() },
+    api: { ...actual.api, get: vi.fn(), post: vi.fn() },
   };
 });
 
-const getMock = vi.mocked(api.get);
-
+const { pushMock, routerMock } = vi.hoisted(() => {
+  const pushMock = vi.fn();
+  return { pushMock, routerMock: { push: pushMock } };
+});
 vi.mock("next/navigation", () => ({
-  useRouter: () => ({ push: vi.fn() }),
+  useRouter: () => routerMock,
 }));
+
+const getMock = vi.mocked(api.get);
+const postMock = vi.mocked(api.post);
 
 function step(
   stepName: StepName,
@@ -62,6 +67,8 @@ function completeRunSteps(): Step[] {
 describe("RunViewerScreen", () => {
   beforeEach(() => {
     getMock.mockReset();
+    postMock.mockReset();
+    pushMock.mockReset();
   });
 
   afterEach(() => {
@@ -168,5 +175,50 @@ describe("RunViewerScreen", () => {
     const stoppedAt = fetchCount;
     await vi.advanceTimersByTimeAsync(5_000);
     expect(fetchCount).toBe(stoppedAt);
+  });
+
+  it("auto-navigates to the report on completion when a report_id is attached (FEAT-018)", async () => {
+    getMock.mockResolvedValue({
+      run: run("complete"),
+      steps: completeRunSteps(),
+      report_id: "report-1",
+    });
+    render(<RunViewerScreen workspaceId="ws-1" runId="run-1" />);
+
+    await screen.findByText("How many customers per region?");
+    expect(pushMock).toHaveBeenCalledWith("/workspaces/ws-1/reports/report-1");
+  });
+
+  it("does not navigate away when a completed run has no report yet", async () => {
+    getMock.mockResolvedValue({ run: run("complete"), steps: completeRunSteps() });
+    render(<RunViewerScreen workspaceId="ws-1" runId="run-1" />);
+
+    await screen.findByText("How many customers per region?");
+    expect(pushMock).not.toHaveBeenCalled();
+  });
+
+  it("starts a NEW run seeded with the edited SQL and navigates to it (FEAT-018)", async () => {
+    getMock.mockResolvedValue({ run: run("complete"), steps: completeRunSteps() });
+    postMock.mockResolvedValue({ run: run("complete", { id: "run-2" }) });
+    render(<RunViewerScreen workspaceId="ws-1" runId="run-1" />);
+
+    await screen.findByText(SQL_TEXT);
+    screen.getByRole("button", { name: "Edit SQL" }).click();
+
+    const textarea = await screen.findByRole("textbox", { name: "Edit Generated SQL" });
+    const edited = "SELECT region FROM dataset_sales_q3_d5f3e2a1 WHERE cnt > 5";
+    // fireEvent is safer than userEvent for a controlled textarea under fake timers.
+    const { fireEvent } = await import("@testing-library/react");
+    fireEvent.change(textarea, { target: { value: edited } });
+
+    screen.getByRole("button", { name: "Run edited query" }).click();
+
+    await vi.waitFor(() => {
+      expect(postMock).toHaveBeenCalledWith(
+        "/v1/workspaces/ws-1/runs",
+        expect.objectContaining({ question_text: "How many customers per region?", sql: edited }),
+      );
+      expect(pushMock).toHaveBeenCalledWith("/workspaces/ws-1/runs/run-2");
+    });
   });
 });

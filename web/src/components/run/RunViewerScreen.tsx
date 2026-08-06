@@ -8,7 +8,7 @@ import { Card, CardHeader } from "@/components/ui/Card";
 import { StatusPill, runStatusPill } from "@/components/ui/StatusPill";
 import { ErrorState } from "@/components/shared/ErrorState";
 import { Skeleton } from "@/components/shared/Skeleton";
-import { CodeBlock } from "@/components/shared/CodeBlock";
+import { EditableCodeBlock } from "./EditableCodeBlock";
 import { StepFeed } from "./StepFeed";
 import { ResultTable } from "./ResultTable";
 import {
@@ -28,6 +28,12 @@ export interface RunViewerScreenProps {
 interface GetRunResponse {
   run: Run;
   steps: Step[];
+  /**
+   * Id of a report this run materialized, attached on completion (FEAT-018). Null while running or
+   * when no report exists; the viewer uses it to auto-navigate to the report and to offer a
+   * "View report" link.
+   */
+  report_id?: string | null;
 }
 
 /**
@@ -43,7 +49,7 @@ const RUN_POLL_INTERVAL_MS = 1_000;
 
 type ScreenState =
   | { status: "loading" }
-  | { status: "loaded"; run: Run; steps: Step[] }
+  | { status: "loaded"; run: Run; steps: Step[]; reportId: string | null }
   | { status: "error"; message: string };
 
 /**
@@ -55,9 +61,9 @@ type ScreenState =
  *
  * Phase 2 boundary (IMPLEMENTATION.md "Phase 2 boundary assumptions"): halt, amend, and "Resume from
  * here" (FEAT-022/024) and the Clarifying Question Prompt's interactive surface (FEAT-033) are later
- * phases — this viewer is watch-only. The one Phase 2 form of ambiguity handling is the failed-run
- * banner for an unanswerable plan, since the plan step COMPLETES with that verdict and the reason
- * would otherwise be invisible.
+ * phases. This viewer is watch-only for the current run, with FEAT-018's one editing affordance:
+ * the generated SQL is editable and "Run edited query" starts a NEW run seeded with that SQL (never
+ * mutating this one). On completion the viewer auto-navigates to the run's report when one exists.
  */
 export function RunViewerScreen({ workspaceId, runId }: RunViewerScreenProps) {
   const router = useRouter();
@@ -67,16 +73,38 @@ export function RunViewerScreen({ workspaceId, runId }: RunViewerScreenProps) {
   // last-known state on screen instead of flashing the error state (the same pattern as
   // WorkspaceHomeScreen's lastKnownWorkspace ref).
   const loaded = useRef(false);
+  // Guards the completion auto-navigate so it fires once per mount (screens/08-run-viewer.md's
+  // "assemble completes → auto-navigate to Report View").
+  const navigatedToReport = useRef(false);
+  // Busy state while "Run edited query" is submitting the new run.
+  const [submittingEdit, setSubmittingEdit] = useState(false);
 
   const load = useCallback(async () => {
     try {
       const response = await api.get<GetRunResponse>(
         `/v1/workspaces/${workspaceId}/runs/${runId}`,
       );
-      setState({ status: "loaded", run: response.run, steps: response.steps });
+      const reportId = response.report_id ?? null;
+      setState({
+        status: "loaded",
+        run: response.run,
+        steps: response.steps,
+        reportId,
+      });
       loaded.current = true;
       if (isTerminalRunStatus(response.run.status)) {
         stopPolling.current = true;
+      }
+      // FEAT-018 auto-navigate: a run that completed materialized a report, and the viewer follows
+      // the user there (screens/08-run-viewer.md Data Flow step 4). No report_id yet (running, or a
+      // test double without the reports seam) → stay and keep showing live state.
+      if (
+        response.run.status === RunStatus.Complete &&
+        reportId &&
+        !navigatedToReport.current
+      ) {
+        navigatedToReport.current = true;
+        router.push(routes.report(workspaceId, reportId));
       }
     } catch (error) {
       // A failed poll after a successful load is a transient hiccup between polls: keep the
@@ -90,11 +118,38 @@ export function RunViewerScreen({ workspaceId, runId }: RunViewerScreenProps) {
           : "Something went wrong. Try again.";
       setState({ status: "error", message });
     }
-  }, [workspaceId, runId]);
+  }, [router, workspaceId, runId]);
+
+  // FEAT-018: "Run edited query" starts a NEW run seeded with the edited SQL (IMPLEMENTATION.md's
+  // Phase 2 boundary) and hands the user to its viewer. The current run is never mutated.
+  const handleRunEdited = useCallback(
+    async (sql: string) => {
+      const trimmed = sql.trim();
+      if (!trimmed) return;
+      setSubmittingEdit(true);
+      try {
+        const { run: nextRun } = await api.post<{ run: Run }>(
+          `/v1/workspaces/${workspaceId}/runs`,
+          {
+            question_text: state.status === "loaded" ? state.run.question_text : "",
+            sql: trimmed,
+          },
+        );
+        router.push(routes.run(workspaceId, nextRun.id));
+      } catch {
+        // A failed submission leaves the user on the viewer with the edit intact; the server's
+        // 4xx body would otherwise be surfaced by a dedicated error surface in a later wave.
+      } finally {
+        setSubmittingEdit(false);
+      }
+    },
+    [router, workspaceId, state],
+  );
 
   useEffect(() => {
     stopPolling.current = false;
     loaded.current = false;
+    navigatedToReport.current = false;
     // Mount-triggered async fetch; see WorkspaceHomeScreen.tsx for why this eslint rule is
     // suppressed here.
     // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -123,6 +178,7 @@ export function RunViewerScreen({ workspaceId, runId }: RunViewerScreenProps) {
 
   const run = state.status === "loaded" ? state.run : null;
   const steps = state.status === "loaded" ? state.steps : [];
+  const reportId = state.status === "loaded" ? state.reportId : null;
 
   // Parse the three Phase 2 step payloads at the boundary (schema.ts's convention on Step).
   const planStep = steps.find((step) => step.step_name === "plan");
@@ -181,6 +237,15 @@ export function RunViewerScreen({ workspaceId, runId }: RunViewerScreenProps) {
         </p>
       )}
 
+      {reportId && run?.status === RunStatus.Complete && (
+        <Link
+          href={routes.report(workspaceId, reportId)}
+          className="mb-4 inline-block text-body-small text-provenance hover:text-provenance"
+        >
+          View report →
+        </Link>
+      )}
+
       {notAnswerable && (
         <div
           role="alert"
@@ -202,10 +267,13 @@ export function RunViewerScreen({ workspaceId, runId }: RunViewerScreenProps) {
 
         <div className="flex flex-col gap-6">
           <Card>
-            <CodeBlock
+            <EditableCodeBlock
               label="Generated SQL"
               code={generateSQL?.sql ?? ""}
-              hint="View-only in Phase 2 — SQL editing arrives with amend (later phase)."
+              editable={Boolean(generateSQL?.sql)}
+              hint="Editing runs exactly this SQL in a new run."
+              onRunEdited={handleRunEdited}
+              submitting={submittingEdit}
             />
           </Card>
 

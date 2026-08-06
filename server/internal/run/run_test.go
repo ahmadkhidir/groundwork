@@ -183,6 +183,7 @@ func (f *fakeProvider) Status(_ context.Context, _ string) (engine.Status, error
 type fakeHandle struct {
 	mu             sync.Mutex
 	execStatements []string
+	queried        []string
 	rows           engine.Rows
 	// countRows, when set, is returned for SELECT count(*) queries (reconciliation measurement),
 	// so the fake can produce a distinct row count without exhausting rows. Kept as data, not an
@@ -198,10 +199,19 @@ func (f *fakeHandle) AcquiredAt() time.Time {
 func (f *fakeHandle) Query(_ context.Context, sql string, _ ...any) (engine.Rows, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.queried = append(f.queried, sql)
 	if f.countRows != nil && strings.HasPrefix(sql, "SELECT count(*)") {
 		return &fakeRows{cols: []string{"count"}, rows: f.countRows}, nil
 	}
 	return f.rows, nil
+}
+
+func (f *fakeHandle) queriedSQL() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.queried))
+	copy(out, f.queried)
+	return out
 }
 
 func (f *fakeHandle) Exec(_ context.Context, sql string, _ ...any) (int64, error) {
@@ -546,6 +556,123 @@ func TestExecutorHappyPath(t *testing.T) {
 	}
 	if rep.ProvenanceLinks == nil || len(rep.ProvenanceLinks) != 0 {
 		t.Errorf("report provenance_links = %v, want an empty array", rep.ProvenanceLinks)
+	}
+}
+
+// TestExecutorSeededGenerateSQL pins FEAT-018's seeded path: SubmitWithSQL skips plan and the model
+// generate_sql call, persists the user's edited SQL verbatim as the generate_sql step output, then
+// continues the ordinary execute → chart_spec → narrate → report tail. The engine runs the seeded
+// SQL exactly, and the run completes with one materialized report.
+func TestExecutorSeededSubmit(t *testing.T) {
+	executor, runs, steps, _, modelClient, _, reports := newTestExecutor()
+	executor.datasets = &fakeDatasetStore{datasets: []domain.Dataset{{
+		ID: "d5f3e2a1b9c8472d9a1b2c3d4e5f60718", OriginalFilename: "Sales Data (Q3).csv",
+		IngestStatus: domain.IngestComplete,
+	}}}
+	executor.columns = &fakeColumnStore{byDataset: map[string][]domain.Column{
+		"d5f3e2a1b9c8472d9a1b2c3d4e5f60718": {
+			{Name: "region", InferredType: domain.TypeString},
+			{Name: "amount", InferredType: domain.TypeNumber},
+		},
+	}}
+	handle := &fakeHandle{
+		rows: &fakeRows{cols: []string{"region", "total"}, rows: [][]any{{"North", float64(100)}}},
+		// Reconciliation measurement needs a distinct count result; distinct from the main rows so
+		// the count(*) query drives a fresh cursor rather than exhausting the shared one.
+		countRows: [][]any{{int64(3)}},
+	}
+	executor.provider = &fakeProvider{handle: handle}
+
+	// Only chart_spec and narrate consume the model; plan and generate_sql are replaced by the seed.
+	modelClient.enqueue(
+		`{"chart_type":"bar","x_axis_column":"region","y_axis_column":"total","title":"Sales by region"}`,
+		`{"narrative":"North leads sales."}`,
+	)
+
+	edited := "SELECT region, SUM(amount) AS total FROM dataset_sales_data_q3_csv_d5f3e2a1 GROUP BY region"
+	executor.SubmitWithSQL("user-1", testRun(), "  "+edited+"  ")
+	waitFor(t, func() bool { return runs.current().Status.IsTerminal() })
+
+	if got := runs.current().Status; got != domain.RunComplete {
+		t.Fatalf("run status = %s, want complete (steps: %+v)", got, steps.all())
+	}
+
+	all := steps.all()
+	if len(all) != 4 {
+		t.Fatalf("steps = %d, want 4 (generate_sql, execute, chart_spec, narrate)", len(all))
+	}
+	wantNames := []domain.StepName{domain.StepGenerateSQL, domain.StepExecute, domain.StepChartSpec, domain.StepNarrate}
+	for i, name := range wantNames {
+		if all[i].StepName != name || all[i].Status != domain.StepComplete {
+			t.Errorf("step[%d] = %s/%s, want %s complete", i, all[i].StepName, all[i].Status, name)
+		}
+	}
+
+	// The generate_sql step has no chained plan input and its output is the user's trimmed SQL.
+	if all[0].Input != "" {
+		t.Errorf("generate_sql input = %q, want empty — no plan step precedes it", all[0].Input)
+	}
+	var gen domain.GenerateSQLStepOutput
+	if err := json.Unmarshal([]byte(all[0].Output), &gen); err != nil {
+		t.Fatalf("generate_sql output not parseable: %v", err)
+	}
+	if gen.SQL != edited {
+		t.Errorf("generate_sql SQL = %q, want the user's trimmed SQL verbatim %q", gen.SQL, edited)
+	}
+
+	// The engine ran the seeded SQL exactly (queried includes the execute step's query).
+	queried := handle.queriedSQL()
+	found := false
+	for _, q := range queried {
+		if q == edited {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("engine queries = %v, want the seeded SQL %q among them", queried, edited)
+	}
+
+	// Two model calls only: chart_spec and narrate.
+	if got := modelClient.callCount(); got != 2 {
+		t.Errorf("model calls = %d, want 2 (chart_spec, narrate)", got)
+	}
+
+	// A report still materializes for the seeded run.
+	if created := reports.created(); len(created) != 1 {
+		t.Errorf("created reports = %d, want 1", len(created))
+	}
+}
+
+// TestExecutorSeedRejectsEmptySQL pins the executor's guard: SubmitWithSQL with a whitespace-only
+// sql must fail the run at the generate_sql step — a run never executes nothing.
+func TestExecutorSeedRejectsEmptySQL(t *testing.T) {
+	executor, runs, steps, _, modelClient, _, _ := newTestExecutor()
+	executor.datasets = &fakeDatasetStore{datasets: []domain.Dataset{{
+		ID: "d5f3e2a1b9c8472d9a1b2c3d4e5f60718", OriginalFilename: "sales.csv",
+		IngestStatus: domain.IngestComplete,
+	}}}
+	executor.columns = &fakeColumnStore{byDataset: map[string][]domain.Column{
+		"d5f3e2a1b9c8472d9a1b2c3d4e5f60718": {
+			{Name: "region", InferredType: domain.TypeString},
+		},
+	}}
+
+	executor.SubmitWithSQL("user-1", testRun(), "   ")
+	waitFor(t, func() bool { return runs.current().Status.IsTerminal() })
+
+	if got := runs.current().Status; got != domain.RunFailed {
+		t.Fatalf("run status = %s, want failed for empty edited SQL", got)
+	}
+	all := steps.all()
+	if len(all) != 1 || all[0].StepName != domain.StepGenerateSQL || all[0].Status != domain.StepFailed {
+		t.Fatalf("steps = %+v, want one FAILED generate_sql step", all)
+	}
+	if !strings.Contains(all[0].Output, "empty") {
+		t.Errorf("failed generate_sql output = %q, want it to name the empty SQL", all[0].Output)
+	}
+	if got := modelClient.callCount(); got != 0 {
+		t.Errorf("model calls = %d, want 0", got)
 	}
 }
 

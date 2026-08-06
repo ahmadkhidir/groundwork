@@ -356,7 +356,7 @@ loaded via `next/font` and bound to `--font-display`, `--font-body`, `--font-mon
 |---|---|---|
 | **A — Foundation** | Scaffold, theme tokens, schema entities, auth, routing skeleton, docker-compose | **Complete** |
 | **1 — Foundation: Workspace, Ingest & Trust** | FEAT-001 ✅ 002 ✅ 003 ✅ 004 ✅ 005 ✅ 006 ✅ 007 ✅ 008 ✅ 009 ✅ 011 ✅ 042 ✅ 044 ✅ 048 ✅ 049 ✅ | **Complete** — reopened for FEAT-048/049 by docs `ff8d5b2` (2026-08-06) and closed by this wave; see below |
-| **2 — Core Grounded Answer Loop** | FEAT-013 ✅, 014 ✅, 015 ✅, 016 ✅, 017, 018, 019 ✅, 020 | In progress — FEAT-019 (Wave 1), FEAT-013 (Wave 2), FEAT-014/015/016 (Wave 3) landed |
+| **2 — Core Grounded Answer Loop** | FEAT-013 ✅, 014 ✅, 015 ✅, 016 ✅, 017 ✅, 018 ✅, 019 ✅, 020 | In progress — Wave 1–4 landed (017 ✅, 018 ✅ in Wave 4); only FEAT-020 remains |
 | **3 — Trust & Observability** | FEAT-022, 023, 024, 027, 028, 029, 030 | Not started |
 | **4 — Reports & Delivery** | FEAT-034, 035, 036, 041, 043 | Not started |
 | **5 — Polish & Expansion** | FEAT-010, 012, 021, 025, 026, 031, 032, 033, 037, 038, 039, 040, 045, 046, 047 | Not started |
@@ -382,6 +382,19 @@ loaded via `next/font` and bound to `--font-display`, `--font-body`, `--font-mon
 > row-ceiling AC lands here (`config.MaxExecuteRows`, 10k, fail-closed); the R-016 facts seam extends
 > to `model.BuildFactsPayload`, which drops any PII/excluded column's VALUES from the facts before
 > they reach chart_spec/narrate; `chart_spec`/`narrate` emit only parsable payloads (no chart image, no markup). Wave 3 is verification-clean (`go vet` + fresh `go test` + `gofmt`).
+>
+> **FEAT-017 (First-Party Chart Rendering) and FEAT-018 (SQL Editing → New Run) landed in Phase 2's
+> Wave 4** as a single web+server pass. The Report View screen (`web/src/components/report/`) renders
+> the self-contained report — narrative, reconciliation notice, and a first-party SVG chart
+> (`ChartRenderer`: bar/line/pie/scatter/table, no charting library) drawn from the report's
+> `chart_spec` over the run's execute facts, with an accessible data-table fallback; it also auto-
+> navigates from a completed run to its report via the GET-run `report_id`. FEAT-018 lets the Run
+> Viewer edit the generated SQL inline (`EditableCodeBlock`) and submit it: the handler routes to
+> `RunExecutor.SubmitWithSQL` → `executeSeeded`, which starts a NEW run whose `generate_sql` step is
+> seeded with the user's exact edited SQL (no plan step, no model call), then continues
+> execute → chart_spec → narrate → report. Per the approved FEAT-024 boundary, editing never amends
+> or resumes — it always starts a fresh run. Wave 4 is verification-clean: server `go vet` + fresh
+> `go test` (cgo env) + `gofmt` clean; web `vitest` 169/169 + `eslint` + source-only `tsc --noEmit`.
 
 ### Phase 1 reopened for FEAT-048 / FEAT-049 (docs `ff8d5b2`, user-approved 2026-08-06) — CLOSED
 
