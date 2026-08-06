@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -278,6 +279,141 @@ func TestCreateRunRejectsNonOwner(t *testing.T) {
 		t.Error("executor was submitted for a workspace the user does not own")
 	}
 }
+
+/* -------------------------------------------------------------------------------------------- */
+/* FEAT-020 capture hook                                                                         */
+/* -------------------------------------------------------------------------------------------- */
+
+// newRunsTestServerWithCorrections is newRunsTestServer plus an in-memory SemanticCorrectionStore,
+// for asserting FEAT-020's capture of an edited-SQL run.
+func newRunsTestServerWithCorrections(t *testing.T, corrections *fakeSemanticCorrectionStore) (*Server, *fakeWorkspaceStore, *fakeRunExecutor) {
+	t.Helper()
+
+	cfg := config.Config{
+		Port:           "8080",
+		DatabaseURL:    "postgres://localhost/test",
+		AllowedOrigin:  "http://localhost:3000",
+		MaxUploadBytes: config.MaxUploadBytesDefault,
+		Environment:    "development",
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	workspaces := newFakeWorkspaceStore()
+	executor := &fakeRunExecutor{}
+
+	server := NewServer(cfg, logger, nil, Dependencies{
+		AuthSecret:          testAuthSecret,
+		Workspaces:          workspaces,
+		Users:               newFakeUserTierLookup(),
+		Runs:                newFakeRunRepo(),
+		RunSteps:            newFakeRunStepRepo(),
+		RunExecutor:         executor,
+		SemanticCorrections: corrections,
+	})
+	return server, workspaces, executor
+}
+
+// TestCreateRunWithEditedSQLCapturesCorrection pins FEAT-020's capture: a create with the user's
+// edited SQL (FEAT-018) both seeds a new run AND persists a durable Correction row attributing the
+// edit — corrected logic = the SQL, workspace scoped, attributed to the NEW run, with a plain-
+// language description. AC1's durable-preference shape and AC2's attribution.
+func TestCreateRunWithEditedSQLCapturesCorrection(t *testing.T) {
+	corrections := newFakeSemanticCorrectionStore()
+	server, workspaces, executor := newRunsTestServerWithCorrections(t, corrections)
+	workspaces.byID["ws-1"] = domain.Workspace{ID: "ws-1", OwnerID: "user-1"}
+
+	edited := "SELECT region, SUM(amount) FROM dataset_sales_csv_d5f3e2a1 GROUP BY region"
+	req := authedRequest(t, http.MethodPost, "/v1/workspaces/ws-1/runs",
+		map[string]string{"question_text": "How many customers per region?", "sql": edited}, "user-1", domain.TierFree)
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	var body struct {
+		Run struct {
+			ID string `json:"id"`
+		} `json:"run"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decoding body: %v", err)
+	}
+
+	// SubmitWithSQL still fired for the seeded run.
+	if sqls := executor.submittedSQL(); len(sqls) != 1 || sqls[0] != edited {
+		t.Fatalf("seeded SQL submissions = %v, want [%q]", sqls, edited)
+	}
+
+	// Exactly one correction captured, its fields as decided (see captureCorrection's doc).
+	got := corrections.byWorkspace["ws-1"]
+	if len(got) != 1 {
+		t.Fatalf("captured corrections = %d, want 1 (list = %+v)", len(got), got)
+	}
+	c := got[0]
+	if c.WorkspaceID != "ws-1" {
+		t.Errorf("workspace_id = %q, want ws-1", c.WorkspaceID)
+	}
+	if c.CorrectedLogic != edited {
+		t.Errorf("corrected_logic = %q, want the edited SQL verbatim", c.CorrectedLogic)
+	}
+	if c.OriginatingRunID != body.Run.ID {
+		t.Errorf("originating_run_id = %q, want the new run's id %q", c.OriginatingRunID, body.Run.ID)
+	}
+	if c.Description == "" {
+		t.Error("description is empty; a correction must carry a plain-language summary")
+	}
+	// OriginalLogic is unknown at capture (the request does not carry the prior SQL) — stored empty.
+	if c.OriginalLogic != "" {
+		t.Errorf("original_logic = %q, want empty (not carried by the create request)", c.OriginalLogic)
+	}
+}
+
+// TestCreateRunWithoutSQLCapturesNoCorrection pins that the ordinary question → plan → generate_sql
+// path (no edited SQL) must not fabricate a correction.
+func TestCreateRunWithoutSQLCapturesNoCorrection(t *testing.T) {
+	corrections := newFakeSemanticCorrectionStore()
+	server, workspaces, executor := newRunsTestServerWithCorrections(t, corrections)
+	workspaces.byID["ws-1"] = domain.Workspace{ID: "ws-1", OwnerID: "user-1"}
+
+	req := authedRequest(t, http.MethodPost, "/v1/workspaces/ws-1/runs",
+		map[string]string{"question_text": "How many customers?"}, "user-1", domain.TierFree)
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202, body = %s", rec.Code, rec.Body.String())
+	}
+	if len(executor.submitted()) != 1 {
+		t.Fatalf("executor submissions = %d, want the single normal Submit", len(executor.submitted()))
+	}
+	if len(corrections.byWorkspace["ws-1"]) != 0 {
+		t.Error("a correction was captured for a run with no edited SQL")
+	}
+}
+
+// TestCreateRunContinuesWhenCorrectionCaptureFails pins that FEAT-020's capture is best-effort: a
+// failed correction write must not fail the run the user asked for (still 202, still submitted).
+func TestCreateRunContinuesWhenCorrectionCaptureFails(t *testing.T) {
+	corrections := newFakeSemanticCorrectionStore()
+	corrections.createErr = errCapturingCorrection
+	server, workspaces, executor := newRunsTestServerWithCorrections(t, corrections)
+	workspaces.byID["ws-1"] = domain.Workspace{ID: "ws-1", OwnerID: "user-1"}
+
+	req := authedRequest(t, http.MethodPost, "/v1/workspaces/ws-1/runs",
+		map[string]string{"question_text": "How many customers?", "sql": "SELECT 1"}, "user-1", domain.TierFree)
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 even when correction capture fails; body = %s", rec.Code, rec.Body.String())
+	}
+	if sqls := executor.submittedSQL(); len(sqls) != 1 {
+		t.Fatalf("seeded SQL submissions = %d, want 1 despite a failed capture", len(sqls))
+	}
+}
+
+var errCapturingCorrection = errors.New("simulated correction capture failure")
 
 func TestGetRunRequiresAuthentication(t *testing.T) {
 	server, _, _, _, _ := newRunsTestServer(t)

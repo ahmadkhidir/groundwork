@@ -140,13 +140,55 @@ func (f *fakeSemanticMetricDefinitionStore) DeleteForWorkspace(ctx context.Conte
 	return nil
 }
 
-// fakeSemanticCorrectionStore is an in-memory SemanticCorrectionStore.
+// fakeSemanticCorrectionStore is an in-memory SemanticCorrectionStore (FEAT-019 read side plus
+// FEAT-020's Create/Delete).
 type fakeSemanticCorrectionStore struct {
 	byWorkspace map[string][]domain.Correction
+	byID        map[string]string // correction id -> workspace id, for ownership-scoped Delete
+	deleted     []string
+	// createErr, when set, makes Create fail — used to assert FEAT-020's capture is best-effort and
+	// does not fail the run it is captured alongside.
+	createErr error
+}
+
+func newFakeSemanticCorrectionStore() *fakeSemanticCorrectionStore {
+	return &fakeSemanticCorrectionStore{
+		byWorkspace: map[string][]domain.Correction{},
+		byID:        map[string]string{},
+	}
+}
+
+func (f *fakeSemanticCorrectionStore) add(c domain.Correction) {
+	f.byWorkspace[c.WorkspaceID] = append(f.byWorkspace[c.WorkspaceID], c)
+	f.byID[c.ID] = c.WorkspaceID
 }
 
 func (f *fakeSemanticCorrectionStore) ListByWorkspace(ctx context.Context, workspaceID string) ([]domain.Correction, error) {
 	return f.byWorkspace[workspaceID], nil
+}
+
+func (f *fakeSemanticCorrectionStore) Create(ctx context.Context, c domain.Correction) error {
+	if f.createErr != nil {
+		return f.createErr
+	}
+	f.add(c)
+	return nil
+}
+
+func (f *fakeSemanticCorrectionStore) Delete(ctx context.Context, workspaceID, id string) error {
+	if f.byID[id] != workspaceID {
+		return postgres.ErrCorrectionNotFound
+	}
+	f.deleted = append(f.deleted, id)
+	delete(f.byID, id)
+	ws := f.byWorkspace[workspaceID]
+	for i, c := range ws {
+		if c.ID == id {
+			f.byWorkspace[workspaceID] = append(ws[:i], ws[i+1:]...)
+			break
+		}
+	}
+	return nil
 }
 
 // fakeSemanticSummaryStore is an in-memory SemanticSummaryStore.
@@ -578,6 +620,91 @@ func TestListCorrectionsDisablesRunLinkWhenOriginatingRunIsGone(t *testing.T) {
 	}
 	if body.Corrections[0].OriginatingRunID != "" {
 		t.Errorf("originating_run_id = %q, want empty so the client disables the run link", body.Corrections[0].OriginatingRunID)
+	}
+}
+
+// TestDeleteCorrection pins FEAT-020 AC3's happy path: the remove affordance deletes the correction
+// and answers 204.
+func TestDeleteCorrection(t *testing.T) {
+	workspaces := newFakeWorkspaceStore()
+	workspaces.byID["ws-1"] = domain.Workspace{ID: "ws-1", OwnerID: "user-1"}
+	corrections := newFakeSemanticCorrectionStore()
+	corrections.add(domain.Correction{ID: "corr-1", WorkspaceID: "ws-1", Description: "d", CorrectedLogic: "c", CreatedAt: time.Now()})
+	router := newTestSemanticRouter(workspaces, newFakeSemanticRelationshipStore(), newFakeSemanticMetricDefinitionStore(), corrections, &fakeSemanticSummaryStore{})
+
+	req := authedRequest(t, http.MethodDelete, "/v1/workspaces/ws-1/semantic-layer/corrections/corr-1", nil, "user-1", domain.TierFree)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204; body: %s", rec.Code, rec.Body.String())
+	}
+	if len(corrections.byWorkspace["ws-1"]) != 0 {
+		t.Error("correction still listed after delete")
+	}
+	if len(corrections.deleted) != 1 || corrections.deleted[0] != "corr-1" {
+		t.Errorf("deleted = %v, want [corr-1]", corrections.deleted)
+	}
+}
+
+// TestDeleteCorrectionFromAnotherWorkspaceNotFound pins FEAT-020's workspace-ownership enforcement:
+// a correction in workspace2 must read as a plain 404 from workspace1 (non-enumeration) and must not
+// actually be removed.
+func TestDeleteCorrectionFromAnotherWorkspaceNotFound(t *testing.T) {
+	workspaces := newFakeWorkspaceStore()
+	workspaces.byID["ws-1"] = domain.Workspace{ID: "ws-1", OwnerID: "user-1"}
+	corrections := newFakeSemanticCorrectionStore()
+	corrections.add(domain.Correction{ID: "corr-other", WorkspaceID: "ws-other", Description: "d", CorrectedLogic: "c", CreatedAt: time.Now()})
+	router := newTestSemanticRouter(workspaces, newFakeSemanticRelationshipStore(), newFakeSemanticMetricDefinitionStore(), corrections, &fakeSemanticSummaryStore{})
+
+	req := authedRequest(t, http.MethodDelete, "/v1/workspaces/ws-1/semantic-layer/corrections/corr-other", nil, "user-1", domain.TierFree)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d for a correction belonging to a different workspace", rec.Code, http.StatusNotFound)
+	}
+	if len(corrections.deleted) != 0 {
+		t.Error("correction belonging to another workspace was deleted")
+	}
+	if len(corrections.byWorkspace["ws-other"]) != 1 {
+		t.Error("cross-workspace correction was removed from its own workspace's list")
+	}
+}
+
+// TestDeleteCorrectionNotFound pins the 404 for a correction id that never existed.
+func TestDeleteCorrectionNotFound(t *testing.T) {
+	workspaces := newFakeWorkspaceStore()
+	workspaces.byID["ws-1"] = domain.Workspace{ID: "ws-1", OwnerID: "user-1"}
+	router := newTestSemanticRouter(workspaces, newFakeSemanticRelationshipStore(), newFakeSemanticMetricDefinitionStore(), newFakeSemanticCorrectionStore(), &fakeSemanticSummaryStore{})
+
+	req := authedRequest(t, http.MethodDelete, "/v1/workspaces/ws-1/semantic-layer/corrections/missing", nil, "user-1", domain.TierFree)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+}
+
+// TestDeleteCorrectionRejectsNonOwner pins that a delete request for a workspace the caller does not
+// own is blocked by workspace ownership before any store call.
+func TestDeleteCorrectionRejectsNonOwner(t *testing.T) {
+	workspaces := newFakeWorkspaceStore()
+	workspaces.byID["ws-1"] = domain.Workspace{ID: "ws-1", OwnerID: "owner-user"}
+	corrections := newFakeSemanticCorrectionStore()
+	corrections.add(domain.Correction{ID: "corr-1", WorkspaceID: "ws-1", CreatedAt: time.Now()})
+	router := newTestSemanticRouter(workspaces, newFakeSemanticRelationshipStore(), newFakeSemanticMetricDefinitionStore(), corrections, &fakeSemanticSummaryStore{})
+
+	req := authedRequest(t, http.MethodDelete, "/v1/workspaces/ws-1/semantic-layer/corrections/corr-1", nil, "someone-else", domain.TierFree)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d (non-enumeration)", rec.Code, http.StatusNotFound)
+	}
+	if len(corrections.deleted) != 0 {
+		t.Error("non-owner's delete reached the store")
 	}
 }
 

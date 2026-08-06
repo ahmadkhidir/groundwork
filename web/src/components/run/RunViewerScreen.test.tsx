@@ -221,4 +221,30 @@ describe("RunViewerScreen", () => {
       expect(pushMock).toHaveBeenCalledWith("/workspaces/ws-1/runs/run-2");
     });
   });
+
+  it("links to the semantic-layer Corrections tab for an edited-SQL run whose correction was captured (FEAT-020)", async () => {
+    // A seeded run (FEAT-018) has no plan step: the user's edited SQL was captured as a durable
+    // correction, and screen 15's entry point says the Run Viewer links to it.
+    getMock.mockResolvedValue({
+      run: run("complete"),
+      steps: [
+        step("generate_sql", { output: JSON.stringify({ sql: SQL_TEXT }) }),
+        step("execute", {
+          output: JSON.stringify({ columns: ["region", "cnt"], rows: [["North", 10]], row_count: 1 }),
+        }),
+      ],
+    });
+    render(<RunViewerScreen workspaceId="ws-1" runId="run-1" />);
+
+    const link = await screen.findByRole("link", { name: /correction saved/i });
+    expect(link).toHaveAttribute("href", "/workspaces/ws-1/semantic-layer");
+  });
+
+  it("does not show the correction-saved link for a normal run that had a plan step", async () => {
+    getMock.mockResolvedValue({ run: run("complete"), steps: completeRunSteps() });
+    render(<RunViewerScreen workspaceId="ws-1" runId="run-1" />);
+
+    await screen.findByText("How many customers per region?");
+    expect(screen.queryByRole("link", { name: /correction saved/i })).not.toBeInTheDocument();
+  });
 });

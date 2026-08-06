@@ -209,4 +209,40 @@ describe("SemanticLayerScreen", () => {
     const links = screen.getAllByRole("link", { name: "View run" });
     expect(links[0]).toHaveAttribute("href", "/workspaces/ws-1/runs/run-1");
   });
+
+  it("removes a stored correction from the Corrections tab (FEAT-020 AC3)", async () => {
+    mockLoad({ corrections: [correction()] });
+    deleteMock.mockResolvedValue(undefined);
+
+    render(<SemanticLayerScreen workspaceId="ws-1" />);
+    await userEvent.click(screen.getByRole("tab", { name: "Corrections" }));
+    await waitFor(() =>
+      expect(screen.getAllByText("refunds join now excludes cancelled orders").length).toBeGreaterThan(0),
+    );
+
+    // The web table's Remove button (exact accessible name "Remove"; the mobile tile's is
+    // "Remove <description>") — both drive the same handler.
+    await userEvent.click(screen.getByRole("button", { name: "Remove" }));
+
+    await waitFor(() =>
+      expect(deleteMock).toHaveBeenCalledWith("/v1/workspaces/ws-1/semantic-layer/corrections/corr-1"),
+    );
+    await waitFor(() => expect(screen.getByText("No corrections yet")).toBeInTheDocument());
+  });
+
+  it("keeps the correction row with an inline error when removal fails", async () => {
+    mockLoad({ corrections: [correction()] });
+    deleteMock.mockRejectedValueOnce(new ApiError(500, "Server exploded"));
+
+    render(<SemanticLayerScreen workspaceId="ws-1" />);
+    await userEvent.click(screen.getByRole("tab", { name: "Corrections" }));
+    await waitFor(() =>
+      expect(screen.getAllByText("refunds join now excludes cancelled orders").length).toBeGreaterThan(0),
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "Remove" }));
+
+    await waitFor(() => expect(screen.getByText("Server exploded")).toBeInTheDocument());
+    expect(screen.getAllByText("refunds join now excludes cancelled orders").length).toBeGreaterThan(0);
+  });
 });

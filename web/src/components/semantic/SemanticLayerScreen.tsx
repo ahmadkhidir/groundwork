@@ -206,6 +206,25 @@ export function SemanticLayerScreen({ workspaceId }: SemanticLayerScreenProps) {
     }
   }
 
+  // FEAT-020 AC3: removing a stored correction. Screens/15's Error state — "failed edit reverts to
+  // prior value with an inline error" — falls out naturally: state is only mutated on success, so a
+  // failed delete leaves the row in place and surfaces the message inline.
+  async function handleDeleteCorrection(id: string) {
+    markSaving(id, true);
+    clearRowError(id);
+    try {
+      await api.delete(`/v1/workspaces/${workspaceId}/semantic-layer/corrections/${id}`);
+      setCorrectionsState((current) =>
+        current.status === "loaded" ? { ...current, items: current.items.filter((c) => c.id !== id) } : current,
+      );
+    } catch (error) {
+      const message = error instanceof ApiError ? error.message : "Could not delete this correction. Try again.";
+      setRowError(id, message);
+    } finally {
+      markSaving(id, false);
+    }
+  }
+
   const activeState: TabState<unknown> = useMemo(() => {
     switch (activeTab) {
       case "relationships":
@@ -279,7 +298,13 @@ export function SemanticLayerScreen({ workspaceId }: SemanticLayerScreenProps) {
               />
             )}
             {activeTab === "corrections" && (
-              <CorrectionsTab workspaceId={workspaceId} corrections={itemsOf(correctionsState)} />
+              <CorrectionsTab
+                workspaceId={workspaceId}
+                corrections={itemsOf(correctionsState)}
+                savingIds={savingIds}
+                errors={rowErrors}
+                onDelete={handleDeleteCorrection}
+              />
             )}
           </>
         )}

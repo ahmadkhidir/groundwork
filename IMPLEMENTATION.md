@@ -356,7 +356,7 @@ loaded via `next/font` and bound to `--font-display`, `--font-body`, `--font-mon
 |---|---|---|
 | **A — Foundation** | Scaffold, theme tokens, schema entities, auth, routing skeleton, docker-compose | **Complete** |
 | **1 — Foundation: Workspace, Ingest & Trust** | FEAT-001 ✅ 002 ✅ 003 ✅ 004 ✅ 005 ✅ 006 ✅ 007 ✅ 008 ✅ 009 ✅ 011 ✅ 042 ✅ 044 ✅ 048 ✅ 049 ✅ | **Complete** — reopened for FEAT-048/049 by docs `ff8d5b2` (2026-08-06) and closed by this wave; see below |
-| **2 — Core Grounded Answer Loop** | FEAT-013 ✅, 014 ✅, 015 ✅, 016 ✅, 017 ✅, 018 ✅, 019 ✅, 020 | In progress — Wave 1–4 landed (017 ✅, 018 ✅ in Wave 4); only FEAT-020 remains |
+| **2 — Core Grounded Answer Loop** | FEAT-013 ✅, 014 ✅, 015 ✅, 016 ✅, 017 ✅, 018 ✅, 019 ✅, 020 ✅ | **Complete** — Waves 1–5 landed (FEAT-020 in Wave 5) |
 | **3 — Trust & Observability** | FEAT-022, 023, 024, 027, 028, 029, 030 | Not started |
 | **4 — Reports & Delivery** | FEAT-034, 035, 036, 041, 043 | Not started |
 | **5 — Polish & Expansion** | FEAT-010, 012, 021, 025, 026, 031, 032, 033, 037, 038, 039, 040, 045, 046, 047 | Not started |
@@ -395,6 +395,35 @@ loaded via `next/font` and bound to `--font-display`, `--font-body`, `--font-mon
 > execute → chart_spec → narrate → report. Per the approved FEAT-024 boundary, editing never amends
 > or resumes — it always starts a fresh run. Wave 4 is verification-clean: server `go vet` + fresh
 > `go test` (cgo env) + `gofmt` clean; web `vitest` 169/169 + `eslint` + source-only `tsc --noEmit`.
+>
+> **FEAT-020 (Persistent User Corrections) landed in Phase 2's Wave 5**, the last wave of the
+> authorized Phase 2 scope. Capturing: `server/internal/api/runs.go`'s `handleCreateRun` persists a
+> durable `Correction` (via `captureCorrection`) when a run is created with the user's edited SQL
+> (FEAT-018's seeded path) — the correction's `originating_run_id` points at the NEW run and
+> `original_logic` is stored empty, because the create request carries neither the prior run's id nor
+> the prior generated SQL (honest values, doc tensions routed to product-shaper; see below).
+> Removing: `corrections.go` gains `Delete` (workspace-scoped, `ErrCorrectionNotFound` sentinel) and
+> `semantic.go` gains `DELETE .../semantic-layer/corrections/:correctionId` + the Corrections tab's
+> remove affordance (AC3, read-only-guarded for FEAT-045). The Run Viewer shows a "Correction saved —
+> view it in the semantic layer" link for seeded (no-plan) runs (screen 15's entry point). The one
+> shared-module assembly change is a single gated wiring line in `api.go` threading the existing
+> `SemanticCorrections` seam into `RegisterRunRoutes`. Wave 5 is verification-clean: full server
+> `go test ./internal/...` (cgo env) + `go build ./...` + `gofmt` clean; web `vitest` 173/173 +
+> `eslint` + source-only `tsc --noEmit`.
+>
+> **Phase 2 (the last authorized roadmap phase) is CLOSED** — Foundation + Phase 1 + Phase 2 (FEAT-001
+> …009, 011, 013…020, 042, 044, 048, 049) are all delivered and green. Phases 3–5 remain documented
+> but not authorized: **do not begin Phase 3 (␦FEAT-022…030) without explicit approval**.
+>
+> **Doc corrections to route to product-shaper (from FEAT-020):**
+> - `schema.md` marks `Correction.original_logic` required, but FEAT-018's run-create request does not
+>   carry the prior generated SQL, so captures store it empty. Product decision: extend the request
+>   to thread the original through, relax the schema requirement, or accept empty-as-honest.
+> - FEAT-020 AC2 says attributable "to a specific semantic-layer entry"; `schema.md`'s
+>   `Correction.originating_run_id` attributes to a **run**. The capture anchors to the new run; a
+>   `parent/source_run_id` (or explicit semantic-layer-entry FK) would reconcile the two.
+> - FEAT-020 AC1's "same edit twice → corrected by default on the third occurrence" is only served at
+>   capture + grounding-occlusion today; the re-apply engine beyond that is intentionally not built.
 
 ### Phase 1 reopened for FEAT-048 / FEAT-049 (docs `ff8d5b2`, user-approved 2026-08-06) — CLOSED
 

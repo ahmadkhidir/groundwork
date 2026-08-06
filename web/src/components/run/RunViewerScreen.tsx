@@ -277,6 +277,20 @@ export function RunViewerScreen({ workspaceId, runId }: RunViewerScreenProps) {
             />
           </Card>
 
+          {/* Screen 15's entry point (screens/15-semantic-layer.md): "Run Viewer — link after a
+              correction is saved during a run." A seeded run produced by "Run edited query" has no
+              plan step (FEAT-018's path) and generated SQL — that is exactly a run whose edited
+              query was captured as a durable correction (FEAT-020), so the Corrections tab is the
+              next stop. */}
+          {run && !planStep && generateSQL && (
+            <Link
+              href={routes.semanticLayer(workspaceId)}
+              className="text-body-small text-primary hover:underline"
+            >
+              Correction saved — view it in the semantic layer →
+            </Link>
+          )}
+
           {run && executeResult && (
             <Card>
               <CardHeader

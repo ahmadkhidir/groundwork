@@ -43,8 +43,14 @@ type RunExecutor interface {
 
 // RegisterRunRoutes wires FEAT-013's endpoints onto r. reports backs the GET run response's
 // report_id lookup (FEAT-018); it may be nil in test doubles that do not exercise that field.
-func RegisterRunRoutes(r chi.Router, workspaces WorkspaceStore, runs RunStore, steps RunStepStore, reports ReportStore, executor RunExecutor, logger *slog.Logger) {
-	r.Post("/workspaces/{workspaceId}/runs", handleCreateRun(workspaces, runs, executor, logger))
+//
+// corrections backs FEAT-020's capture hook: when a run is created with the user's edited SQL
+// (FEAT-018), handleCreateRun persists a durable Correction row attributing the edit. It is the same
+// SemanticCorrectionStore the semantic layer routes use (api.go's SemanticCorrections seam) and may
+// be nil when the semantic layer is not wired (e.g. minimal run-route tests) — capture is skipped,
+// never an error.
+func RegisterRunRoutes(r chi.Router, workspaces WorkspaceStore, runs RunStore, steps RunStepStore, reports ReportStore, corrections SemanticCorrectionStore, executor RunExecutor, logger *slog.Logger) {
+	r.Post("/workspaces/{workspaceId}/runs", handleCreateRun(workspaces, runs, corrections, executor, logger))
 	r.Get("/workspaces/{workspaceId}/runs/{runId}", handleGetRun(workspaces, runs, steps, reports, logger))
 }
 
@@ -63,7 +69,13 @@ type createRunRequest struct {
 // 202 Accepted response is the honest one for "accepted, processing in the background", and matches
 // architecture.md's "runs are server-side state; the UI is a viewer attached to them" framing: the
 // user navigates to the Run Viewer knowing the run may not have progressed past queued yet.
-func handleCreateRun(workspaces WorkspaceStore, runs RunStore, executor RunExecutor, logger *slog.Logger) http.HandlerFunc {
+//
+// FEAT-020's capture hook lives here: when the request carries the user's edited SQL (FEAT-018), a
+// durable Correction row is persisted attributing the edit to the NEW run before the executor is
+// handed it. Capture is best-effort by design — a failure to persist the preference logs and
+// continues, because the run the user asked for is the primary resource and must not be blocked on a
+// secondary write.
+func handleCreateRun(workspaces WorkspaceStore, runs RunStore, corrections SemanticCorrectionStore, executor RunExecutor, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
@@ -114,6 +126,18 @@ func handleCreateRun(workspaces WorkspaceStore, runs RunStore, executor RunExecu
 		// path — the same question, the user's corrected query. A blank/absent sql is the ordinary
 		// question → plan → generate_sql path.
 		if sql := strings.TrimSpace(req.SQL); sql != "" {
+			// FEAT-020 capture: the edit is a durable semantic-layer preference, not a one-off
+			// patch. Attributed to the NEW run (the run "during which this correction was made",
+			// per schema.md) — see captureCorrection's doc for the full decision.
+			if corrections != nil {
+				if err := corrections.Create(r.Context(), captureCorrection(run, question, sql)); err != nil {
+					logger.Error("capturing correction from edited-SQL run",
+						slog.String("workspace_id", workspaceID),
+						slog.String("run_id", run.ID),
+						slog.String("error", err.Error()),
+					)
+				}
+			}
 			executor.SubmitWithSQL(claims.UserID, run, sql)
 		} else {
 			executor.Submit(claims.UserID, run)
@@ -122,6 +146,52 @@ func handleCreateRun(workspaces WorkspaceStore, runs RunStore, executor RunExecu
 		respondJSON(w, http.StatusAccepted, map[string]any{"run": run})
 	}
 }
+
+// captureCorrection builds the durable Correction row FEAT-020 persists when a user's edited SQL
+// starts a new run (FEAT-018's seeded path), from what the create request actually carries.
+//
+// Decisions, and the doc tensions behind them (routed to product-shaper in the wave report):
+//
+//   - OriginatingRunID points at the NEW run, not the run whose SQL was edited. The schema describes
+//     originating_run_id as "the Run during which this correction was made", and this correction IS
+//     made while creating the seeded run. The original run's id is also not carried by the create
+//     request (no parent_run_id is passed on FEAT-018's path), so the new run is the only honest,
+//     durable anchor available here.
+//
+//   - OriginalLogic is stored empty. The request carries only the corrected SQL; the original
+//     generated SQL lives in the previous run's generate_sql step, whose id the client does not send.
+//     Storing a fabricated "original" would corrupt the Corrections tab's original-vs-corrected
+//     comparison, so the honest value is an empty original with the corrected SQL and the question
+//     context preserved. schema.md marks original_logic required; this is surfaced as a doc
+//     correction candidate (see FEAT-020 AC2 / screen 15 in the wave report).
+//
+//   - Description is derived from the question text: with no parsed understanding of the edit, the
+//     plain-language summary anchors the correction to the question whose generated SQL was edited.
+func captureCorrection(run domain.Run, question, sql string) domain.Correction {
+	return domain.Correction{
+		ID:               uuid.NewString(),
+		WorkspaceID:      run.WorkspaceID,
+		Description:      correctionDescription(question),
+		OriginalLogic:    "",
+		CorrectedLogic:   sql,
+		OriginatingRunID: run.ID,
+		CreatedAt:        time.Now().UTC(),
+	}
+}
+
+// correctionDescription builds a short plain-language summary of a captured correction, anchoring it
+// to the question whose generated SQL was edited. The question is whitespace-collapsed and truncated
+// so a long question cannot balloon the Corrections tab's description column.
+func correctionDescription(question string) string {
+	q := strings.Join(strings.Fields(question), " ")
+	if len(q) > correctionDescriptionMax {
+		q = q[:correctionDescriptionMax] + "…"
+	}
+	return "Edited the SQL generated for: " + q
+}
+
+// correctionDescriptionMax bounds the question excerpt embedded in a correction's description.
+const correctionDescriptionMax = 60
 
 // handleGetRun serves screens/08-run-viewer.md's polling endpoint: GET /api/workspaces/:id/runs/:runId.
 //

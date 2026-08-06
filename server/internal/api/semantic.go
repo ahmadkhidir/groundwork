@@ -44,11 +44,15 @@ type SemanticMetricDefinitionStore interface {
 	DeleteForWorkspace(ctx context.Context, id, workspaceID string) error
 }
 
-// SemanticCorrectionStore is the read seam for the Corrections tab, satisfied by
-// internal/store/postgres.CorrectionRepository. Read-only here: capturing a correction is FEAT-020,
-// a later wave — see corrections.go's doc comment.
+// SemanticCorrectionStore is the persistence seam for the Corrections tab, satisfied by
+// internal/store/postgres.CorrectionRepository. FEAT-019 shipped the read side; FEAT-020 (a later
+// wave of the same phase) extends it with the write side: Create (api/runs.go captures a Correction
+// row when a user's edited SQL starts a new run) and Delete (the Corrections tab's remove action,
+// AC3 "user can view and remove a stored correction").
 type SemanticCorrectionStore interface {
 	ListByWorkspace(ctx context.Context, workspaceID string) ([]domain.Correction, error)
+	Create(ctx context.Context, c domain.Correction) error
+	Delete(ctx context.Context, workspaceID, id string) error
 }
 
 // SemanticSummaryStore backs screens/04-workspace-home.md's compact summary panel, satisfied by
@@ -79,6 +83,7 @@ func RegisterSemanticRoutes(
 	r.Delete("/workspaces/{workspaceId}/semantic-layer/metrics/{metricId}", handleDeleteMetricDefinition(workspaces, metrics, logger))
 
 	r.Get("/workspaces/{workspaceId}/semantic-layer/corrections", handleListCorrections(workspaces, corrections, logger))
+	r.Delete("/workspaces/{workspaceId}/semantic-layer/corrections/{correctionId}", handleDeleteCorrection(workspaces, corrections, logger))
 }
 
 func internalErrorResponse(w http.ResponseWriter) {
@@ -562,5 +567,43 @@ func handleListCorrections(workspaces WorkspaceStore, corrections SemanticCorrec
 			out = append(out, toPublicCorrection(c))
 		}
 		respondJSON(w, http.StatusOK, map[string]any{"corrections": out})
+	}
+}
+
+// handleDeleteCorrection serves DELETE
+// /v1/workspaces/:id/semantic-layer/corrections/:correctionId — FEAT-020 AC3's "user can view and
+// remove a stored correction", screens/15-semantic-layer.md's Corrections tab remove affordance.
+//
+// Ownership is enforced by the store's workspace-scoped DELETE (corrections.go): a correction whose
+// id exists but belongs to a different workspace comes back as ErrCorrectionNotFound and reads as a
+// plain 404, matching this API's non-enumeration pattern (a cross-workspace correction is never
+// confirmed to exist). Deleting from a workspace the caller does not own is already blocked by
+// requireWorkspaceOwnership above.
+func handleDeleteCorrection(workspaces WorkspaceStore, corrections SemanticCorrectionStore, logger *slog.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		claims, ok := requireClaims(w, r)
+		if !ok {
+			return
+		}
+		workspaceID := chi.URLParam(r, "workspaceId")
+		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+			return
+		}
+
+		correctionID := chi.URLParam(r, "correctionId")
+		if err := corrections.Delete(r.Context(), workspaceID, correctionID); err != nil {
+			if errors.Is(err, postgres.ErrCorrectionNotFound) {
+				respondJSON(w, http.StatusNotFound, map[string]string{
+					"error": "Correction not found.",
+					"code":  "not_found",
+				})
+				return
+			}
+			logger.Error("deleting correction", slog.String("error", err.Error()))
+			internalErrorResponse(w)
+			return
+		}
+
+		respondJSON(w, http.StatusNoContent, nil)
 	}
 }

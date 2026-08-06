@@ -2,21 +2,25 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/ahmadkhidir/groundwork/server/internal/domain"
 )
 
+// ErrCorrectionNotFound is returned when no correction matches the given id, scoped to a workspace —
+// FEAT-020's "user can view and remove a stored correction" (AC3). Returned both when the id never
+// existed and when it belongs to a different workspace, so the API can surface an honest 404 for
+// either case without ever confirming a cross-workspace row's existence (the same non-enumeration
+// stance as ErrRelationshipNotFound / ErrMetricDefinitionNotFound).
+var ErrCorrectionNotFound = errors.New("correction not found")
+
 // CorrectionRepository persists and retrieves durable user corrections — schema.md's Correction
-// entity, per FEAT-019 (storage) and FEAT-020 (capture, a later wave). This wave (FEAT-019) owns
-// storage and the read side only: screens/15-semantic-layer.md's Corrections tab, and the log a
-// correction is later attributed to.
-//
-// Create exists so the storage contract is complete and testable even though nothing calls it yet —
-// FEAT-020 (Persistent User Corrections, this same Phase 2 roadmap phase but a later wave) is what
-// actually captures a correction while a user edits SQL or a semantic-layer definition mid-run. Until
-// that wave lands, ListByWorkspace legitimately returns an empty slice for every workspace, and
-// screens/15's Corrections tab shows its documented Empty state rather than fabricated rows.
+// entity, per FEAT-019 (storage) and FEAT-020 (capture + removal). FEAT-019 owned the read side
+// (screens/15-semantic-layer.md's Corrections tab); FEAT-020 (the same Phase 2 roadmap phase, a
+// later wave) added the write side this file's Create always existed for: the API captures a
+// Correction row when a user's edited SQL starts a new run (see api/runs.go), and removes one when
+// the user deletes it from the Corrections tab.
 type CorrectionRepository struct {
 	pool *Pool
 }
@@ -88,4 +92,25 @@ func (r *CorrectionRepository) CountByWorkspace(ctx context.Context, workspaceID
 		return 0, fmt.Errorf("counting corrections: %w", err)
 	}
 	return count, nil
+}
+
+// Delete removes the correction with id, scoped to workspaceID. Returns ErrCorrectionNotFound if no
+// correction matches — including when a row exists but belongs to a different workspace, so a caller
+// with a URL pointing at another workspace's correction gets an honest not-found rather than a
+// successful no-op delete (compare metric_definitions.DeleteForWorkspace, whose handler checks
+// GetByIDForWorkspace first; the corrections handler relies on this scope-scoped return instead).
+//
+// Unlike DeleteForWorkspace's no-op posture, scoping a delete and reporting not-found here is
+// deliberate: the rows-affected count is the only in-hand proof of ownership, and FEAT-020 AC3's
+// remove action must not silently succeed for a row it did not touch.
+func (r *CorrectionRepository) Delete(ctx context.Context, workspaceID, id string) error {
+	tag, err := r.pool.Exec(ctx,
+		`DELETE FROM corrections WHERE id = $1 AND workspace_id = $2`, id, workspaceID)
+	if err != nil {
+		return fmt.Errorf("deleting correction: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrCorrectionNotFound
+	}
+	return nil
 }
