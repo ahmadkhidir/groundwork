@@ -31,6 +31,18 @@ func (f *fakeProfilingDatasetStore) GetByID(ctx context.Context, id string) (dom
 	return ds, nil
 }
 
+// ListByWorkspace supports FEAT-008/FEAT-049's Relationship inference skipped notice, computed by
+// handleListCandidateJoins from the workspace's full dataset list.
+func (f *fakeProfilingDatasetStore) ListByWorkspace(ctx context.Context, workspaceID string) ([]domain.Dataset, error) {
+	var out []domain.Dataset
+	for _, ds := range f.byID {
+		if ds.WorkspaceID == workspaceID {
+			out = append(out, ds)
+		}
+	}
+	return out, nil
+}
+
 // fakeProfilingColumnStore is an in-memory ProfilingColumnStore.
 type fakeProfilingColumnStore struct {
 	byDataset map[string][]domain.Column
@@ -191,6 +203,46 @@ func TestListCandidateJoinsReturnsPendingCandidatesNeverAutoApplied(t *testing.T
 	}
 	if got.Basis == "" {
 		t.Error("basis is empty — a confidence number alone is not an explanation")
+	}
+}
+
+// TestListCandidateJoinsSurfacesSkippedFilenamePairs is FEAT-008/FEAT-049's read-side test: two
+// datasets sharing an original_filename (the "Keep both" outcome) must be named in a skipped_pairs
+// notice, per screens/07-ingest-confirmation.md's Relationships step — not left as an unexplained
+// absence of candidates.
+func TestListCandidateJoinsSurfacesSkippedFilenamePairs(t *testing.T) {
+	workspaces := newFakeWorkspaceStore()
+	workspaces.byID["ws-1"] = domain.Workspace{ID: "ws-1", OwnerID: "user-1"}
+	datasets := &fakeProfilingDatasetStore{byID: map[string]domain.Dataset{
+		"ds-a": {ID: "ds-a", WorkspaceID: "ws-1", OriginalFilename: "customers.csv", CreatedAt: time.Date(2026, 8, 5, 14, 0, 0, 0, time.UTC)},
+		"ds-b": {ID: "ds-b", WorkspaceID: "ws-1", OriginalFilename: "customers.csv", CreatedAt: time.Date(2026, 8, 6, 9, 0, 0, 0, time.UTC)},
+		"ds-c": {ID: "ds-c", WorkspaceID: "ws-1", OriginalFilename: "orders.csv", CreatedAt: time.Date(2026, 8, 5, 14, 0, 0, 0, time.UTC)},
+	}}
+	router := newTestProfilingRouter(workspaces, datasets, &fakeProfilingColumnStore{}, &fakeProfilingCandidateJoinStore{})
+
+	req := authedRequest(t, http.MethodGet, "/v1/workspaces/ws-1/candidate-joins", nil, "user-1", domain.TierFree)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+
+	var body struct {
+		SkippedPairs []skippedFilenamePair `json:"skipped_pairs"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+	if len(body.SkippedPairs) != 1 {
+		t.Fatalf("skipped_pairs = %+v, want exactly one group (customers.csv) — orders.csv has no collision", body.SkippedPairs)
+	}
+	pair := body.SkippedPairs[0]
+	if pair.Filename != "customers.csv" {
+		t.Errorf("skipped pair filename = %q, want customers.csv", pair.Filename)
+	}
+	if len(pair.Datasets) != 2 {
+		t.Fatalf("skipped pair datasets = %+v, want both ds-a and ds-b named", pair.Datasets)
 	}
 }
 

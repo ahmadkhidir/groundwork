@@ -95,7 +95,10 @@ func (w *Writer) WriteExport(ctx context.Context, workspaceID, userID string) er
 	})
 }
 
-// WriteDeletion records a workspace deletion. Reserved for FEAT-043 (Phase 1, not this wave).
+// WriteDeletion records a deletion — a whole workspace (FEAT-043, not yet implemented) or a single
+// dataset (FEAT-048). schema.md's AuditLogEntry does not distinguish deletion scope beyond
+// action_type "deletion"; the deleted entity's identity is not modeled on this entry at all, matching
+// every other action type here.
 func (w *Writer) WriteDeletion(ctx context.Context, workspaceID, userID string) error {
 	return w.write(ctx, domain.AuditLogEntry{
 		WorkspaceID: workspaceID,

@@ -492,6 +492,49 @@ func findColumnID(t *testing.T, cols []domain.Column, name string) string {
 	return ""
 }
 
+// TestPipelineNeverInfersJoinsBetweenSameFilenameDatasets guards FEAT-008's unconditional exclusion,
+// added directly in response to a real incident: 4 datasets sharing one original_filename produced
+// 216 candidate joins comparing every copy against every other. Two datasets sharing a name — the
+// FEAT-049 "Keep both" case, reproduced here — must never be compared, even though their columns
+// (same names, same values) would otherwise score a near-certain candidate join.
+func TestPipelineNeverInfersJoinsBetweenSameFilenameDatasets(t *testing.T) {
+	ws := "ws-dupe"
+	dsA := domain.Dataset{
+		ID: "ds-dupe-a", WorkspaceID: ws, OriginalFilename: "customers.csv",
+		Format: domain.FormatCSV, IngestStatus: domain.IngestPending,
+	}
+	dsB := domain.Dataset{
+		ID: "ds-dupe-b", WorkspaceID: ws, OriginalFilename: "customers.csv", // same filename, "Keep both"
+		Format: domain.FormatCSV, IngestStatus: domain.IngestPending,
+	}
+
+	datasets := newFakeDatasetStore(dsA, dsB)
+	objects := newFakeObjectStore()
+	// Identical content: if the exclusion were missing, this would score a near-certain candidate
+	// join (identical names, identical values) on every column pair.
+	objects.objects["workspaces/ws-dupe/datasets/ds-dupe-a/original/customers.csv"] = []byte(
+		"customer_id,name\n1,Ada\n2,Grace\n3,Alan\n",
+	)
+	objects.objects["workspaces/ws-dupe/datasets/ds-dupe-b/original/customers.csv"] = []byte(
+		"customer_id,name\n1,Ada\n2,Grace\n3,Alan\n",
+	)
+
+	pipeline, _, joins, _ := newTestPipeline(datasets, objects)
+
+	pipeline.Start(dsA.ID)
+	waitForTerminalStatus(t, datasets, dsA.ID)
+	pipeline.Start(dsB.ID)
+	final := waitForTerminalStatus(t, datasets, dsB.ID)
+
+	if final.IngestStatus != domain.IngestComplete {
+		t.Fatalf("second dataset ingest_status = %q, want %q", final.IngestStatus, domain.IngestComplete)
+	}
+
+	if got := len(joins.all()); got != 0 {
+		t.Errorf("got %d candidate joins between two same-filename datasets, want 0 — FEAT-008 requires this pair never be compared", got)
+	}
+}
+
 func TestPipelineSerializesRelationshipInferenceAcrossConcurrentSiblings(t *testing.T) {
 	ws := "ws-3"
 	dsA := domain.Dataset{

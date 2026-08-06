@@ -1,19 +1,27 @@
-import { FileText, X } from "lucide-react";
+import { AlertTriangle, FileText, X } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { formatBytes } from "@/lib/limits";
+import { Button } from "@/components/ui/Button";
 import type { SelectedFile } from "./types";
 
 export interface SelectedFileListProps {
   files: SelectedFile[];
   onRemove: (id: string) => void;
+  /**
+   * Opens the Duplicate Filename dialog for a "duplicate"-status entry, per FEAT-049. Optional so
+   * this component stays usable in isolation (and in older tests) without wiring the whole flow.
+   */
+  onResolveDuplicate?: (id: string) => void;
 }
 
 /**
  * screens/05-file-upload.md's Selected-files list: filename, size, type icon, remove action — plus
- * this wave's per-file progress bar (Uploading state) and inline error (Upload Error state), since
- * both are properties of the same row rather than separate components.
+ * this wave's per-file progress bar (Uploading state), inline error (Upload Error state), and
+ * FEAT-049's Duplicate Filename Detected row (a warning plus a "Resolve" action that reopens the
+ * Duplicate Filename dialog), since all are properties of the same row rather than separate
+ * components.
  */
-export function SelectedFileList({ files, onRemove }: SelectedFileListProps) {
+export function SelectedFileList({ files, onRemove, onResolveDuplicate }: SelectedFileListProps) {
   if (files.length === 0) return null;
 
   return (
@@ -23,7 +31,9 @@ export function SelectedFileList({ files, onRemove }: SelectedFileListProps) {
           key={entry.id}
           className={cn(
             "flex flex-col gap-1 rounded-md border p-2",
-            entry.status === "error" ? "border-error bg-error/10" : "border-border bg-surface",
+            entry.status === "error" && "border-error bg-error/10",
+            entry.status === "duplicate" && "border-warning bg-warning/12",
+            entry.status !== "error" && entry.status !== "duplicate" && "border-border bg-surface",
           )}
         >
           <div className="flex items-center gap-2">
@@ -70,6 +80,24 @@ export function SelectedFileList({ files, onRemove }: SelectedFileListProps) {
             <p role="alert" className="text-body-small text-error">
               {entry.errorMessage}
             </p>
+          )}
+
+          {entry.status === "checking-duplicate" && (
+            <p className="text-caption text-text-secondary">Checking for an existing file with this name…</p>
+          )}
+
+          {entry.status === "duplicate" && (
+            <div className="flex items-center justify-between gap-2">
+              <p className="flex items-center gap-1 text-body-small text-warning">
+                <AlertTriangle size={14} aria-hidden="true" />A file named &quot;{entry.file.name}&quot; already
+                exists in this workspace.
+              </p>
+              {onResolveDuplicate && (
+                <Button variant="outline" onClick={() => onResolveDuplicate(entry.id)}>
+                  Resolve
+                </Button>
+              )}
+            </div>
           )}
         </li>
       ))}

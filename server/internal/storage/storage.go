@@ -99,6 +99,29 @@ func (c *Client) GetObject(ctx context.Context, key string) (io.ReadCloser, erro
 	return out.Body, nil
 }
 
+// DeleteObject removes the object at key.
+//
+// Added for FEAT-048 (Single-Dataset Deletion): confirmed operationally that object storage does NOT
+// cascade when the owning Dataset row is deleted from Postgres — every uploaded original and
+// normalized Parquet file is left behind unless removed by an explicit call like this one. A dataset
+// deletion that only removes database rows and leaves these objects in R2/MinIO would silently break
+// the provable-deletion promise this feature exists to uphold.
+//
+// Deleting a key that does not exist is not an error on S3-compatible stores (this call succeeds),
+// which matters here: a dataset that failed before its normalized Parquet was ever written still has
+// an original object to remove, and callers should not have to know which objects exist before
+// asking for them to be gone.
+func (c *Client) DeleteObject(ctx context.Context, key string) error {
+	_, err := c.s3.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(c.bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return fmt.Errorf("storage: deleting object %q: %w", key, err)
+	}
+	return nil
+}
+
 // NormalizedDatasetKey builds the object key for a dataset's normalized, canonical Parquet form —
 // the durable artifact FEAT-004's Ingest Pipeline writes, independent of the engine's lifecycle per
 // architecture.md's Data Architecture. Mirrors DatasetKey's convention.

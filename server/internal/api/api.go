@@ -95,6 +95,17 @@ type Dependencies struct {
 	SemanticMetrics       SemanticMetricDefinitionStore
 	SemanticCorrections   SemanticCorrectionStore
 	SemanticSummary       SemanticSummaryStore
+
+	// Datasets... below back FEAT-048 (Single-Dataset Deletion) — screens/04-workspace-home.md's
+	// Datasets panel and the shared Delete Confirmation Modal's data source — and FEAT-049's
+	// duplicate-filename check (DuplicateCheck), which also calls FEAT-048's deletion directly for its
+	// Replace path. See datasets.go and upload.go's DeleteDatasetAndObjects/handleCheckFilename.
+	DatasetsList         DatasetsStore
+	DatasetColumns       DatasetColumnsStore
+	DatasetRelationships DatasetRelationshipsStore
+	DatasetObjects       DatasetObjectDeleter
+	DatasetDeletionAudit DatasetDeletionAuditWriter
+	DuplicateCheck       DuplicateCheckStore
 }
 
 // Server wires configuration and dependencies into an http.Handler.
@@ -168,6 +179,18 @@ func (s *Server) routes() {
 				// FEAT-003: file upload.
 				if s.deps.Datasets != nil && s.deps.Objects != nil {
 					RegisterUploadRoutes(r, s.deps.Workspaces, s.deps.Datasets, s.deps.Objects, s.cfg.MaxUploadBytes, s.logger)
+				}
+
+				// FEAT-049: pre-upload duplicate-filename check. screens/05-file-upload.md.
+				if s.deps.DuplicateCheck != nil {
+					RegisterDuplicateCheckRoute(r, s.deps.Workspaces, s.deps.DuplicateCheck, s.logger)
+				}
+
+				// FEAT-048: single-dataset deletion. screens/04-workspace-home.md's Datasets panel.
+				if s.deps.DatasetsList != nil && s.deps.DatasetColumns != nil &&
+					s.deps.DatasetRelationships != nil && s.deps.DatasetObjects != nil && s.deps.DatasetDeletionAudit != nil {
+					RegisterDatasetRoutes(r, s.deps.Workspaces, s.deps.DatasetsList, s.deps.DatasetColumns,
+						s.deps.DatasetRelationships, s.deps.DatasetObjects, s.deps.DatasetDeletionAudit, s.logger)
 				}
 
 				// FEAT-042: visible model-egress / audit log.

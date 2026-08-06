@@ -93,6 +93,57 @@ func (r *RelationshipRepository) GetByIDForWorkspace(ctx context.Context, id, wo
 	return rel, nil
 }
 
+// DatasetRelationship is a confirmed relationship annotated with its source/target column names, for
+// FEAT-048's delete-confirmation disclosure — naming what a dataset deletion would take with it is
+// the explicit acceptance criterion, not merely a count.
+type DatasetRelationship struct {
+	domain.Relationship
+	SourceColumnName string
+	TargetColumnName string
+}
+
+// ListByDatasetColumns returns every confirmed relationship in workspaceID whose source OR target
+// column belongs to datasetID, annotated with both columns' names.
+//
+// FEAT-048's delete confirmation must name any dependent Relationship before the user commits, rather
+// than silently orphaning it once the CASCADE (migration 00001) removes the columns it points to —
+// this is the read that powers that disclosure. Ordered by confirmed_at DESC to match
+// ListByWorkspace's convention.
+func (r *RelationshipRepository) ListByDatasetColumns(ctx context.Context, workspaceID, datasetID string) ([]DatasetRelationship, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT rel.id, rel.workspace_id, rel.source_column_id, rel.target_column_id,
+		       rel.cardinality, rel.grain_notes, rel.confirmed_at, sc.name, tc.name
+		FROM relationships rel
+		JOIN columns sc ON sc.id = rel.source_column_id
+		JOIN columns tc ON tc.id = rel.target_column_id
+		WHERE rel.workspace_id = $1 AND (sc.dataset_id = $2 OR tc.dataset_id = $2)
+		ORDER BY rel.confirmed_at DESC`,
+		workspaceID, datasetID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("listing dataset relationships: %w", err)
+	}
+	defer rows.Close()
+
+	var out []DatasetRelationship
+	for rows.Next() {
+		var (
+			dr          DatasetRelationship
+			cardinality string
+		)
+		if err := rows.Scan(&dr.ID, &dr.WorkspaceID, &dr.SourceColumnID, &dr.TargetColumnID,
+			&cardinality, &dr.GrainNotes, &dr.ConfirmedAt, &dr.SourceColumnName, &dr.TargetColumnName); err != nil {
+			return nil, fmt.Errorf("scanning dataset relationship: %w", err)
+		}
+		dr.Cardinality = domain.Cardinality(cardinality)
+		out = append(out, dr)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating dataset relationships: %w", err)
+	}
+	return out, nil
+}
+
 // Update overrides a confirmed relationship's cardinality and grain notes per FEAT-019's Edit action
 // on screens/15-semantic-layer.md's Relationships tab. Per that screen's edge case, editing a
 // relationship does not retroactively alter an in-progress run's already-generated SQL — it only

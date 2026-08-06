@@ -218,6 +218,22 @@ func (r *DatasetRepository) CompleteIngest(ctx context.Context, id string) error
 	return nil
 }
 
+// DeleteByID removes the dataset row at id.
+//
+// FEAT-048 (Single-Dataset Deletion): every FK from columns/candidate_joins/relationships down to this
+// row is ON DELETE CASCADE (migration 00001), so this single statement is the whole database half of
+// the deletion — Column, CandidateJoin, and Relationship rows referencing this dataset's columns are
+// removed automatically. Object storage does NOT cascade (see storage.Client.DeleteObject's doc
+// comment); callers of this method are responsible for deleting this dataset's objects separately,
+// and MUST do so, since this method alone leaves them orphaned.
+func (r *DatasetRepository) DeleteByID(ctx context.Context, id string) error {
+	_, err := r.pool.Exec(ctx, `DELETE FROM datasets WHERE id = $1`, id)
+	if err != nil {
+		return fmt.Errorf("deleting dataset: %w", err)
+	}
+	return nil
+}
+
 // MarkFailed records a specific, actionable ingest failure reason and moves the dataset to its
 // terminal "failed" state — FEAT-004's acceptance criterion "Ingest failure surfaces a specific,
 // actionable error."

@@ -112,18 +112,22 @@ func toPublicRelationship(rel domain.Relationship) publicRelationship {
 }
 
 // publicConfirmationColumn is one column as shown on screens/07's Type/PII review tables — the
-// existing publicColumn (profiling.go) plus the owning dataset's filename, since the confirmation
-// screen reviews every column across an entire ingest batch (potentially several files) at once and
-// needs to label which file each column belongs to.
+// existing publicColumn (profiling.go) plus the owning dataset's filename AND created_at, since the
+// confirmation screen reviews every column across an entire ingest batch (potentially several files)
+// at once and MUST group by source dataset, per that screen's hard requirement: two datasets sharing
+// an original_filename (FEAT-049's "Keep both" outcome) are indistinguishable by filename alone, and
+// a real incident produced exactly that — 4 duplicate datasets' 16 identical columns rendered as an
+// undifferentiated, unlabeled repeating list. DatasetCreatedAt is what disambiguates them.
 type publicConfirmationColumn struct {
-	ID              string  `json:"id"`
-	DatasetID       string  `json:"dataset_id"`
-	DatasetFilename string  `json:"dataset_filename"`
-	Name            string  `json:"name"`
-	InferredType    string  `json:"inferred_type"`
-	TypeConfidence  float64 `json:"type_confidence"`
-	PIIFlag         bool    `json:"pii_flag"`
-	PIIPattern      string  `json:"pii_pattern,omitempty"`
+	ID               string  `json:"id"`
+	DatasetID        string  `json:"dataset_id"`
+	DatasetFilename  string  `json:"dataset_filename"`
+	DatasetCreatedAt string  `json:"dataset_created_at"`
+	Name             string  `json:"name"`
+	InferredType     string  `json:"inferred_type"`
+	TypeConfidence   float64 `json:"type_confidence"`
+	PIIFlag          bool    `json:"pii_flag"`
+	PIIPattern       string  `json:"pii_pattern,omitempty"`
 	// PIIReviewedAt is RFC 3339, or "" when no user has ever reviewed this column's flag — the
 	// distinction FEAT-007 requires between reviewed-and-cleared and never-flagged.
 	PIIReviewedAt     string  `json:"pii_reviewed_at,omitempty"`
@@ -158,8 +162,10 @@ func handleListWorkspaceColumns(workspaces WorkspaceStore, datasets Confirmation
 			return
 		}
 		filenameByDatasetID := make(map[string]string, len(dsList))
+		createdAtByDatasetID := make(map[string]string, len(dsList))
 		for _, ds := range dsList {
 			filenameByDatasetID[ds.ID] = ds.OriginalFilename
+			createdAtByDatasetID[ds.ID] = ds.CreatedAt.Format(time.RFC3339)
 		}
 
 		cols, err := columns.ListByWorkspace(r.Context(), workspaceID)
@@ -178,6 +184,7 @@ func handleListWorkspaceColumns(workspaces WorkspaceStore, datasets Confirmation
 				ID:                c.ID,
 				DatasetID:         c.DatasetID,
 				DatasetFilename:   filenameByDatasetID[c.DatasetID],
+				DatasetCreatedAt:  createdAtByDatasetID[c.DatasetID],
 				Name:              c.Name,
 				InferredType:      string(c.InferredType),
 				TypeConfidence:    c.TypeConfidence,

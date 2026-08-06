@@ -42,7 +42,14 @@ var extensionFormats = map[string]domain.DatasetFormat{
 	".db":      domain.FormatSQLite,
 }
 
-// RegisterUploadRoutes wires FEAT-003's endpoint onto r.
+// DuplicateCheckStore is the persistence seam FEAT-049's collision check depends on, satisfied by
+// internal/store/postgres.DatasetRepository.
+type DuplicateCheckStore interface {
+	ListByWorkspace(ctx context.Context, workspaceID string) ([]domain.Dataset, error)
+}
+
+// RegisterUploadRoutes wires FEAT-003's endpoint onto r, plus FEAT-049's pre-upload filename
+// collision check.
 func RegisterUploadRoutes(
 	r chi.Router,
 	workspaces WorkspaceStore,
@@ -52,6 +59,74 @@ func RegisterUploadRoutes(
 	logger *slog.Logger,
 ) {
 	r.Post("/workspaces/{workspaceId}/files", handleUploadFiles(workspaces, datasets, objects, maxUploadBytes, logger))
+}
+
+// RegisterDuplicateCheckRoute wires FEAT-049's GET /v1/workspaces/:id/files?filename= onto r.
+//
+// Separate registration function from RegisterUploadRoutes (rather than folding straight in) because
+// this route depends on DuplicateCheckStore — a ListByWorkspace-shaped seam distinct from
+// DatasetStore's Create-only shape above — and api.go wires dependencies feature-by-feature; see that
+// file's Dependencies doc comment for why these seams stay narrow and separate even when one
+// DatasetRepository instance satisfies all of them.
+func RegisterDuplicateCheckRoute(r chi.Router, workspaces WorkspaceStore, datasets DuplicateCheckStore, logger *slog.Logger) {
+	r.Get("/workspaces/{workspaceId}/files", handleCheckFilename(workspaces, datasets, logger))
+}
+
+// duplicateCheckResponse is screens/05-file-upload.md's Duplicate Filename dialog's data source: does
+// a dataset with this exact original_filename already exist in the workspace, and if so, which one.
+type duplicateCheckResponse struct {
+	Exists  bool                  `json:"exists"`
+	Dataset *publicDatasetSummary `json:"dataset,omitempty"`
+}
+
+// handleCheckFilename serves GET /v1/workspaces/:id/files?filename= — FEAT-049's pre-upload
+// collision check. Matches on EXACT original_filename, regardless of ingest_status (explicitly
+// including "failed" — features.md's description names this as the retry case that caused the
+// incident this feature exists to prevent), against every dataset currently in the workspace. Only
+// the single most-recently created match is returned: ListByWorkspace orders most-recent first, and
+// the dialog only ever needs to know "does a collision exist" plus which one Replace would remove —
+// if "Keep both" has already produced more than one same-named dataset, the newest one is what a
+// third upload of the same name would be colliding with next.
+func handleCheckFilename(workspaces WorkspaceStore, datasets DuplicateCheckStore, logger *slog.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		claims, ok := requireClaims(w, r)
+		if !ok {
+			return
+		}
+		workspaceID := chi.URLParam(r, "workspaceId")
+		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+			return
+		}
+
+		filename := r.URL.Query().Get("filename")
+		if filename == "" {
+			respondJSON(w, http.StatusBadRequest, map[string]string{
+				"error": "filename query parameter is required.",
+				"code":  "validation_error",
+			})
+			return
+		}
+
+		found, err := datasets.ListByWorkspace(r.Context(), workspaceID)
+		if err != nil {
+			logger.Error("listing datasets for duplicate check", slog.String("error", err.Error()))
+			respondJSON(w, http.StatusInternalServerError, map[string]string{
+				"error": "Something went wrong. Try again.",
+				"code":  "internal_error",
+			})
+			return
+		}
+
+		for _, ds := range found {
+			if ds.OriginalFilename == filename {
+				summary := toPublicDatasetSummary(ds)
+				respondJSON(w, http.StatusOK, duplicateCheckResponse{Exists: true, Dataset: &summary})
+				return
+			}
+		}
+
+		respondJSON(w, http.StatusOK, duplicateCheckResponse{Exists: false})
+	}
 }
 
 type uploadedFileResult struct {

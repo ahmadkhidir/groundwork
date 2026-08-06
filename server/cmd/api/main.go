@@ -136,6 +136,16 @@ func run(logger *slog.Logger) error {
 		SemanticMetrics:       metricDefinitionRepo,
 		SemanticCorrections:   correctionRepo,
 		SemanticSummary:       semanticSummaryRepo,
+
+		// FEAT-048 (single-dataset deletion) and FEAT-049 (duplicate-filename detection). Same
+		// datasetRepo/relationshipRepo/objectStore/auditWriter instances as above, satisfying the
+		// further narrow seams datasets.go and upload.go declare — see api.Dependencies' doc comment.
+		DatasetsList:         datasetRepo,
+		DatasetColumns:       columnRepo,
+		DatasetRelationships: relationshipRepo,
+		DatasetObjects:       objectStore,
+		DatasetDeletionAudit: auditWriter,
+		DuplicateCheck:       datasetRepo,
 	}
 
 	server := &http.Server{

@@ -28,6 +28,7 @@ function column(overrides: Partial<ConfirmationColumn> = {}): ConfirmationColumn
     id: "col-1",
     dataset_id: "ds-1",
     dataset_filename: "customers.csv",
+    dataset_created_at: "2026-08-05T14:00:00Z",
     name: "customer_id",
     inferred_type: "integer",
     type_confidence: 0.92,
@@ -53,10 +54,14 @@ function join(overrides: Partial<ConfirmationCandidateJoin> = {}): ConfirmationC
   };
 }
 
-function mockLoad(columns: ConfirmationColumn[], joins: ConfirmationCandidateJoin[] = []) {
+function mockLoad(
+  columns: ConfirmationColumn[],
+  joins: ConfirmationCandidateJoin[] = [],
+  skippedPairs: Array<{ filename: string; datasets: Array<{ id: string; created_at: string }> }> = [],
+) {
   getMock.mockImplementation((path: string) => {
     if (path.includes("/candidate-joins")) {
-      return Promise.resolve({ candidate_joins: joins });
+      return Promise.resolve({ candidate_joins: joins, skipped_pairs: skippedPairs });
     }
     return Promise.resolve({ columns });
   });
@@ -119,6 +124,38 @@ describe("IngestConfirmationScreen", () => {
 
     await userEvent.click(screen.getByRole("tab", { name: /Relationships/ }));
     expect(screen.getByText("No relationships found")).toBeInTheDocument();
+  });
+
+  // FEAT-008/FEAT-049: two datasets sharing an original_filename (the "Keep both" outcome) are never
+  // compared by relationship inference — this must be named on screen, not left as an unexplained
+  // absence of candidates, which is exactly what the real incident's screen looked like before this.
+  it("names the skipped filename pair on the Relationships step, with a pointer to add one manually", async () => {
+    mockLoad(
+      [
+        column({ id: "col-1", dataset_id: "ds-a", dataset_filename: "customers.csv" }),
+        column({ id: "col-2", dataset_id: "ds-b", dataset_filename: "customers.csv" }),
+      ],
+      [],
+      [
+        {
+          filename: "customers.csv",
+          datasets: [
+            { id: "ds-a", created_at: "2026-08-05T14:00:00Z" },
+            { id: "ds-b", created_at: "2026-08-06T09:00:00Z" },
+          ],
+        },
+      ],
+    );
+    render(<IngestConfirmationScreen workspaceId="ws-1" />);
+    await waitFor(() => expect(screen.getByText("Confirm your data")).toBeInTheDocument());
+
+    await userEvent.click(screen.getByRole("tab", { name: /Relationships/ }));
+
+    expect(screen.getByText(/2 files named "customers\.csv"/)).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /add a relationship manually/i })).toHaveAttribute(
+      "href",
+      "/workspaces/ws-1/semantic-layer",
+    );
   });
 
   // Every review step renders BOTH a mobile list and a desktop table (toggled purely via CSS media

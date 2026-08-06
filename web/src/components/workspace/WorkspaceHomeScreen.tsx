@@ -11,6 +11,7 @@ import { Skeleton } from "@/components/shared/Skeleton";
 import { AskPanel } from "./AskPanel";
 import { RecentReportsPanel } from "./RecentReportsPanel";
 import { SemanticLayerSummaryPanel } from "./SemanticLayerSummaryPanel";
+import { DatasetsPanel } from "./DatasetsPanel";
 import { api, ApiError } from "@/lib/api-client";
 import { routes } from "@/lib/routes";
 import type { Workspace } from "@/types/schema";
@@ -189,8 +190,28 @@ export function WorkspaceHomeScreen({ workspaceId }: WorkspaceHomeScreenProps) {
           <h2 className="mb-2 text-h3 text-text-primary">Recent reports</h2>
           <RecentReportsPanel />
         </div>
-        <div className="hidden lg:block">
+        <div className="hidden flex-col gap-6 lg:flex">
           <SemanticLayerSummaryPanel workspaceId={workspaceId} />
+          {/* Datasets panel (FEAT-048): filename, upload time, row count, per-row delete. Shown once
+              the workspace has data — before that, there is nothing to list and the Empty (no data)
+              state above already covers the same message. */}
+          {workspace?.has_datasets && (
+            <DatasetsPanel
+              workspaceId={workspaceId}
+              onDatasetDeleted={(remainingCount) => {
+                // screens/04's Data Flow step 6: deleting the workspace's last remaining dataset
+                // reverts has_datasets, which in turn brings back the Empty (no data) state and the
+                // Upload CTA — updated locally rather than waiting for the next poll.
+                if (remainingCount === 0) {
+                  setState((current) =>
+                    current.status === "loaded"
+                      ? { ...current, workspace: { ...current.workspace, has_datasets: false } }
+                      : current,
+                  );
+                }
+              }}
+            />
+          )}
         </div>
       </div>
     </main>

@@ -355,7 +355,7 @@ loaded via `next/font` and bound to `--font-display`, `--font-body`, `--font-mon
 | Phase | Features | Status |
 |---|---|---|
 | **A — Foundation** | Scaffold, theme tokens, schema entities, auth, routing skeleton, docker-compose | **Complete** |
-| **1 — Foundation: Workspace, Ingest & Trust** | FEAT-001 ✅ 002 ✅ 003 ✅ 004 ✅ 005 ✅ 006 ✅ 007 ✅ 008 ✅ 009 ✅ 011 ✅ 042 ✅ 044 ✅ **048 ⬜ 049 ⬜** | **Reopened** — was complete after 5 waves; FEAT-048/049 added to Phase 1 by docs `ff8d5b2` (see below) |
+| **1 — Foundation: Workspace, Ingest & Trust** | FEAT-001 ✅ 002 ✅ 003 ✅ 004 ✅ 005 ✅ 006 ✅ 007 ✅ 008 ✅ 009 ✅ 011 ✅ 042 ✅ 044 ✅ 048 ✅ 049 ✅ | **Complete** — reopened for FEAT-048/049 by docs `ff8d5b2` (2026-08-06) and closed by this wave; see below |
 | **2 — Core Grounded Answer Loop** | FEAT-013, 014, 015, 016, 017, 018, 019 ✅, 020 | In progress — FEAT-019 landed this wave |
 | **3 — Trust & Observability** | FEAT-022, 023, 024, 027, 028, 029, 030 | Not started |
 | **4 — Reports & Delivery** | FEAT-034, 035, 036, 041, 043 | Not started |
@@ -369,9 +369,13 @@ loaded via `next/font` and bound to `--font-display`, `--font-body`, `--font-mon
 > dispatch) — see the "FEAT-019 — Semantic Layer Storage" note below for what shipped and what it
 > deliberately left for FEAT-013/FEAT-020.
 
-### Phase 1 reopened for FEAT-048 / FEAT-049 (docs `ff8d5b2`, user-approved 2026-08-06)
+### Phase 1 reopened for FEAT-048 / FEAT-049 (docs `ff8d5b2`, user-approved 2026-08-06) — CLOSED
 
-Phase 1 was complete and is now reopened with two P0 features. Neither is implemented.
+Phase 1 was reopened with two P0 features (FEAT-048 Single-Dataset Deletion, FEAT-049 Duplicate
+Filename Detection & Resolution at Upload), plus a same-filename exclusion added to FEAT-008. Both
+are implemented and Phase 1 is closed. Verification: server `go vet` + `go test` (fresh) + `gofmt`
+clean, web `tsc --noEmit` + `vitest` 138/138 + `eslint` (0 warnings) + `next build` all green. This
+is the pass that delivered the reopening.
 
 The docs never said what happens when a file is uploaded to a workspace that already contains one.
 A user hit it: an ingest-progress bug (now fixed, `ef02198`) reported failure for uploads that had
@@ -396,6 +400,67 @@ had to be destroyed by hand, against Postgres and MinIO directly.
 
 Screens 04 (new Datasets panel), 05 (duplicate dialog), and 07 (per-dataset grouping, skip notice)
 were built against the older spec and are now behind it.
+
+**What shipped this wave (all against docs `ff8d5b2`):**
+
+- **FEAT-048 — `server/internal/api/datasets.go`** (new): `GET /v1/workspaces/:id/datasets`,
+  `GET .../datasets/:id/deletion-impact`, `DELETE .../datasets/:id`, plus the exported
+  `DeleteDatasetAndObjects` used directly by FEAT-049's Replace path. Deletion order is deliberate
+  and tested: **object storage first, DB row second, audit entry third** — a storage failure leaves
+  the dataset intact and retryable. Both objects (original + normalized Parquet, when one exists)
+  are removed by explicit `storage.Client.DeleteObject` calls; the FK cascade (`migration 00001`)
+  handles the DB half. `audit.Writer.WriteDeletion` records `action_type: deletion` per FEAT-042.
+  Deletion impact names dependent Relationships via `RelationshipRepository.ListByDatasetColumns`.
+- **FEAT-048 — `web/src/components/workspace/DatasetsPanel.tsx`** (new) on Workspace Home: lists
+  filename / `created_at` / row count / `ingest_status`, per-row delete, `readOnly` hides the
+  delete action (FEAT-045), and the shared `DeleteConfirmationModal` (new,
+  `web/src/components/shared/DeleteConfirmationModal.tsx`) states the explicit scope + the
+  review-work-lost warning before commit. Deleting the workspace's last dataset reverts
+  `has_datasets` locally (screens/04 Data Flow step 6).
+- **FEAT-049 — `GET /v1/workspaces/:id/files?filename=`** (`upload.go`'s
+  `RegisterDuplicateCheckRoute`): exact `original_filename` match against every dataset, any
+  `ingest_status` including `failed`. Client flow (`web/src/components/upload/`): every selected
+  file passes `checkDuplicateFilename` → "checking-duplicate" / "duplicate" row states; a collision
+  opens `DuplicateFilenameDialog` (Replace pre-selected, never auto-applied; Keep both leaves the
+  prior dataset untouched); Replace calls the FEAT-048 DELETE first, then uploads fresh; Start
+  Ingest stays disabled until every collision resolves.
+- **FEAT-008 — same-filename exclusion in `internal/ingest/pipeline.go`**: two datasets sharing an
+  `original_filename` are never compared (unconditional — closes the 216-candidate-join incident
+  mechanism). The skip is surfaced on Ingest Confirmation's Relationships step as a
+  `skipped_pairs` notice (`profiling.go` `computeSkippedFilenamePairs` computed at read time, not
+  persisted), naming the pair by filename + `created_at`, with a pointer to the Semantic Layer.
+- **screens/07 — per-dataset grouping**: Types and Sensitive Columns tables now always group by
+  source dataset with a sticky sub-header naming `original_filename` + `created_at`
+  (`groupColumnsByDataset` / `datasetGroupLabel` in `confirmation/types.ts`), so two "Keep both"
+  datasets sharing a name are never an undifferentiated flat list — the exact incident failure mode.
+- **Tests**: `datasets_test.go` (ownership boundary, impact disclosure naming relationships +
+  reviewed-PII, both-object deletion, failed-dataset duplicate detection, storage-failure abort
+  ordering, cross-workspace rejection), `profiling_test.go` (skipped pairs), `pipeline_test.go`
+  (same-filename pair never produces a join even with identical content), `DatasetsPanel.test.tsx`
+  (6 cases incl. read-only + inline error retry), `UploadScreen.test.tsx` (dialog auto-shows,
+  failed-dataset retry, Replace deletes via FEAT-048), `IngestConfirmationScreen.test.tsx` (skip
+  notice + manual-add link).
+
+**Reported doc/architecture ambiguities from this wave (routed to product-shaper, not fixed):**
+
+1. **`Column.type_overridden_at` does not exist in schema.md.** FEAT-048 requires the confirmation to
+   state when a dataset "has any columns carrying a type override," but `Column`'s only type field is
+   `inferred_type`, overwritten in place by a FEAT-006 override — indistinguishable from the original
+   profile. `deletion-impact` therefore returns `has_type_override_risk: true` whenever a dataset has
+   any columns (deliberate over-disclosure, documented in `datasets.go`; a false negative would
+   violate the acceptance criterion outright). A `type_overridden_at` field would make it exact.
+2. **Datasets panel platform scope.** `screens/04`'s Components table says "Both (collapsible on
+   mobile)" but its mobile Layout section does not list the panel; the implementation shows it in the
+   web two-column layout only. Not built on mobile; needs a doc decision.
+3. **Duplicate detection is client-flow only on the upload path.** The required resolution prompt is
+   inherently UI, and the docs' defense-in-depth is the server-side FEAT-008 exclusion (a bypassed
+   prompt still cannot produce same-filename candidate joins, and FEAT-048 cleans up any duplicate
+   that slips through). Unlike the size ceiling, the docs do not mandate a second server-side
+   duplicate control; noted rather than invented.
+
+**Environment note:** `server/Makefile`'s `fmt`/`doctor` recipes use POSIX shell syntax; on Windows
+`make check` fails at the `fmt` step under cmd (`'out' is not recognized`). Run `make vet` + `make
+test` and check `gofmt -l .` manually instead. Pre-existing, not introduced by this wave.
 
 ### Phase 2 boundary assumptions (user-approved 2026-08-05)
 
@@ -458,6 +523,7 @@ item is **closed** by Wave 5: PII detection is real (`internal/pii`).
 
 | Item | Detail | Owner |
 |---|---|---|
+| **FEAT-048 deletion-impact cannot distinguish a type override from the original profile — `Column` has no `type_overridden_at`** | `deletion-impact` returns `has_type_override_risk: true` for any dataset with columns (deliberate over-disclosure, never a false negative). An exact answer needs a `Column.type_overridden_at` field (paired with `pii_reviewed_at`'s convention) — a schema/migration decision. | Product |
 | **`type_confidence`'s scoring heuristic is undocumented** | FEAT-008 now specifies the join-confidence bands and the value-overlap-only cap, and declares the weighting implementation-defined — that half is closed. `profiling.go`'s `confidenceBaseByType` still produces `type_confidence` by an undocumented rule, though `features.md` now specifies the HIGH/MEDIUM/LOW bands it is presented through. Lower stakes than the join case, but still a trust-facing number set by implementation. | Product |
 | **FEAT-008's "near-unique" exemption can swallow the cap it sits beside** | The value-overlap-only cap exempts identifier-shaped columns, and `features.md` defines that to include near-unique (≥0.95) columns. A money column with all-distinct values — common in real exports — therefore reads as identifier-shaped and escapes the cap. Observed live: `total` ↔ `amount` at 40 distinct values over 40 rows scored 0.75 with basis "one side is nearly unique, consistent with a key". **No acceptance criterion is violated** (it stayed below HIGH), and the code implements the doc exactly as written rather than narrowing it. If the intent was that a measure-shaped name never escapes on distinctness alone, the rule needs a name-based override. | Product |
 | **FEAT-006's "type corrections... used for all subsequent ingest of the same schema shape" is NOT implemented** | `schema.md`'s `Column` has no field keying a correction to a reusable "schema shape" (e.g. a hash of column names+types), and nothing else in `docs/` defines what a schema shape is. Implemented instead: overriding a column's type persists on that specific column (`PATCH /v1/workspaces/:id/columns/:columnId`), which is everything the schema supports today. A future re-ingest of the same file gets a fresh Column row with the ORIGINAL heuristic type, not the prior correction. Needs a schema-shape-keyed corrections table (+ migration) before this acceptance criterion can be met — route to product-shaper for the data model, since nothing was invented here. | Product |

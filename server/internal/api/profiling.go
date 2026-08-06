@@ -15,8 +15,14 @@ import (
 
 // ProfilingDatasetStore is the seam RegisterProfilingRoutes uses to confirm a dataset belongs to the
 // workspace named in the route, satisfied by internal/store/postgres.DatasetRepository.
+//
+// ListByWorkspace was added for FEAT-008/FEAT-049: handleListCandidateJoins computes the Relationship
+// inference skipped notice (screens/07-ingest-confirmation.md's Relationships step) at READ time, by
+// grouping the workspace's datasets by original_filename, rather than persisting a "skip" row anywhere
+// — no schema.md entity models it, and nothing else needs it stored.
 type ProfilingDatasetStore interface {
 	GetByID(ctx context.Context, id string) (domain.Dataset, error)
+	ListByWorkspace(ctx context.Context, workspaceID string) ([]domain.Dataset, error)
 }
 
 // ProfilingColumnStore is the persistence seam for reading profiled columns (FEAT-005), satisfied by
@@ -37,7 +43,7 @@ type ProfilingCandidateJoinStore interface {
 // computation — both are pure reads served entirely from Postgres.
 func RegisterProfilingRoutes(r chi.Router, workspaces WorkspaceStore, datasets ProfilingDatasetStore, columns ProfilingColumnStore, joins ProfilingCandidateJoinStore, logger *slog.Logger) {
 	r.Get("/workspaces/{workspaceId}/datasets/{datasetId}/columns", handleListColumns(workspaces, datasets, columns, logger))
-	r.Get("/workspaces/{workspaceId}/candidate-joins", handleListCandidateJoins(workspaces, joins, logger))
+	r.Get("/workspaces/{workspaceId}/candidate-joins", handleListCandidateJoins(workspaces, datasets, joins, logger))
 }
 
 type publicColumn struct {
@@ -157,8 +163,56 @@ func toPublicCandidateJoin(cj domain.CandidateJoin) publicCandidateJoin {
 	}
 }
 
-// handleListCandidateJoins serves FEAT-008's GET /api/workspaces/:id/candidate-joins.
-func handleListCandidateJoins(workspaces WorkspaceStore, joins ProfilingCandidateJoinStore, logger *slog.Logger) http.HandlerFunc {
+// skippedDatasetRef names one dataset in a Relationship inference skipped notice pair.
+type skippedDatasetRef struct {
+	ID        string `json:"id"`
+	CreatedAt string `json:"created_at"`
+}
+
+// skippedFilenamePair is one entry in the Relationship inference skipped notice
+// (screens/07-ingest-confirmation.md's Relationships step), per FEAT-008/FEAT-049: two or more
+// datasets sharing an original_filename are never compared, and that skip must be named rather than
+// left as an unexplained absence of candidates.
+type skippedFilenamePair struct {
+	Filename string              `json:"filename"`
+	Datasets []skippedDatasetRef `json:"datasets"`
+}
+
+// computeSkippedFilenamePairs groups datasets by original_filename and returns one entry per group of
+// 2 or more — the exact set of pairs FEAT-008's exclusion applied to in internal/ingest.Pipeline.
+// Computed at read time from the current dataset list rather than persisted anywhere: no schema.md
+// entity models a "skip," and grouping the already-fetched list is cheap and always current, unlike a
+// stored record that could drift from which datasets actually still exist.
+func computeSkippedFilenamePairs(datasets []domain.Dataset) []skippedFilenamePair {
+	byFilename := make(map[string][]domain.Dataset)
+	var order []string
+	for _, ds := range datasets {
+		if _, seen := byFilename[ds.OriginalFilename]; !seen {
+			order = append(order, ds.OriginalFilename)
+		}
+		byFilename[ds.OriginalFilename] = append(byFilename[ds.OriginalFilename], ds)
+	}
+
+	out := make([]skippedFilenamePair, 0)
+	for _, filename := range order {
+		group := byFilename[filename]
+		if len(group) < 2 {
+			continue
+		}
+		refs := make([]skippedDatasetRef, 0, len(group))
+		for _, ds := range group {
+			refs = append(refs, skippedDatasetRef{ID: ds.ID, CreatedAt: ds.CreatedAt.Format(time.RFC3339)})
+		}
+		out = append(out, skippedFilenamePair{Filename: filename, Datasets: refs})
+	}
+	return out
+}
+
+// handleListCandidateJoins serves FEAT-008's GET /api/workspaces/:id/candidate-joins, plus
+// FEAT-008/FEAT-049's Relationship inference skipped notice: any 2+ datasets in the workspace sharing
+// an original_filename, which the ingest pipeline never compares against each other (see
+// internal/ingest.Pipeline.inferRelationshipsAndComplete).
+func handleListCandidateJoins(workspaces WorkspaceStore, datasets ProfilingDatasetStore, joins ProfilingCandidateJoinStore, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
@@ -180,10 +234,23 @@ func handleListCandidateJoins(workspaces WorkspaceStore, joins ProfilingCandidat
 			return
 		}
 
+		dsList, err := datasets.ListByWorkspace(r.Context(), workspaceID)
+		if err != nil {
+			logger.Error("listing datasets for skipped-pair notice", slog.String("error", err.Error()))
+			respondJSON(w, http.StatusInternalServerError, map[string]string{
+				"error": "Something went wrong. Try again.",
+				"code":  "internal_error",
+			})
+			return
+		}
+
 		out := make([]publicCandidateJoin, 0, len(found))
 		for _, cj := range found {
 			out = append(out, toPublicCandidateJoin(cj))
 		}
-		respondJSON(w, http.StatusOK, map[string]any{"candidate_joins": out})
+		respondJSON(w, http.StatusOK, map[string]any{
+			"candidate_joins": out,
+			"skipped_pairs":   computeSkippedFilenamePairs(dsList),
+		})
 	}
 }

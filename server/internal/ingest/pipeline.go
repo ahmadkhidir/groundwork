@@ -306,9 +306,21 @@ func (p *Pipeline) inferRelationshipsAndComplete(ctx context.Context, handle eng
 
 	var completedSiblings []domain.Dataset
 	for _, sib := range siblings {
-		if sib.ID != ds.ID && sib.IngestStatus == domain.IngestComplete {
-			completedSiblings = append(completedSiblings, sib)
+		if sib.ID == ds.ID || sib.IngestStatus != domain.IngestComplete {
+			continue
 		}
+		// FEAT-008: two datasets sharing an original_filename are NEVER compared — unconditionally,
+		// regardless of whether they arrived via FEAT-049's "Keep both" or (in a race/retry edge case)
+		// a Replace still mid-flight. This is the defense-in-depth exclusion features.md's description
+		// calls out as the direct mechanical fix for the real incident where 4 same-named copies of one
+		// file produced 216 candidate joins comparing every copy against every other. The skip itself is
+		// surfaced to the user on screens/07-ingest-confirmation.md's Relationships step, computed at
+		// read time from the dataset list rather than persisted here — see profiling.go's
+		// handleListCandidateJoins.
+		if sib.OriginalFilename == ds.OriginalFilename {
+			continue
+		}
+		completedSiblings = append(completedSiblings, sib)
 	}
 
 	if len(completedSiblings) > 0 {

@@ -19,6 +19,7 @@ import {
   type ConfirmationStep,
   type ListCandidateJoinsResponse,
   type ListColumnsResponse,
+  type SkippedFilenamePair,
   type UpdateCandidateJoinResponse,
   type UpdateColumnResponse,
 } from "./types";
@@ -30,7 +31,12 @@ export interface IngestConfirmationScreenProps {
 type ScreenState =
   | { status: "loading" }
   | { status: "error"; message: string }
-  | { status: "loaded"; columns: ConfirmationColumn[]; joins: ConfirmationCandidateJoin[] };
+  | {
+      status: "loaded";
+      columns: ConfirmationColumn[];
+      joins: ConfirmationCandidateJoin[];
+      skippedPairs: SkippedFilenamePair[];
+    };
 
 /**
  * Screen 7: Ingest Confirmation (screens/07-ingest-confirmation.md) — FEAT-006 (type review),
@@ -64,6 +70,7 @@ export function IngestConfirmationScreen({ workspaceId }: IngestConfirmationScre
         status: "loaded",
         columns: columnsRes.columns ?? [],
         joins: joinsRes.candidate_joins ?? [],
+        skippedPairs: joinsRes.skipped_pairs ?? [],
       });
     } catch (error) {
       const message = error instanceof ApiError ? error.message : "Something went wrong. Try again.";
@@ -309,11 +316,13 @@ export function IngestConfirmationScreen({ workspaceId }: IngestConfirmationScre
           )}
           {activeStep === "relationships" && (
             <JoinReviewStep
+              workspaceId={workspaceId}
               joins={state.joins}
               columnsById={columnsById}
               savingIds={savingIds}
               errors={rowErrors}
               onDecide={handleDecideJoin}
+              skippedPairs={state.skippedPairs}
             />
           )}
         </div>
