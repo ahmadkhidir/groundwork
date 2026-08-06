@@ -14,7 +14,10 @@ export interface ReconciliationNoticeProps {
  * exclusion warnings the pipeline recorded.
  */
 export function ReconciliationNotice({ summary }: ReconciliationNoticeProps) {
-  const hasWarnings = summary.exclusion_warnings.length > 0;
+  // Tolerate a null/absent list from the API (a nil slice once marshalled to JSON `null`) rather
+  // than crashing the render — the honest-status notice must never take the Report View down.
+  const warnings = summary.exclusion_warnings ?? [];
+  const hasWarnings = warnings.length > 0;
   const rowsDropped = summary.rows_out < summary.rows_in;
 
   // Neither a dropped count nor a warning → nothing to disclose. The doc's "Loaded (no notice)"
@@ -36,7 +39,7 @@ export function ReconciliationNotice({ summary }: ReconciliationNoticeProps) {
         </p>
       )}
       {hasWarnings &&
-        summary.exclusion_warnings.map((warning) => (
+        warnings.map((warning) => (
           <p key={warning} className="mt-1 text-text-secondary">
             {warning}
           </p>

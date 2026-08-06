@@ -39,4 +39,22 @@ describe("ReconciliationNotice", () => {
       screen.getByText("excluded 31% of rows where region was null"),
     ).toBeInTheDocument();
   });
+
+  it("tolerates a null warnings list from the API without crashing (regression)", () => {
+    // A nil Go slice marshals to JSON `null`; the render must treat it as "no warnings". This is
+    // the exact shape that previously threw console "Cannot read properties of null".
+    render(
+      <ReconciliationNotice
+        summary={{
+          rows_in: 1_000,
+          rows_out: 690,
+          exclusion_warnings: null as unknown as string[],
+        }}
+      />,
+    );
+    expect(screen.getByText("Reconciliation note")).toBeInTheDocument();
+    expect(
+      screen.getByText(/covers 690 of 1,000 rows read\./),
+    ).toBeInTheDocument();
+  });
 });

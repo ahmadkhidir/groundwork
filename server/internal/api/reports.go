@@ -60,6 +60,16 @@ func handleGetReport(workspaces WorkspaceStore, reports ReportStore, logger *slo
 			return
 		}
 
+		// Schema.md documents every array on the Report as a non-null `string[]`. A nil Go slice
+		// would marshal to JSON `null` and break clients that trust the type, so normalize to the
+		// documented shape before it leaves the boundary (see run.go building these as nil).
+		if report.ReconciliationSummary.ExclusionWarnings == nil {
+			report.ReconciliationSummary.ExclusionWarnings = []string{}
+		}
+		if report.ProvenanceLinks == nil {
+			report.ProvenanceLinks = []string{}
+		}
+
 		respondJSON(w, http.StatusOK, map[string]any{"report": report})
 	}
 }

@@ -170,6 +170,56 @@ func TestGetReportSucceeds(t *testing.T) {
 	}
 }
 
+// TestGetReportNormalizesNilSlices pins the wire contract that caused a production client crash:
+// a stored report whose reconciliation summary carries a nil ExclusionWarnings slice (Go marshals
+// nil as JSON `null`) must be emitted as `[]`, because schema.md documents the field as string[] and
+// the Report View does `summary.exclusion_warnings.length` at render time.
+func TestGetReportNormalizesNilSlices(t *testing.T) {
+	server, workspaces, reports := newReportsTestServer(t)
+	workspaces.byID["ws-1"] = domain.Workspace{ID: "ws-1", OwnerID: "user-1"}
+
+	// Deliberately leave ExclusionWarnings and ProvenanceLinks nil — exactly the shape the run
+	// pipeline produces when nothing was excluded and no provenance links were materialized.
+	reports.reports["report-1"] = domain.Report{
+		ID:          "report-1",
+		WorkspaceID: "ws-1",
+		RunID:       "run-1",
+		Title:       "Total transactions",
+		Narrative:   "One row.",
+		ReconciliationSummary: domain.ReconciliationSummary{
+			RowsIn:  1000,
+			RowsOut: 1,
+		},
+	}
+
+	req := authedRequest(t, http.MethodGet, "/v1/workspaces/ws-1/reports/report-1", nil, "user-1", domain.TierFree)
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var body struct {
+		Report struct {
+			ProvenanceLinks       []string `json:"provenance_links"`
+			ReconciliationSummary struct {
+				ExclusionWarnings []string `json:"exclusion_warnings"`
+			} `json:"reconciliation_summary"`
+		} `json:"report"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decoding body: %v", err)
+	}
+
+	if body.Report.ReconciliationSummary.ExclusionWarnings == nil {
+		t.Error("exclusion_warnings is null, want an empty array (client renders .length on it)")
+	}
+	if body.Report.ProvenanceLinks == nil {
+		t.Error("provenance_links is null, want an empty array")
+	}
+}
+
 func TestGetReportReturnsNotFoundForUnknownReport(t *testing.T) {
 	server, workspaces, _ := newReportsTestServer(t)
 	workspaces.byID["ws-1"] = domain.Workspace{ID: "ws-1", OwnerID: "user-1"}
