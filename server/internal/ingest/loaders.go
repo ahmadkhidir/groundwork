@@ -257,19 +257,27 @@ func cellString(v any) string {
 // ignore_errors, range, sheet, empty_as_varchar, normalize_names), so the detection window cannot
 // simply be widened.
 //
-// `ignore_errors=true` is NOT the fix, though it makes the error disappear: it nulls the offending
-// cell. Verified against the reproduction above — the account number becomes NULL and the column
-// stays DOUBLE, so the user silently loses exactly the value that made their data interesting. Silent
-// wrongness is the one failure mode this product exists to prevent (see README's differentiator);
-// a loud failure is strictly better, and a correct read is better still.
+// The file's own cell formats are the metadata that matters, and they must survive the fallback. An
+// .xlsx date column stores Excel serials (43341) but marks every cell with a date format (d-mmm-yy);
+// read_xlsx honours that and returns a real DATE column — as long as the typed read runs. The all-text
+// fallback cannot see the format, reads "43341" as a string, and types the column as a whole number:
+// the date becomes an integer end to end with no mechanism to know better. That is the failure this
+// function exists to prevent, so the fallback is built to keep the typed read's metadata columns.
 //
-// So: try the typed read first, and fall back only when it fails. The fallback re-reads every cell as
-// text (all_varchar, which cannot fail on a type conflict because it makes no type decision) and then
-// types each column itself, per excelColumnType below.
+// Fallback plan, in order:
 //
-// Ordering matters and is deliberate: the typed read stays the default so a well-formed spreadsheet's
-// dates and numbers keep the types read_xlsx derives from its cell formats. The fallback only ever
-// runs where the current behaviour is a hard failure, so it cannot regress a file that works today.
+//  1. The plain typed read stays the default (a well-formed spreadsheet keeps all of read_xlsx's
+//     types, dates included) — it only runs the fallback when it hard-fails.
+//  2. Hybrid read: retry the typed read with `ignore_errors=true`. That read succeeds where the plain
+//     one failed (it NULLs exactly the offending cells) and still applies the file's cell formats, so
+//     date columns come back as real DATEs. Then drop the DATE/TIMESTAMP/BOOLEAN columns whose typed
+//     read dropped no values straight into the Parquet, and build every other column from the all-text
+//     read through the existing excelColumnType round-trip — the mixed-type cell that caused the
+//     failure is one of those, so its text value is preserved rather than nulled. The two reads are
+//     joined by row number; both scan the same file in the same order, and the pairings are verified
+//     by TestNormalizeExcelHybridRead against a real fixture.
+//  3. Text-only fallback: prior behaviour. Only used when the hybrid read itself cannot run (file
+//     unreadable at the sheet level, or a date column whose typed read dropped values).
 func normalizeExcel(ctx context.Context, h execer, sourcePath, parquetPath string) error {
 	typedErr := copyToParquet(ctx, h,
 		fmt.Sprintf("SELECT * FROM read_xlsx(%s)", sqlQuote(sourcePath)),
@@ -278,7 +286,19 @@ func normalizeExcel(ctx context.Context, h execer, sourcePath, parquetPath strin
 		return nil
 	}
 
+	typedRead := fmt.Sprintf("read_xlsx(%s, ignore_errors=true)", sqlQuote(sourcePath))
 	textRead := fmt.Sprintf("read_xlsx(%s, all_varchar=true)", sqlQuote(sourcePath))
+
+	// Prefer the hybrid read; it is the only fallback that preserves the file's date metadata. If its
+	// typed half fails to describe (sheet-level corruption, not a per-cell coercion), or if it finds
+	// nothing worth keeping, fall through to the text-only path rather than failing — the file worked
+	// before the hybrid existed, and it must keep working.
+	typedCols, err := excelColumnTypes(ctx, h, typedRead)
+	if err == nil {
+		if hybridErr := excelHybrid(ctx, h, typedRead, textRead, typedCols, parquetPath); hybridErr == nil {
+			return nil
+		}
+	}
 
 	names, err := excelColumnNames(ctx, h, textRead)
 	if err != nil {
@@ -309,6 +329,173 @@ func normalizeExcel(ctx context.Context, h execer, sourcePath, parquetPath strin
 		return typedErr
 	}
 	return nil
+}
+
+// excelKeepTyped reports whether a DuckDB type from the ignore_errors read is one of the kinds only
+// the file's cell-format metadata produces reliably — the columns the hybrid read sources from the
+// typed read. Numbers are deliberately excluded: read_xlsx reports every numeric column as DOUBLE
+// even when the values are whole integers, and narrowing those to BIGINT is the existing
+// excelColumnType round-trip's job, unchanged.
+func excelKeepTyped(duckType string) bool {
+	upper := strings.ToUpper(duckType)
+	return strings.HasPrefix(upper, "DATE") ||
+		strings.HasPrefix(upper, "TIMESTAMP") ||
+		strings.HasPrefix(upper, "BOOLEAN")
+}
+
+// excelColumnTypes lists column names and DuckDB types from the ignore_errors read, which is what
+// tells the hybrid path which columns the file itself declares as dates (via cell formats).
+func excelColumnTypes(ctx context.Context, h execer, typedRead string) ([]csvColumn, error) {
+	rows, err := h.Query(ctx, fmt.Sprintf("DESCRIBE SELECT * FROM %s", typedRead))
+	if err != nil {
+		return nil, fmt.Errorf("describing Excel columns: %w", err)
+	}
+	defer rows.Close()
+
+	numCols := len(rows.Columns())
+	if numCols == 0 {
+		numCols = 6 // DuckDB's DESCRIBE shape: column_name, column_type, null, key, default, extra
+	}
+	var out []csvColumn
+	for rows.Next() {
+		dest := make([]any, numCols)
+		ptrs := make([]any, numCols)
+		for i := range dest {
+			ptrs[i] = &dest[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return nil, fmt.Errorf("scanning Excel column schema: %w", err)
+		}
+		out = append(out, csvColumn{name: cellString(dest[0]), duckType: cellString(dest[1])})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("reading Excel column schema: %w", err)
+	}
+	return out, nil
+}
+
+// excelHybrid builds the normalized Parquet from the typed (ignore_errors) read and the all-text
+// read joined by row number, taking each column from whichever read is honest for it:
+//
+//   - DATE/TIMESTAMP/BOOLEAN columns that the typed read fully preserved come from the typed read,
+//     so Excel serial dates land as real dates.
+//   - Everything else comes from the text read through excelColumnType's round-trip, exactly as the
+//     text-only fallback does — including the mixed-type columns whose cells the typed read dropped,
+//     so those values survive verbatim.
+//
+// It returns an error (and lets normalizeExcel fall back to the text-only path) when there is no
+// column worth keeping from the typed read — the hybrid's extra complexity buys nothing for a file
+// with no date-typed columns.
+func excelHybrid(ctx context.Context, h execer, typedRead, textRead string, typedCols []csvColumn, parquetPath string) error {
+	// Resolve the keep-typed candidates against the text read's column list. Both reads describe the
+	// same sheet, so the name order is identical; the map lets the projection loop consult by name.
+	textNames, err := excelColumnNames(ctx, h, textRead)
+	if err != nil {
+		return err
+	}
+	typeByName := make(map[string]string, len(typedCols))
+	for _, c := range typedCols {
+		typeByName[c.name] = c.duckType
+	}
+
+	var candidates []string
+	for _, name := range textNames {
+		if duckType, ok := typeByName[name]; ok && excelKeepTyped(duckType) {
+			candidates = append(candidates, name)
+		}
+	}
+	if len(candidates) == 0 {
+		return fmt.Errorf("no columns whose cell-format metadata the typed read preserves")
+	}
+
+	// A keep-typed column is usable only if the typed read dropped none of its values — otherwise its
+	// NULLs would silently destroy data. Dropped cells are the whole reason the plain typed read
+	// failed, and they land in exactly the mixed-type columns; a DATE column losing a value is rare
+	// but possible, and the text read must win when it happens.
+	dropped, err := excelDroppedCounts(ctx, h, typedRead, textRead, candidates)
+	if err != nil {
+		return err
+	}
+	sourceTyped := make(map[string]bool, len(candidates))
+	anyTyped := false
+	for _, name := range candidates {
+		sourceTyped[name] = dropped[name] == 0
+		anyTyped = anyTyped || sourceTyped[name]
+	}
+	if !anyTyped {
+		return fmt.Errorf("every metadata column lost values in the typed read; nothing safe to keep")
+	}
+
+	projections := make([]string, 0, len(textNames))
+	for _, name := range textNames {
+		ident := quoteIdent(name)
+		if sourceTyped[name] {
+			projections = append(projections, fmt.Sprintf("t.%s", ident))
+			continue
+		}
+		sqlType, err := excelColumnType(ctx, h, textRead, name)
+		if err != nil {
+			return err
+		}
+		if sqlType == "VARCHAR" {
+			projections = append(projections, fmt.Sprintf("s.%s", ident))
+			continue
+		}
+		projections = append(projections, fmt.Sprintf("CAST(s.%s AS %s) AS %s", ident, sqlType, ident))
+	}
+
+	query := fmt.Sprintf(
+		`WITH t AS (SELECT row_number() OVER () AS __rn__, * FROM %[1]s),
+		        s AS (SELECT row_number() OVER () AS __rn__, * FROM %[2]s)
+		 SELECT %[3]s FROM t JOIN s USING (__rn__)`,
+		typedRead, textRead, strings.Join(projections, ", "),
+	)
+	return copyToParquet(ctx, h, query, parquetPath, "Excel")
+}
+
+// excelDroppedCounts reports, for each named column, how many rows the typed read has NULL where the
+// text read has a value — the cells ignore_errors silently dropped. Both reads are the same sheet
+// scanned in the same order, so row_number() OVER () aligns them; this pairing is exercised by
+// TestNormalizeExcelHybridRead against a real fixture.
+func excelDroppedCounts(ctx context.Context, h execer, typedRead, textRead string, names []string) (map[string]int64, error) {
+	filters := make([]string, 0, len(names))
+	for _, name := range names {
+		ident := quoteIdent(name)
+		filters = append(filters, fmt.Sprintf("count(*) FILTER (WHERE t.%s IS NULL AND s.%s IS NOT NULL)", ident, ident))
+	}
+	query := fmt.Sprintf(
+		`WITH t AS (SELECT row_number() OVER () AS __rn__, * FROM %[1]s),
+		        s AS (SELECT row_number() OVER () AS __rn__, * FROM %[2]s)
+		 SELECT %[3]s FROM t JOIN s USING (__rn__)`,
+		typedRead, textRead, strings.Join(filters, ", "),
+	)
+
+	rows, err := h.Query(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("counting dropped Excel cells: %s", cleanDriverError(err))
+	}
+	defer rows.Close()
+
+	out := make(map[string]int64, len(names))
+	if !rows.Next() {
+		return nil, fmt.Errorf("counting dropped Excel cells: the scan returned no rows")
+	}
+	// count(*) FILTER always yields a non-null BIGINT (0 or more), so scanning straight into int64
+	// is safe; the only NULL case is an empty sheet, which rows.Next() above already ruled out.
+	dests := make([]any, len(names))
+	ptrs := make([]any, len(names))
+	vals := make([]int64, len(names))
+	for i := range vals {
+		ptrs[i] = &vals[i]
+	}
+	dests = ptrs
+	if err := rows.Scan(dests...); err != nil {
+		return nil, fmt.Errorf("counting dropped Excel cells: %w", err)
+	}
+	for i, name := range names {
+		out[name] = vals[i]
+	}
+	return out, nil
 }
 
 // excelColumnNames lists the column names produced by the all-text read, in order.

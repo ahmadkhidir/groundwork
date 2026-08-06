@@ -534,6 +534,35 @@ shape: `ACCT_LEVEL_DATE` now profiles as `date` at fit 1.0 end to end.
 
 Verification: server `go vet` + fresh `go test ./...` (all packages green) + `gofmt -l` clean.
 
+### Post-closure bugfix — Excel date columns lost to the text fallback (FEAT-003), committed after the CSV fix
+
+The dd-mmm-yy CSV fix above handled text dates in CSV. A follow-up on the user's real file (an `.xlsx`)
+exposed a different, more subtle path. That file stores dates as **Excel serials** (43341) in cells
+whose style is the date format `d-mmm-yy`. DuckDB's `read_xlsx` honours that cell-format metadata and
+reads them as real `DATE` columns — but the file also has a genuinely mixed-type `MOBILE_NO` column
+(one text `002-2318820` in an otherwise numeric column), which makes the whole typed read throw, and
+the existing all-text fallback then cannot see the cell formats, reads the serials as strings, and
+types the date columns as whole numbers. Net effect: `ACCT_DATE_OPEN`/`TRA_DATE` profiled as integers
+("Excel presents it as a date" — actually the file declares it).
+
+**Fix (hybrid fallback) in `normalizeExcel` (`server/internal/ingest/loaders.go`):** when the plain
+typed read fails, retry it with `ignore_errors=true` (succeeds, keeps the file's date cells as real
+`DATE`s, NULLs only the cells that caused the failure), then merge: `DATE`/`TIMESTAMP`/`BOOLEAN`
+columns whose typed read dropped **zero** values come from the typed read; every other column comes
+from the all-text read through the existing `excelColumnType` round-trip — so the mixed-type cell that
+forced the fallback is preserved verbatim as text, not nulled. The two reads are joined by
+`row_number() OVER ()` (both scan the same sheet in the same order; the pairing is verified by
+`TestNormalizeExcelHybridRead` against a fixture with a real `styles.xml`). When no metadata column
+survives cleanly, it falls back to the prior text-only path unchanged.
+
+- **Verified against the user's file:** `ACCT_DATE_OPEN` → date (fit 1.0), `TRA_DATE` → date (fit
+  1.0), `MOBILE_NO` → string (all values preserved, `002-2318820` intact).
+- **Tests:** `excel_hybrid_test.go` `TestNormalizeExcelHybridRead` (date column stays `DATE` while the
+  mixed-type cell survives; clean integer column keeps its BIGINT narrowing; mixed column stays
+  VARCHAR). Existing Excel tests unchanged and green.
+
+Verification: server `go vet` + fresh `go test ./...` (all packages green) + `gofmt -l` clean.
+
 ### Phase 2 boundary assumptions (user-approved 2026-08-05)
 
 Four Phase 2 features lean on capabilities `roadmap.md` schedules for Phase 3+. These are the
