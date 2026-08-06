@@ -3,6 +3,7 @@ package ingest
 import (
 	"context"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 
@@ -56,9 +57,7 @@ func normalizeToParquet(ctx context.Context, h execer, format domain.DatasetForm
 		if _, err := h.Exec(ctx, "INSTALL excel; LOAD excel;"); err != nil {
 			return fmt.Errorf("could not load Excel support for this engine: %s", cleanDriverError(err))
 		}
-		return copyToParquet(ctx, h,
-			fmt.Sprintf("SELECT * FROM read_xlsx(%s)", sqlQuote(sourcePath)),
-			parquetPath, "Excel")
+		return normalizeExcel(ctx, h, sourcePath, parquetPath)
 
 	case domain.FormatSQLite:
 		return normalizeSQLite(ctx, h, sourcePath, parquetPath)
@@ -73,6 +72,72 @@ func copyToParquet(ctx context.Context, h execer, selectSQL, parquetPath, format
 	statement := fmt.Sprintf("COPY (%s) TO %s (FORMAT parquet)", selectSQL, sqlQuote(parquetPath))
 	if _, err := h.Exec(ctx, statement); err != nil {
 		return fmt.Errorf("could not read this %s file: %s", formatLabel, cleanDriverError(err))
+	}
+	return nil
+}
+
+// normalizeExcel ingests an .xlsx file, falling back to whole-file type inference when DuckDB's
+// per-cell typing gives up.
+//
+// read_xlsx types a column from the cell types it meets first, then hard-fails on the first cell that
+// contradicts it:
+//
+//	Invalid Input Error: read_xlsx: Failed to parse cell 'E105':
+//	Could not convert string '002-2318820' to DOUBLE
+//
+// That is extremely common in real spreadsheets — an ID or account column that is numeric for a
+// hundred rows and then hits a value with a dash or a leading zero. Unlike read_csv, read_xlsx has no
+// sample_size parameter (its full option list is col0, header, all_varchar, stop_at_empty,
+// ignore_errors, range, sheet, empty_as_varchar, normalize_names), so the detection window cannot
+// simply be widened.
+//
+// `ignore_errors=true` is NOT the fix, though it makes the error disappear: it nulls the offending
+// cell. Verified against the reproduction above — the account number becomes NULL and the column
+// stays DOUBLE, so the user silently loses exactly the value that made their data interesting. Silent
+// wrongness is the one failure mode this product exists to prevent (see README's differentiator);
+// a loud failure is strictly better, and a correct read is better still.
+//
+// So: try the typed read first, and fall back only when it fails. The fallback re-reads every cell as
+// text (all_varchar, lossless) and routes it through the CSV sniffer with sample_size=-1, which reads
+// EVERY row before choosing a type — the same whole-file inference CSV ingest already uses. The
+// mixed column lands as VARCHAR with its value intact; its well-behaved neighbours keep real types.
+//
+// Ordering matters and is deliberate: the typed read stays the default so a well-formed spreadsheet's
+// dates and numbers keep the types read_xlsx derives from its cell formats. The fallback only ever
+// runs where the current behaviour is a hard failure, so it cannot regress a file that works today.
+//
+// The one trade-off, worth knowing: on the fallback path a column of purely numeric-looking text
+// (e.g. "002", "003") is typed by the CSV sniffer as it would be in a CSV upload — as an integer,
+// dropping the leading zeros. That is existing, consistent behaviour for CSV rather than something
+// new, and the user can override the type on the ingest confirmation screen (FEAT-006).
+func normalizeExcel(ctx context.Context, h execer, sourcePath, parquetPath string) error {
+	typedErr := copyToParquet(ctx, h,
+		fmt.Sprintf("SELECT * FROM read_xlsx(%s)", sqlQuote(sourcePath)),
+		parquetPath, "Excel")
+	if typedErr == nil {
+		return nil
+	}
+
+	// The intermediate CSV sits beside the Parquet output, which the pipeline already owns and
+	// cleans up; both are server-generated temp paths, never user input.
+	csvPath := parquetPath + ".xlsx-text.csv"
+	defer func() { _ = os.Remove(csvPath) }()
+
+	if _, err := h.Exec(ctx, fmt.Sprintf(
+		"COPY (SELECT * FROM read_xlsx(%s, all_varchar=true)) TO %s (FORMAT csv, HEADER)",
+		sqlQuote(sourcePath), sqlQuote(csvPath),
+	)); err != nil {
+		// The all-text read failed too, so the file is unreadable for a reason the fallback cannot
+		// address. Report the ORIGINAL typed-read error: it names the offending cell, which is what
+		// makes the message actionable per FEAT-004.
+		return typedErr
+	}
+
+	if err := copyToParquet(ctx, h,
+		fmt.Sprintf("SELECT * FROM read_csv(%s, auto_detect=true, sample_size=-1)", sqlQuote(csvPath)),
+		parquetPath, "Excel",
+	); err != nil {
+		return typedErr
 	}
 	return nil
 }
