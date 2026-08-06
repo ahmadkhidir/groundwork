@@ -39,6 +39,39 @@ func writeMixedTypeXLSX(t *testing.T, path string, stringRow int, totalRows int)
 			`<row r="%d"><c r="A%d"><v>%d</v></c><c r="B%d"><v>%d</v></c></row>`,
 			i, i, i, i, 1000+i))
 	}
+	writeSheetXLSX(t, path, rows.String())
+}
+
+// writeLeadingZeroXLSX builds a sheet whose `code` column is text that LOOKS numeric — "002", "003"
+// — alongside a mixed `account` column that forces the fallback path. The point is that entering the
+// fallback must not license rewriting values elsewhere in the file.
+func writeLeadingZeroXLSX(t *testing.T, path string, totalRows int) {
+	t.Helper()
+
+	var rows strings.Builder
+	rows.WriteString(`<row r="1">` +
+		`<c r="A1" t="inlineStr"><is><t>id</t></is></c>` +
+		`<c r="B1" t="inlineStr"><is><t>code</t></is></c>` +
+		`<c r="C1" t="inlineStr"><is><t>amount</t></is></c>` +
+		`<c r="D1" t="inlineStr"><is><t>account</t></is></c></row>`)
+	for i := 2; i <= totalRows; i++ {
+		account := fmt.Sprintf(`<c r="D%d"><v>%d</v></c>`, i, 5000+i)
+		if i == totalRows {
+			// One contradicting cell, enough to make read_xlsx give up and hand over to the fallback.
+			account = fmt.Sprintf(`<c r="D%d" t="inlineStr"><is><t>002-2318820</t></is></c>`, i)
+		}
+		rows.WriteString(fmt.Sprintf(
+			`<row r="%d"><c r="A%d"><v>%d</v></c>`+
+				`<c r="B%d" t="inlineStr"><is><t>%03d</t></is></c>`+
+				`<c r="C%d" t="inlineStr"><is><t>1.50</t></is></c>%s</row>`,
+			i, i, i, i, i, i, account))
+	}
+	writeSheetXLSX(t, path, rows.String())
+}
+
+// writeSheetXLSX wraps sheet-row XML in the minimum set of parts that make a valid .xlsx package.
+func writeSheetXLSX(t *testing.T, path string, rowsXML string) {
+	t.Helper()
 
 	files := map[string]string{
 		"[Content_Types].xml": `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
@@ -62,7 +95,7 @@ func writeMixedTypeXLSX(t *testing.T, path string, stringRow int, totalRows int)
 			`</Relationships>`,
 		"xl/worksheets/sheet1.xml": `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
 			`<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>` +
-			rows.String() + `</sheetData></worksheet>`,
+			rowsXML + `</sheetData></worksheet>`,
 	}
 
 	f, err := os.Create(path)
@@ -170,5 +203,76 @@ func TestNormalizeExcelKeepsRealTypesForWellBehavedColumns(t *testing.T) {
 	}
 	if accountType != "VARCHAR" {
 		t.Errorf("typeof(account) = %s, want VARCHAR", accountType)
+	}
+}
+
+func TestNormalizeExcelFallbackNeverRewritesAValue(t *testing.T) {
+	handle := acquireTestHandle(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	source := filepath.Join(dir, "codes.xlsx")
+	target := filepath.Join(dir, "out.parquet")
+	writeLeadingZeroXLSX(t, source, 120)
+
+	if _, err := handle.Exec(ctx, "INSTALL excel; LOAD excel;"); err != nil {
+		t.Skipf("excel extension unavailable: %v", err)
+	}
+	if err := normalizeToParquet(ctx, handle, "excel", source, target); err != nil {
+		t.Fatalf("normalizeToParquet() error = %v, want nil", err)
+	}
+
+	// Entering the fallback must not license rewriting values elsewhere in the file. "002" cast to an
+	// integer and rendered back is "2", and "1.50" is "1.5" — both are values a person deliberately
+	// stored as text in a spreadsheet (an account code, a price), and both would be silently altered
+	// by any type inference that checks only whether a cast SUCCEEDS rather than whether it ROUND-TRIPS.
+	rows, err := handle.Query(ctx, fmt.Sprintf(
+		"SELECT code, amount FROM read_parquet(%s) WHERE id = 2", sqlQuote(target)))
+	if err != nil {
+		t.Fatalf("querying preserved values: %v", err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		t.Fatal("row id=2 missing from normalized output")
+	}
+	var code, amount string
+	if err := rows.Scan(&code, &amount); err != nil {
+		t.Fatalf("scanning: %v (a type error here means the column was numeric-typed and rewritten)", err)
+	}
+	if code != "002" {
+		t.Errorf("code = %q, want %q — leading zeros were destroyed", code, "002")
+	}
+	if amount != "1.50" {
+		t.Errorf("amount = %q, want %q — trailing zero was destroyed", amount, "1.50")
+	}
+}
+
+func TestExcelColumnTypeRejectsTypeThatWouldRewriteValues(t *testing.T) {
+	handle := acquireTestHandle(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	source := filepath.Join(dir, "codes.xlsx")
+	writeLeadingZeroXLSX(t, source, 120)
+	if _, err := handle.Exec(ctx, "INSTALL excel; LOAD excel;"); err != nil {
+		t.Skipf("excel extension unavailable: %v", err)
+	}
+	textRead := fmt.Sprintf("read_xlsx(%s, all_varchar=true)", sqlQuote(source))
+
+	// Guards the inner coalesce in excelColumnType: TRY_CAST yields NULL for an uncastable value, the
+	// comparison then yields NULL, and bool_and SKIPS NULLs — so without it, a column of clean numbers
+	// plus one "002-2318820" reports as BIGINT and the odd value is destroyed by the following CAST.
+	// This was a real bug in the first version of this function, caught by a test rather than review.
+	for _, tc := range []struct{ column, want string }{
+		{"id", "BIGINT"},       // genuinely numeric, safe to type
+		{"code", "VARCHAR"},    // "002" would render back as "2"
+		{"amount", "VARCHAR"},  // "1.50" would render back as "1.5"
+		{"account", "VARCHAR"}, // one value cannot be cast at all
+	} {
+		got, err := excelColumnType(ctx, handle, textRead, tc.column)
+		if err != nil {
+			t.Fatalf("excelColumnType(%s) error = %v", tc.column, err)
+		}
+		if got != tc.want {
+			t.Errorf("excelColumnType(%s) = %s, want %s", tc.column, got, tc.want)
+		}
 	}
 }

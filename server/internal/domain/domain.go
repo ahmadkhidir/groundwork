@@ -299,8 +299,18 @@ type Dataset struct {
 	ParquetLocation string       `json:"parquet_location,omitempty"`
 	IngestStatus    IngestStatus `json:"ingest_status"`
 	// RowCount is zero until profiling completes.
-	RowCount  int64     `json:"row_count,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
+	RowCount int64 `json:"row_count,omitempty"`
+	// IngestError is the specific, actionable failure reason when IngestStatus is IngestFailed, and
+	// empty otherwise (FEAT-004's "ingest failure surfaces a specific, actionable error").
+	//
+	// It is carried on the entity, not fetched separately on demand, because the Ingest Progress
+	// screen reconstructs a dataset's state from its persisted row whenever this process has no live
+	// Tracker entry for it — after a restart, or for a batch a different instance handled. When the
+	// reason was not carried here, that path produced a failed dataset with no message at all, and the
+	// screen fell back to "Ingest failed for an unspecified reason" while the real, specific error sat
+	// in the database one column away.
+	IngestError string    `json:"ingest_error,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 // Column is a single profiled column, carrying inferred type, PII flag, and model-visibility state.

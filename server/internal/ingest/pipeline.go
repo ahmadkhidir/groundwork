@@ -500,6 +500,13 @@ func (p *Pipeline) fail(ctx context.Context, ds domain.Dataset, reason string) {
 // after a server restart or for a dataset another process instance is handling.
 func StateFor(tracker *Tracker, ds domain.Dataset) State {
 	if s, ok := tracker.Get(ds.ID); ok {
+		// A failure must always arrive with its reason. The live entry normally carries one (see
+		// fail), but if it ever doesn't, the persisted column still does — and an empty reason reaches
+		// the user as "Ingest failed for an unspecified reason", which is exactly the generic message
+		// FEAT-004 exists to rule out. Prefer the specific one wherever it lives.
+		if s.Step == StepFailed && s.Error == "" {
+			s.Error = ds.IngestError
+		}
 		return s
 	}
 
@@ -515,7 +522,10 @@ func StateFor(tracker *Tracker, ds domain.Dataset) State {
 	case domain.IngestComplete:
 		return State{Step: StepRelationships, UpdatedAt: time.Now()}
 	case domain.IngestFailed:
-		return State{Step: StepFailed, UpdatedAt: time.Now()}
+		// Carry the persisted reason. Returning a bare StepFailed here left the client with a failed
+		// dataset and no message, which it rendered as "Ingest failed for an unspecified reason" —
+		// while the specific, actionable error FEAT-004 requires sat in datasets.ingest_error.
+		return State{Step: StepFailed, Error: ds.IngestError, UpdatedAt: time.Now()}
 	default:
 		return State{Step: StepProfiling, UpdatedAt: time.Now()}
 	}

@@ -3,7 +3,6 @@ package ingest
 import (
 	"context"
 	"fmt"
-	"os"
 	"strconv"
 	"strings"
 
@@ -98,18 +97,12 @@ func copyToParquet(ctx context.Context, h execer, selectSQL, parquetPath, format
 // a loud failure is strictly better, and a correct read is better still.
 //
 // So: try the typed read first, and fall back only when it fails. The fallback re-reads every cell as
-// text (all_varchar, lossless) and routes it through the CSV sniffer with sample_size=-1, which reads
-// EVERY row before choosing a type — the same whole-file inference CSV ingest already uses. The
-// mixed column lands as VARCHAR with its value intact; its well-behaved neighbours keep real types.
+// text (all_varchar, which cannot fail on a type conflict because it makes no type decision) and then
+// types each column itself, per excelColumnType below.
 //
 // Ordering matters and is deliberate: the typed read stays the default so a well-formed spreadsheet's
 // dates and numbers keep the types read_xlsx derives from its cell formats. The fallback only ever
 // runs where the current behaviour is a hard failure, so it cannot regress a file that works today.
-//
-// The one trade-off, worth knowing: on the fallback path a column of purely numeric-looking text
-// (e.g. "002", "003") is typed by the CSV sniffer as it would be in a CSV upload — as an integer,
-// dropping the leading zeros. That is existing, consistent behaviour for CSV rather than something
-// new, and the user can override the type on the ingest confirmation screen (FEAT-006).
 func normalizeExcel(ctx context.Context, h execer, sourcePath, parquetPath string) error {
 	typedErr := copyToParquet(ctx, h,
 		fmt.Sprintf("SELECT * FROM read_xlsx(%s)", sqlQuote(sourcePath)),
@@ -118,28 +111,118 @@ func normalizeExcel(ctx context.Context, h execer, sourcePath, parquetPath strin
 		return nil
 	}
 
-	// The intermediate CSV sits beside the Parquet output, which the pipeline already owns and
-	// cleans up; both are server-generated temp paths, never user input.
-	csvPath := parquetPath + ".xlsx-text.csv"
-	defer func() { _ = os.Remove(csvPath) }()
+	textRead := fmt.Sprintf("read_xlsx(%s, all_varchar=true)", sqlQuote(sourcePath))
 
-	if _, err := h.Exec(ctx, fmt.Sprintf(
-		"COPY (SELECT * FROM read_xlsx(%s, all_varchar=true)) TO %s (FORMAT csv, HEADER)",
-		sqlQuote(sourcePath), sqlQuote(csvPath),
-	)); err != nil {
+	names, err := excelColumnNames(ctx, h, textRead)
+	if err != nil {
 		// The all-text read failed too, so the file is unreadable for a reason the fallback cannot
 		// address. Report the ORIGINAL typed-read error: it names the offending cell, which is what
 		// makes the message actionable per FEAT-004.
 		return typedErr
 	}
 
+	projections := make([]string, 0, len(names))
+	for _, name := range names {
+		sqlType, err := excelColumnType(ctx, h, textRead, name)
+		if err != nil {
+			return typedErr
+		}
+		ident := quoteIdent(name)
+		if sqlType == "VARCHAR" {
+			projections = append(projections, ident)
+			continue
+		}
+		projections = append(projections, fmt.Sprintf("CAST(%s AS %s) AS %s", ident, sqlType, ident))
+	}
+
 	if err := copyToParquet(ctx, h,
-		fmt.Sprintf("SELECT * FROM read_csv(%s, auto_detect=true, sample_size=-1)", sqlQuote(csvPath)),
+		fmt.Sprintf("SELECT %s FROM %s", strings.Join(projections, ", "), textRead),
 		parquetPath, "Excel",
 	); err != nil {
 		return typedErr
 	}
 	return nil
+}
+
+// excelColumnNames lists the column names produced by the all-text read, in order.
+func excelColumnNames(ctx context.Context, h execer, textRead string) ([]string, error) {
+	rows, err := h.Query(ctx, fmt.Sprintf("SELECT column_name FROM (DESCRIBE SELECT * FROM %s)", textRead))
+	if err != nil {
+		return nil, fmt.Errorf("describing Excel columns: %w", err)
+	}
+	defer rows.Close()
+
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("scanning Excel column name: %w", err)
+		}
+		names = append(names, name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating Excel columns: %w", err)
+	}
+	if len(names) == 0 {
+		return nil, fmt.Errorf("Excel file produced no columns")
+	}
+	return names, nil
+}
+
+// excelColumnType chooses a SQL type for one all-text column, and it is deliberately conservative:
+// a type is adopted ONLY if casting to it and back reproduces the original text of EVERY non-null
+// value, byte for byte. Otherwise the column stays VARCHAR.
+//
+// The round-trip is the whole point, not a belt-and-braces extra. Casting alone would happily accept
+// values it also quietly rewrites — an account number "002" casts to BIGINT perfectly well and comes
+// back as "2", and "1.50" comes back as "1.5". Those are the columns most likely to be identifiers or
+// money in a real spreadsheet, and a spreadsheet is precisely where people keep such values as text
+// on purpose. Since the round-trip compares the rendered value against the original, any column whose
+// text would not survive the trip is left alone as text rather than silently rewritten.
+//
+// This is why the fallback carries no "leading zeros may be lost" caveat: it cannot alter a value. The
+// worst it can do is decline to type a column, which the user can still correct on the ingest
+// confirmation screen (FEAT-006), and which is visible rather than silent.
+//
+// Types are tried narrowest-first so a whole-number column does not land as DOUBLE. TIMESTAMP is not
+// attempted: a date typed here would have to render back in exactly DuckDB's canonical format to pass
+// the round-trip, so it would almost always fall through to VARCHAR anyway, and attempting it costs a
+// query per column for no gain.
+func excelColumnType(ctx context.Context, h execer, textRead, columnName string) (string, error) {
+	ident := quoteIdent(columnName)
+
+	for _, candidate := range []string{"BIGINT", "DOUBLE"} {
+		// The INNER coalesce is load-bearing and easy to get wrong: TRY_CAST returns NULL for a value
+		// that cannot be cast, so the comparison yields NULL rather than false — and bool_and SKIPS
+		// NULLs. Without it, a column of clean numbers plus one "002-2318820" reports true, the column
+		// is typed BIGINT, and the offending value is destroyed by the subsequent CAST. That is the
+		// exact data loss this function exists to prevent, so a failed cast is coalesced to false.
+		//
+		// The OUTER coalesce handles an all-NULL or empty column, where bool_and itself returns NULL:
+		// VARCHAR is the honest answer, since nothing observed justifies a narrower type.
+		query := fmt.Sprintf(
+			`SELECT coalesce(bool_and(coalesce(CAST(TRY_CAST(%[1]s AS %[2]s) AS VARCHAR) = %[1]s, false)), false)
+			   FROM %[3]s WHERE %[1]s IS NOT NULL`,
+			ident, candidate, textRead)
+
+		rows, err := h.Query(ctx, query)
+		if err != nil {
+			return "", fmt.Errorf("testing %s as %s: %w", columnName, candidate, err)
+		}
+		var roundTrips bool
+		if rows.Next() {
+			if err := rows.Scan(&roundTrips); err != nil {
+				rows.Close()
+				return "", fmt.Errorf("scanning round-trip result for %s: %w", columnName, err)
+			}
+		}
+		rows.Close()
+
+		if roundTrips {
+			return candidate, nil
+		}
+	}
+	return "VARCHAR", nil
 }
 
 // normalizeSQLite ingests a single-table SQLite file. Multi-table files are rejected with a specific,

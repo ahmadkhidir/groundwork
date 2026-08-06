@@ -88,6 +88,17 @@ func (f *fakePipeline) startedIDs() []string {
 // checks.
 func newTestServerForIngest(t *testing.T, datasets *fakeIngestDatasetStore, pipeline *fakePipeline) (*Server, *fakeWorkspaceStore) {
 	t.Helper()
+	server, workspaces, _ := newTestServerForIngestWithTracker(t, datasets, pipeline)
+	return server, workspaces
+}
+
+// newTestServerForIngestWithTracker also hands back the Tracker, for the tests that need to
+// distinguish a failure this process is live-tracking from one left behind by an earlier session —
+// which is exactly the distinction currentBatch draws.
+func newTestServerForIngestWithTracker(
+	t *testing.T, datasets *fakeIngestDatasetStore, pipeline *fakePipeline,
+) (*Server, *fakeWorkspaceStore, *ingest.Tracker) {
+	t.Helper()
 
 	cfg := config.Config{
 		Port:           "8080",
@@ -97,15 +108,16 @@ func newTestServerForIngest(t *testing.T, datasets *fakeIngestDatasetStore, pipe
 		Environment:    "development",
 	}
 	workspaces := newFakeWorkspaceStore()
+	tracker := ingest.NewTracker()
 
 	server := NewServer(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, Dependencies{
 		AuthSecret:     testAuthSecret,
 		Workspaces:     workspaces,
 		IngestDatasets: datasets,
 		IngestPipeline: pipeline,
-		IngestTracker:  ingest.NewTracker(),
+		IngestTracker:  tracker,
 	})
-	return server, workspaces
+	return server, workspaces, tracker
 }
 
 func TestStartIngestRequiresWorkspaceOwnership(t *testing.T) {
@@ -301,10 +313,16 @@ func TestIngestStreamTotalDatasetsCountsTheWholeBatchNotJustInProgress(t *testin
 
 func TestIngestStreamReportsFailureWithReason(t *testing.T) {
 	datasets := newFakeIngestDatasetStore(
-		domain.Dataset{ID: "ds-1", WorkspaceID: "ws-1", OriginalFilename: "bad.csv", IngestStatus: domain.IngestFailed},
+		domain.Dataset{
+			ID: "ds-1", WorkspaceID: "ws-1", OriginalFilename: "bad.csv",
+			IngestStatus: domain.IngestFailed,
+			IngestError:  "could not read this CSV file: unterminated quote on line 12",
+		},
 	)
-	server, workspaces := newTestServerForIngest(t, datasets, &fakePipeline{})
+	server, workspaces, tracker := newTestServerForIngestWithTracker(t, datasets, &fakePipeline{})
 	workspaces.byID["ws-1"] = domain.Workspace{ID: "ws-1", OwnerID: "user-1"}
+	// A failure this process is live-tracking: the batch in front of the user, not history.
+	tracker.Set("ds-1", ingest.StepFailed, "could not read this CSV file: unterminated quote on line 12")
 
 	httpServer := httptest.NewServer(server)
 	defer httpServer.Close()
@@ -315,6 +333,84 @@ func TestIngestStreamReportsFailureWithReason(t *testing.T) {
 	}
 	if !event.Done {
 		t.Error("stream should report done once a dataset has failed")
+	}
+	if len(event.Datasets) != 1 || event.Datasets[0].Error == "" {
+		t.Fatalf("failed dataset must carry its reason, got %+v", event.Datasets)
+	}
+}
+
+func TestIngestStreamFallsBackToThePersistedFailureReason(t *testing.T) {
+	// A failure this process never tracked (server restarted mid-batch) still has its reason in the
+	// database. Before this was carried on the entity, the client received an empty error and rendered
+	// "Ingest failed for an unspecified reason" — a generic message standing in for a specific one,
+	// which is precisely what FEAT-004's acceptance criterion forbids.
+	reason := "could not read this Excel file: Failed to parse cell 'E105'"
+	datasets := newFakeIngestDatasetStore(
+		domain.Dataset{
+			ID: "ds-1", WorkspaceID: "ws-1", OriginalFilename: "data.xlsx",
+			IngestStatus: domain.IngestProfiling, IngestError: "",
+		},
+		domain.Dataset{
+			ID: "ds-2", WorkspaceID: "ws-1", OriginalFilename: "other.xlsx",
+			IngestStatus: domain.IngestFailed, IngestError: reason,
+		},
+	)
+	server, workspaces, tracker := newTestServerForIngestWithTracker(t, datasets, &fakePipeline{})
+	workspaces.byID["ws-1"] = domain.Workspace{ID: "ws-1", OwnerID: "user-1"}
+	// ds-2 is part of the live batch, but only its persisted row knows why it failed.
+	tracker.Set("ds-2", ingest.StepFailed, "")
+
+	httpServer := httptest.NewServer(server)
+	defer httpServer.Close()
+
+	event := readOneSSEEvent(t, httpServer, "/v1/workspaces/ws-1/ingest/stream", "user-1", domain.TierFree)
+	var failed *publicIngestDataset
+	for i := range event.Datasets {
+		if event.Datasets[i].ID == "ds-2" {
+			failed = &event.Datasets[i]
+		}
+	}
+	if failed == nil {
+		t.Fatal("failed dataset missing from the stream")
+	}
+	if failed.Error != reason {
+		t.Errorf("error = %q, want the persisted reason %q", failed.Error, reason)
+	}
+}
+
+func TestIngestStreamIgnoresFailuresFromAnEarlierSession(t *testing.T) {
+	// The reported bug: a user's first upload failed, and every later upload to that workspace was
+	// then reported as failed the instant it started — three successful ingests in a row were shown as
+	// "Ingest failed" because one terminal failure never left the in-progress list. A failed dataset
+	// with no live Tracker entry is history, and must not speak for the batch in front of the user.
+	datasets := newFakeIngestDatasetStore(
+		domain.Dataset{
+			ID: "old-failure", WorkspaceID: "ws-1", OriginalFilename: "data.xlsx",
+			IngestStatus: domain.IngestFailed, IngestError: "read_xlsx: Failed to parse cell 'E105'",
+		},
+		domain.Dataset{
+			ID: "fresh", WorkspaceID: "ws-1", OriginalFilename: "data.xlsx",
+			IngestStatus: domain.IngestProfiling,
+		},
+	)
+	server, workspaces, tracker := newTestServerForIngestWithTracker(t, datasets, &fakePipeline{})
+	workspaces.byID["ws-1"] = domain.Workspace{ID: "ws-1", OwnerID: "user-1"}
+	tracker.Set("fresh", ingest.StepProfiling, "")
+
+	httpServer := httptest.NewServer(server)
+	defer httpServer.Close()
+
+	event := readOneSSEEvent(t, httpServer, "/v1/workspaces/ws-1/ingest/stream", "user-1", domain.TierFree)
+	if event.OverallStep == string(ingest.StepFailed) {
+		t.Error("a stale failure from an earlier session must not fail the current batch")
+	}
+	if event.Done {
+		t.Error("the batch is still profiling; reporting done would skip the user past a running ingest")
+	}
+	for _, ds := range event.Datasets {
+		if ds.ID == "old-failure" {
+			t.Error("stale failed dataset should not appear in the current batch")
+		}
 	}
 }
 

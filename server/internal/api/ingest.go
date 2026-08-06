@@ -195,10 +195,11 @@ func buildIngestStreamEvent(ctx context.Context, datasets IngestDatasetStore, tr
 		return ingestStreamEvent{}, fmt.Errorf("listing workspace datasets: %w", err)
 	}
 
-	inProgress, err := datasets.ListInProgressByWorkspace(ctx, workspaceID)
+	all, err := datasets.ListInProgressByWorkspace(ctx, workspaceID)
 	if err != nil {
 		return ingestStreamEvent{}, fmt.Errorf("listing in-progress datasets: %w", err)
 	}
+	inProgress := currentBatch(all, tracker)
 
 	if len(inProgress) == 0 {
 		// Nothing pending, provisioning, profiling, or failed for this workspace — either nothing has
@@ -252,6 +253,35 @@ func buildIngestStreamEvent(ctx context.Context, datasets IngestDatasetStore, tr
 	// finished, including profiling and, when applicable, relationship inference).
 	event.Done = false
 	return event, nil
+}
+
+// currentBatch narrows "every dataset that never reached complete" down to the batch this screen is
+// actually reporting on, by dropping failures left over from earlier sessions.
+//
+// A failed dataset is terminal: nothing will ever move it forward. But it was kept in the in-progress
+// list so the screen could keep showing its reason — with the consequence that ONE old failure made
+// every later upload to that workspace report `overall_step: failed, done: true` the instant it
+// started. Observed in practice: a user whose first upload failed then uploaded the same file three
+// more times, successfully, and was told "Ingest failed" each time while all three datasets sat at
+// `complete` in the database. The stale failure had permanently poisoned the workspace.
+//
+// A live Tracker entry is what distinguishes the two cases. The Tracker holds exactly the datasets
+// this process has worked on since it started, so a failure with an entry belongs to the batch in
+// front of the user and keeps its place; a failure without one is history and is dropped.
+//
+// Non-failed datasets are never filtered: a dataset stuck mid-pipeline after a restart has no Tracker
+// entry either, and it genuinely is unfinished work this screen should still report.
+func currentBatch(datasets []domain.Dataset, tracker *ingest.Tracker) []domain.Dataset {
+	out := make([]domain.Dataset, 0, len(datasets))
+	for _, ds := range datasets {
+		if ds.IngestStatus == domain.IngestFailed {
+			if _, live := tracker.Get(ds.ID); !live {
+				continue
+			}
+		}
+		out = append(out, ds)
+	}
+	return out
 }
 
 // writeSSEEvent writes one `data: <json>\n\n` frame, the minimal well-formed SSE message EventSource
