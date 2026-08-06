@@ -50,7 +50,7 @@ export function TypeReviewStep({ columns, savingIds, errors, onChangeType }: Typ
             <div className="mb-2 font-medium text-text-primary">{col.name}</div>
             <ConfidenceBadge
               tier={confidenceTier(col.type_confidence)}
-              detail={`${Math.round(col.type_confidence * 100)}% confident — ${typeLabel(col.inferred_type)}`}
+              detail={`${Math.round(col.type_confidence * 100)}% of values fit ${typeLabel(col.inferred_type)}`}
             />
             <label className="mt-2 flex flex-col gap-1">
               <span className="text-body-small text-text-secondary">Column type</span>
@@ -93,7 +93,7 @@ export function TypeReviewStep({ columns, savingIds, errors, onChangeType }: Typ
                 <td className="px-2 py-2">
                   <ConfidenceBadge
                     tier={confidenceTier(col.type_confidence)}
-                    detail={`${Math.round(col.type_confidence * 100)}%`}
+                    detail={`${Math.round(col.type_confidence * 100)}% of values fit this type`}
                   />
                 </td>
                 <td className="px-2 py-2">

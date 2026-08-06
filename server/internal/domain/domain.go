@@ -315,11 +315,22 @@ type Dataset struct {
 
 // Column is a single profiled column, carrying inferred type, PII flag, and model-visibility state.
 type Column struct {
-	ID           string       `json:"id"`
-	DatasetID    string       `json:"dataset_id"`
-	Name         string       `json:"name"`
+	ID        string `json:"id"`
+	DatasetID string `json:"dataset_id"`
+	Name      string `json:"name"`
+	// InferredType is the type currently ACTIVE for this column: what profiling inferred, or the
+	// user's override once they set one (FEAT-006 overwrites this field rather than storing the
+	// override separately).
 	InferredType InferredType `json:"inferred_type"`
-	// TypeConfidence is in the range 0-1.
+	// TypeFitRates is the 0-1 fit rate for every candidate type, measured once during profiling.
+	// TypeConfidence is a lookup into this map, which is what lets the badge describe whichever type
+	// the user selects without re-querying the engine (FEAT-005).
+	//
+	// Empty for columns profiled before this was introduced; callers must treat a missing entry as
+	// "unknown" and fall back to the stored TypeConfidence rather than reporting a confident zero.
+	TypeFitRates map[InferredType]float64 `json:"type_fit_rates,omitempty"`
+	// TypeConfidence is in the range 0-1, and always describes InferredType — the type shown to the
+	// user — not whatever was originally inferred.
 	TypeConfidence float64 `json:"type_confidence"`
 	PIIFlag        bool    `json:"pii_flag"`
 	// PIIPattern is the detected pattern when PIIFlag is set, e.g. "email". Empty otherwise.

@@ -262,10 +262,13 @@ func (p *Pipeline) profileAndStore(ctx context.Context, handle engine.Handle, ds
 	for _, s := range stats {
 		result := piiResults[s.Name] // zero value (unflagged) if DetectAll somehow omitted this name
 		cols = append(cols, domain.Column{
-			ID:             uuid.NewString(),
-			DatasetID:      ds.ID,
-			Name:           s.Name,
-			InferredType:   s.InferredType,
+			ID:           uuid.NewString(),
+			DatasetID:    ds.ID,
+			Name:         s.Name,
+			InferredType: s.InferredType,
+			// Carried so a later type override can look up the rate for the type the user picks,
+			// instead of re-scanning the data or (as it once did) reporting a flat 100%.
+			TypeFitRates:   s.TypeFitRates,
 			TypeConfidence: s.TypeConfidence,
 			PIIFlag:        result.Flagged,
 			PIIPattern:     result.Pattern,

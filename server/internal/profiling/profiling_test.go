@@ -328,3 +328,43 @@ func TestDistinctCountIsExactNotApproximate(t *testing.T) {
 			"user-visible statistic that also drives identifier classification", got)
 	}
 }
+
+func TestFitRatesAreComputedForEveryCandidateType(t *testing.T) {
+	h := acquireTestHandle(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "fit.parquet")
+
+	// A text column of clean integers: the sniffer calls it VARCHAR only if something forces it, so
+	// this is written as text explicitly. Its 'integer' fit is high, its 'boolean' fit is not — which
+	// is the whole point: the user may override to either, and the badge must tell them apart.
+	writeParquetFixture(t, h, path,
+		"SELECT CAST(i AS VARCHAR) AS code FROM range(50) t(i)")
+
+	stats := profileByName(t, h, path)
+	col, ok := stats["code"]
+	if !ok {
+		t.Fatal("column 'code' missing from profile")
+	}
+
+	if len(col.TypeFitRates) != len(candidateTypes) {
+		t.Fatalf("fit rates = %d entries, want one per candidate type (%d): %v",
+			len(col.TypeFitRates), len(candidateTypes), col.TypeFitRates)
+	}
+
+	// Overriding this column to a number must NOT read as a confident guess in the dark: every value
+	// really does convert, so the rate is high and the badge says so.
+	if got := col.TypeFitRates[domain.TypeInteger]; got < 0.85 {
+		t.Errorf("integer fit rate = %.2f, want >=0.85 for a column of clean integers", got)
+	}
+	// Overriding to boolean, however, would destroy every value — and that must be visible.
+	if got := col.TypeFitRates[domain.TypeBoolean]; got >= 0.6 {
+		t.Errorf("boolean fit rate = %.2f, want <0.6 — no value in this column is a boolean", got)
+	}
+
+	// TypeConfidence is not measured separately from the rates; it is the rate for whichever type was
+	// inferred. If these ever diverge, the badge and the map disagree about the same column.
+	if col.TypeConfidence != col.TypeFitRates[col.InferredType] {
+		t.Errorf("TypeConfidence = %.4f but TypeFitRates[%s] = %.4f; they must be the same number",
+			col.TypeConfidence, col.InferredType, col.TypeFitRates[col.InferredType])
+	}
+}

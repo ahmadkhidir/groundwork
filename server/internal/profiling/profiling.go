@@ -25,11 +25,32 @@ type Execer interface {
 // ColumnStat is one column's computed profile, ready to be turned into a domain.Column row once the
 // caller assigns it an ID and a dataset/workspace id.
 type ColumnStat struct {
-	Name           string
-	InferredType   domain.InferredType
+	Name         string
+	InferredType domain.InferredType
+	// TypeFitRates is the 0-1 fit rate for EVERY candidate type, not just the inferred one, so the
+	// confirmation screen can show a rate for whichever type the user selects without going back to
+	// the engine. Computed here because the scan is already happening: one more FILTER clause per
+	// candidate type costs no extra round trip, whereas recomputing on override would mean waking a
+	// possibly-sleeping engine to redraw a badge (see FEAT-005's "stored, not recomputed on every
+	// use" criterion, and FEAT-011 on not billing engine-seconds for a glance).
+	TypeFitRates map[domain.InferredType]float64
+	// TypeConfidence is TypeFitRates[InferredType] — the rate for the type actually inferred. Kept as
+	// its own field because that is the value persisted on the column and shown until a user
+	// overrides the type.
 	TypeConfidence float64
 	NullRate       float64
 	DistinctCount  int64
+}
+
+// candidateTypes is every type a user may select on screens/07's Types step, and therefore every
+// type a fit rate is computed for. Ordered for stable SQL generation.
+var candidateTypes = []domain.InferredType{
+	domain.TypeString,
+	domain.TypeInteger,
+	domain.TypeNumber,
+	domain.TypeBoolean,
+	domain.TypeDate,
+	domain.TypeTimestamp,
 }
 
 // nullRatePenalty is how much a fully-null column's confidence is docked. FEAT-005: the agreement
@@ -93,10 +114,19 @@ func Profile(ctx context.Context, h Execer, parquetPath string) ([]ColumnStat, e
 		}
 
 		nonNull := agg.totalRows - agg.nullCounts[col.name]
+
+		fitRates := make(map[domain.InferredType]float64, len(candidateTypes))
+		for _, candidate := range candidateTypes {
+			fitRates[candidate] = typeConfidence(agg.agreeCounts[col.name][candidate], nonNull, nullRate)
+		}
+
 		stats = append(stats, ColumnStat{
-			Name:           col.name,
-			InferredType:   col.inferredType,
-			TypeConfidence: typeConfidence(agg.agreeCounts[col.name], nonNull, nullRate),
+			Name:         col.name,
+			InferredType: col.inferredType,
+			TypeFitRates: fitRates,
+			// Identical by construction to fitRates[inferredType] — the inferred type is not a special
+			// case of the measurement, only the one selected by default.
+			TypeConfidence: fitRates[col.inferredType],
 			NullRate:       nullRate,
 			DistinctCount:  agg.distinctCounts[col.name],
 		})
@@ -104,7 +134,7 @@ func Profile(ctx context.Context, h Execer, parquetPath string) ([]ColumnStat, e
 	return stats, nil
 }
 
-// typeConfidence turns the measured agreement counts into FEAT-005's 0-1 score.
+// typeConfidence turns one candidate type's measured agreement count into FEAT-005's 0-1 fit rate.
 //
 // FEAT-005 specifies WHAT this number measures — "type-inference agreement across the sampled
 // non-null values, not simply which type the sniffer picked" — because a fixed prior per inferred
@@ -112,8 +142,8 @@ func Profile(ctx context.Context, h Execer, parquetPath string) ([]ColumnStat, e
 // which makes the badge on screens/07 report which type was chosen rather than how much evidence
 // there was, and invites skimming the review step that doc calls the highest-risk UX in the product.
 //
-// agreeCount is the number of non-null values that agree with the inferred type; see agreementExpr
-// for how agreement is defined per type. That rate is then weakened by null rate and floored, both
+// agreeCount is the number of non-null values that agree with the candidate type being scored; see
+// agreementExpr for how agreement is defined per type. That rate is then weakened by null rate and floored, both
 // of which FEAT-005 keeps.
 //
 // A column with no non-null values at all scores the floor: the sniffer had nothing to work with, so
@@ -178,9 +208,9 @@ type columnAggregates struct {
 	totalRows      int64
 	nullCounts     map[string]int64
 	distinctCounts map[string]int64
-	// agreeCounts is the number of non-null values in each column that agree with its inferred type,
-	// per agreementExpr — the numerator of FEAT-005's agreement rate.
-	agreeCounts map[string]int64
+	// agreeCounts is, per column, the number of non-null values agreeing with EACH candidate type —
+	// the numerators of FEAT-005's fit rates. Keyed by column name, then by candidate type.
+	agreeCounts map[string]map[domain.InferredType]int64
 }
 
 // agreementExpr builds the SQL aggregate that counts a column's non-null values agreeing with its
@@ -199,10 +229,13 @@ type columnAggregates struct {
 // The inner TRY_CAST to VARCHAR is not redundant. mapDuckDBType routes anything unrecognized — BLOB,
 // STRUCT, LIST — to string, and casting those directly to DOUBLE is a binder error that would fail
 // the whole profiling query rather than returning NULL for that column.
-func agreementExpr(col columnSchema) string {
+// It takes a candidate type rather than reading col.inferredType, because FEAT-005 now measures a
+// fit rate for every selectable type, not only the inferred one — the badge on screens/07 must be
+// able to describe whichever type the user picks.
+func agreementExpr(col columnSchema, candidate domain.InferredType) string {
 	ident := quoteIdent(col.name)
 
-	if target, ok := coercionTargetSQL[col.inferredType]; ok {
+	if target, ok := coercionTargetSQL[candidate]; ok {
 		return fmt.Sprintf("count(*) FILTER (WHERE %s IS NOT NULL AND TRY_CAST(%s AS %s) IS NOT NULL)",
 			ident, ident, target)
 	}
@@ -241,8 +274,14 @@ func aggregateStats(ctx context.Context, h Execer, parquetPath string, schema []
 			// band. A trust-facing number must not be an estimate. DuckDB computes exact distinct
 			// counts columnar-fast; revisit only with a measured problem on real dataset sizes.
 			fmt.Sprintf("count(DISTINCT %s) AS __distinct_%d__", ident, i),
-			fmt.Sprintf("%s AS __agree_%d__", agreementExpr(col), i),
 		)
+		// One agreement count per candidate type. This widens the projection from 3 aggregates per
+		// column to 2+len(candidateTypes), but it is still exactly ONE query and ONE scan — the thing
+		// that actually costs, and the reason this is measured here rather than on demand.
+		for j, candidate := range candidateTypes {
+			selectParts = append(selectParts,
+				fmt.Sprintf("%s AS __agree_%d_%d__", agreementExpr(col, candidate), i, j))
+		}
 	}
 
 	query := fmt.Sprintf("SELECT %s FROM read_parquet(%s)", strings.Join(selectParts, ", "), sqlQuote(parquetPath))
@@ -256,7 +295,9 @@ func aggregateStats(ctx context.Context, h Execer, parquetPath string, schema []
 		return zero, fmt.Errorf("profiling: no result returned computing column statistics")
 	}
 
-	numCols := 1 + 3*len(schema)
+	// One total-rows column, then per column: null count, distinct count, and one agreement count per
+	// candidate type. Must stay in step with aggregateStats' projection.
+	numCols := 1 + (2+len(candidateTypes))*len(schema)
 	dest := make([]any, numCols)
 	ptrs := make([]any, numCols)
 	for i := range dest {
@@ -273,14 +314,20 @@ func aggregateStats(ctx context.Context, h Execer, parquetPath string, schema []
 		totalRows:      asInt64(dest[0]),
 		nullCounts:     make(map[string]int64, len(schema)),
 		distinctCounts: make(map[string]int64, len(schema)),
-		agreeCounts:    make(map[string]int64, len(schema)),
+		agreeCounts:    make(map[string]map[domain.InferredType]int64, len(schema)),
 	}
 	idx := 1
 	for _, col := range schema {
 		agg.nullCounts[col.name] = asInt64(dest[idx])
 		agg.distinctCounts[col.name] = asInt64(dest[idx+1])
-		agg.agreeCounts[col.name] = asInt64(dest[idx+2])
-		idx += 3
+		idx += 2
+
+		perType := make(map[domain.InferredType]int64, len(candidateTypes))
+		for _, candidate := range candidateTypes {
+			perType[candidate] = asInt64(dest[idx])
+			idx++
+		}
+		agg.agreeCounts[col.name] = perType
 	}
 
 	return agg, nil

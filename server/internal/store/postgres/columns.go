@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -45,10 +46,10 @@ func (r *ColumnRepository) BulkInsert(ctx context.Context, workspaceID string, c
 	for _, c := range cols {
 		batch.Queue(
 			`INSERT INTO columns
-			   (id, dataset_id, workspace_id, name, inferred_type, type_confidence,
+			   (id, dataset_id, workspace_id, name, inferred_type, type_confidence, type_fit_rates,
 			    pii_flag, pii_pattern, pii_reviewed_at, excluded_from_model, null_rate, distinct_count)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-			c.ID, c.DatasetID, workspaceID, c.Name, string(c.InferredType), c.TypeConfidence,
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+			c.ID, c.DatasetID, workspaceID, c.Name, string(c.InferredType), c.TypeConfidence, fitRatesJSON(c.TypeFitRates),
 			c.PIIFlag, c.PIIPattern, nullableTime(c.PIIReviewedAt), c.ExcludedFromModel, c.NullRate, c.DistinctCount,
 		)
 	}
@@ -67,7 +68,7 @@ func (r *ColumnRepository) BulkInsert(ctx context.Context, workspaceID string, c
 // ListByDataset returns every column belonging to datasetID, in stable name order.
 func (r *ColumnRepository) ListByDataset(ctx context.Context, datasetID string) ([]domain.Column, error) {
 	rows, err := r.pool.Query(ctx,
-		`SELECT id, dataset_id, name, inferred_type, type_confidence,
+		`SELECT id, dataset_id, name, inferred_type, type_confidence, type_fit_rates,
 		        pii_flag, pii_pattern, pii_reviewed_at, excluded_from_model, null_rate, distinct_count
 		 FROM columns WHERE dataset_id = $1 ORDER BY name ASC`,
 		datasetID,
@@ -83,7 +84,7 @@ func (r *ColumnRepository) ListByDataset(ctx context.Context, datasetID string) 
 // inference, which compares columns across datasets within the same workspace.
 func (r *ColumnRepository) ListByWorkspace(ctx context.Context, workspaceID string) ([]domain.Column, error) {
 	rows, err := r.pool.Query(ctx,
-		`SELECT id, dataset_id, name, inferred_type, type_confidence,
+		`SELECT id, dataset_id, name, inferred_type, type_confidence, type_fit_rates,
 		        pii_flag, pii_pattern, pii_reviewed_at, excluded_from_model, null_rate, distinct_count
 		 FROM columns WHERE workspace_id = $1 ORDER BY dataset_id, name ASC`,
 		workspaceID,
@@ -102,13 +103,15 @@ func scanColumns(rows pgx.Rows) ([]domain.Column, error) {
 		var (
 			c             domain.Column
 			inferredType  string
+			fitRates      []byte
 			piiReviewedAt *time.Time
 		)
-		if err := rows.Scan(&c.ID, &c.DatasetID, &c.Name, &inferredType, &c.TypeConfidence,
+		if err := rows.Scan(&c.ID, &c.DatasetID, &c.Name, &inferredType, &c.TypeConfidence, &fitRates,
 			&c.PIIFlag, &c.PIIPattern, &piiReviewedAt, &c.ExcludedFromModel, &c.NullRate, &c.DistinctCount); err != nil {
 			return nil, fmt.Errorf("scanning column: %w", err)
 		}
 		c.InferredType = domain.InferredType(inferredType)
+		c.TypeFitRates = parseFitRates(fitRates)
 		c.PIIReviewedAt = formatNullableTime(piiReviewedAt)
 		out = append(out, c)
 	}
@@ -123,14 +126,15 @@ func (r *ColumnRepository) GetByID(ctx context.Context, id string) (domain.Colum
 	var (
 		c             domain.Column
 		inferredType  string
+		fitRates      []byte
 		piiReviewedAt *time.Time
 	)
 	err := r.pool.QueryRow(ctx,
-		`SELECT id, dataset_id, name, inferred_type, type_confidence,
+		`SELECT id, dataset_id, name, inferred_type, type_confidence, type_fit_rates,
 		        pii_flag, pii_pattern, pii_reviewed_at, excluded_from_model, null_rate, distinct_count
 		 FROM columns WHERE id = $1`,
 		id,
-	).Scan(&c.ID, &c.DatasetID, &c.Name, &inferredType, &c.TypeConfidence,
+	).Scan(&c.ID, &c.DatasetID, &c.Name, &inferredType, &c.TypeConfidence, &fitRates,
 		&c.PIIFlag, &c.PIIPattern, &piiReviewedAt, &c.ExcludedFromModel, &c.NullRate, &c.DistinctCount)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -139,6 +143,7 @@ func (r *ColumnRepository) GetByID(ctx context.Context, id string) (domain.Colum
 		return domain.Column{}, fmt.Errorf("getting column: %w", err)
 	}
 	c.InferredType = domain.InferredType(inferredType)
+	c.TypeFitRates = parseFitRates(fitRates)
 	c.PIIReviewedAt = formatNullableTime(piiReviewedAt)
 	return c, nil
 }
@@ -152,14 +157,15 @@ func (r *ColumnRepository) GetByIDForWorkspace(ctx context.Context, id, workspac
 	var (
 		c             domain.Column
 		inferredType  string
+		fitRates      []byte
 		piiReviewedAt *time.Time
 	)
 	err := r.pool.QueryRow(ctx,
-		`SELECT id, dataset_id, name, inferred_type, type_confidence,
+		`SELECT id, dataset_id, name, inferred_type, type_confidence, type_fit_rates,
 		        pii_flag, pii_pattern, pii_reviewed_at, excluded_from_model, null_rate, distinct_count
 		 FROM columns WHERE id = $1 AND workspace_id = $2`,
 		id, workspaceID,
-	).Scan(&c.ID, &c.DatasetID, &c.Name, &inferredType, &c.TypeConfidence,
+	).Scan(&c.ID, &c.DatasetID, &c.Name, &inferredType, &c.TypeConfidence, &fitRates,
 		&c.PIIFlag, &c.PIIPattern, &piiReviewedAt, &c.ExcludedFromModel, &c.NullRate, &c.DistinctCount)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -168,23 +174,78 @@ func (r *ColumnRepository) GetByIDForWorkspace(ctx context.Context, id, workspac
 		return domain.Column{}, fmt.Errorf("getting column for workspace: %w", err)
 	}
 	c.InferredType = domain.InferredType(inferredType)
+	c.TypeFitRates = parseFitRates(fitRates)
 	c.PIIReviewedAt = formatNullableTime(piiReviewedAt)
 	return c, nil
 }
 
 // UpdateInferredType overrides a column's inferred type per FEAT-006 — the user's explicit review
-// decision on screens/07-ingest-confirmation.md. type_confidence is set to 1.0: this is now a
-// human-confirmed value, not a heuristic guess, and every downstream reader of type_confidence
-// (including relationship inference's type-compatibility signal) should treat it accordingly.
+// decision on screens/07-ingest-confirmation.md — and moves type_confidence to the fit rate measured
+// for the newly-chosen type.
+//
+// This previously set type_confidence to a flat 1.0, on the reasoning that a human-confirmed value
+// outranks a heuristic guess. That reasoning does not survive contact with what the number is for. A
+// user correcting `text` to `whole number` on a column where a third of the values cannot convert was
+// shown HIGH / 100% — not stale, but fabricated, and precisely on the screen README calls the
+// product's highest-risk UX. Confirming a type says what the user INTENDED; it says nothing about
+// whether the data supports it, and only the second of those is worth a badge.
+//
+// The rate is read from the fit rates measured once at profiling, so this is a lookup inside one
+// UPDATE: no engine query, and no waking a sleeping engine to redraw a badge (FEAT-011).
+//
+// COALESCE handles columns profiled before migration 00006, whose type_fit_rates is '{}': those keep
+// their existing type_confidence rather than dropping to a confident-looking zero. Such a column
+// reports the old inference's rate until it is re-ingested — visibly imperfect, but honest, and it
+// cannot be fixed without re-scanning data this function deliberately does not touch.
 func (r *ColumnRepository) UpdateInferredType(ctx context.Context, id string, t domain.InferredType) error {
 	_, err := r.pool.Exec(ctx,
-		`UPDATE columns SET inferred_type = $2, type_confidence = 1.0 WHERE id = $1`,
+		`UPDATE columns
+		    SET inferred_type = $2,
+		        type_confidence = COALESCE((type_fit_rates ->> $2)::double precision, type_confidence)
+		  WHERE id = $1`,
 		id, string(t),
 	)
 	if err != nil {
 		return fmt.Errorf("updating column inferred type: %w", err)
 	}
 	return nil
+}
+
+// fitRatesJSON encodes a column's per-type fit rates for storage. A nil or empty map is stored as an
+// empty JSON object rather than NULL, matching the column's NOT NULL DEFAULT '{}'.
+func fitRatesJSON(rates map[domain.InferredType]float64) []byte {
+	if len(rates) == 0 {
+		return []byte("{}")
+	}
+	out := make(map[string]float64, len(rates))
+	for t, rate := range rates {
+		out[string(t)] = rate
+	}
+	encoded, err := json.Marshal(out)
+	if err != nil {
+		// Only unencodable floats (NaN/Inf) can reach here, which would mean a profiling bug. Storing
+		// an empty object degrades to the pre-00006 behaviour rather than failing the whole ingest
+		// over a badge.
+		return []byte("{}")
+	}
+	return encoded
+}
+
+// parseFitRates decodes stored per-type fit rates. Unparseable or absent data yields a nil map, which
+// callers must read as "unknown" — never as zero confidence in every type.
+func parseFitRates(raw []byte) map[domain.InferredType]float64 {
+	if len(raw) == 0 {
+		return nil
+	}
+	var decoded map[string]float64
+	if err := json.Unmarshal(raw, &decoded); err != nil || len(decoded) == 0 {
+		return nil
+	}
+	out := make(map[domain.InferredType]float64, len(decoded))
+	for name, rate := range decoded {
+		out[domain.InferredType(name)] = rate
+	}
+	return out
 }
 
 // UpdatePII overrides a column's PII flag and detected pattern per FEAT-007 — the user's explicit

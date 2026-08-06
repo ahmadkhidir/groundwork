@@ -131,7 +131,10 @@ describe("IngestConfirmationScreen", () => {
     render(<IngestConfirmationScreen workspaceId="ws-1" />);
 
     await waitFor(() => expect(screen.getAllByText("customer_id").length).toBeGreaterThan(0));
-    expect(screen.getAllByText("92%").length).toBeGreaterThan(0);
+    // The wording matters, not just the number: "92% confident" reads as confidence in the badge's
+    // own guess, while the badge must state how much of the DATA fits the type currently selected —
+    // which is what makes it still true after a user overrides the type.
+    expect(screen.getAllByText(/92% of values fit/).length).toBeGreaterThan(0);
   });
 
   it("overrides a column's type via PATCH and reflects the confirmed value", async () => {
