@@ -355,7 +355,7 @@ loaded via `next/font` and bound to `--font-display`, `--font-body`, `--font-mon
 | Phase | Features | Status |
 |---|---|---|
 | **A — Foundation** | Scaffold, theme tokens, schema entities, auth, routing skeleton, docker-compose | **Complete** |
-| **1 — Foundation: Workspace, Ingest & Trust** | FEAT-001 ✅ 002 ✅ 003 ✅ 004 ✅ 005 ✅ 006 ✅ 007 ✅ 008 ✅ 009 ✅ 011 ✅ 042 ✅ 044 ✅ | **Complete** — 5 waves + a spec-alignment pass against docs `c2bc326` |
+| **1 — Foundation: Workspace, Ingest & Trust** | FEAT-001 ✅ 002 ✅ 003 ✅ 004 ✅ 005 ✅ 006 ✅ 007 ✅ 008 ✅ 009 ✅ 011 ✅ 042 ✅ 044 ✅ **048 ⬜ 049 ⬜** | **Reopened** — was complete after 5 waves; FEAT-048/049 added to Phase 1 by docs `ff8d5b2` (see below) |
 | **2 — Core Grounded Answer Loop** | FEAT-013, 014, 015, 016, 017, 018, 019 ✅, 020 | In progress — FEAT-019 landed this wave |
 | **3 — Trust & Observability** | FEAT-022, 023, 024, 027, 028, 029, 030 | Not started |
 | **4 — Reports & Delivery** | FEAT-034, 035, 036, 041, 043 | Not started |
@@ -368,6 +368,34 @@ loaded via `next/font` and bound to `--font-display`, `--font-body`, `--font-mon
 > **FEAT-019 (Semantic Layer Storage) landed in Phase 2's Wave 1**, as a solo pass (no parallel
 > dispatch) — see the "FEAT-019 — Semantic Layer Storage" note below for what shipped and what it
 > deliberately left for FEAT-013/FEAT-020.
+
+### Phase 1 reopened for FEAT-048 / FEAT-049 (docs `ff8d5b2`, user-approved 2026-08-06)
+
+Phase 1 was complete and is now reopened with two P0 features. Neither is implemented.
+
+The docs never said what happens when a file is uploaded to a workspace that already contains one.
+A user hit it: an ingest-progress bug (now fixed, `ef02198`) reported failure for uploads that had
+succeeded, they retried, and one workspace ended up with 5 identically-named datasets, 64 columns
+and **216 candidate joins** from comparing every copy against every other. The confirmation screen
+listed the same 16 columns four indistinguishable times, and nothing in the product could remove
+any of it — there is no dataset delete, and FEAT-043 (workspace delete) is Phase 4. The workspace
+had to be destroyed by hand, against Postgres and MinIO directly.
+
+- **FEAT-048 — Single-Dataset Deletion (S).** Must delete database rows **and** both storage objects
+  (original + normalized Parquet). Verified during the manual cleanup: the database FKs cascade on
+  their own, object storage does **not**. An implementation that relies on the cascade will leave
+  every uploaded file behind while telling the user their data is gone.
+- **FEAT-049 — Duplicate Filename Detection (M).** An exact `original_filename` match in the same
+  workspace requires an explicit Replace / Keep both choice before ingest. Applies to a `failed`
+  dataset being retried — the case that caused the incident.
+- **FEAT-008 changes with them:** no candidate joins between datasets sharing a filename, and the
+  skip is shown on the confirmation screen rather than silently producing zero candidates.
+- **Replace discards that dataset's type overrides and PII decisions.** Accepted for Phase 1
+  (FEAT-019 owns cross-ingest replay, Phase 2), but the confirmation must say so. Risks `R-018`
+  and `R-019` record both halves.
+
+Screens 04 (new Datasets panel), 05 (duplicate dialog), and 07 (per-dataset grouping, skip notice)
+were built against the older spec and are now behind it.
 
 ### Phase 2 boundary assumptions (user-approved 2026-08-05)
 
