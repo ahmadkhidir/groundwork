@@ -292,8 +292,10 @@ export interface Column {
   name: string;
   /** Inferred at ingest; reviewable and overridable by the user. */
   inferred_type: InferredType;
-  /** Confidence score in the range 0–1 for the inferred type. */
+  /** Confidence score 0-1 for the current active type — `type_fit_rates[active type]`, never a flat 1.0. */
   type_confidence: number;
+  /** 0-1 fit rate for every candidate type; the confidence badge reads `type_fit_rates[active type]`. Optional: absent for columns profiled before this was introduced. */
+  type_fit_rates?: Partial<Record<InferredType, number>>;
   /** Whether this column was auto-flagged as likely containing sensitive personal data. */
   pii_flag: boolean;
   /** Detected pattern when `pii_flag` is true — e.g. "email", "national_id". Empty string otherwise. */

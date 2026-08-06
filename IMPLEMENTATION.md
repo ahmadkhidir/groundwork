@@ -441,6 +441,45 @@ were built against the older spec and are now behind it.
   failed-dataset retry, Replace deletes via FEAT-048), `IngestConfirmationScreen.test.tsx` (skip
   notice + manual-add link).
 
+### Post-closure bugfix — type-override confidence badge (FEAT-006), committed after the closure wave
+
+A user report exposed a real lying-badge regression on the Ingest Confirmation "Types" step: after
+overriding a column's type (e.g. `ACCT_DATE_OPEN` to `Date`), the confidence badge still showed
+**100% / HIGH** even though the newly selected type could not be 100%. Root cause was two-pass:
+
+1. **Server** — `handleUpdateColumn` (`confirmation.go`) set `col.TypeConfidence = 1.0` on the
+   in-memory copy before building the PATCH response, fabricating "100% of values fit this type".
+   The database write (via `ColumnRepository.UpdateInferredType`, the COALESCE in `columns.go`) was
+   already correct — it read the newly selected type's measured fit rate. The response lied while the
+   DB told the truth, and the client merged the response.
+2. **Client** — `TypeReviewStep` read the badge only from `col.type_confidence`, never from
+   `type_fit_rates`, and had no in-flight selection state; `type_fit_rates` was in no API response
+   and in no client type. So even a correct server could not satisfy FEAT-006's "badge updates in the
+   same interaction" requirement.
+
+Docs statement this violated (exact): features.md FEAT-006 "Overriding a type updates the confidence
+badge, not just the dropdown… the badge updates immediately — in the same interaction, no loading
+state — to show the precomputed fit rate for the newly selected type"; screens/07 "The badge rendered
+for a column is `type_fit_rates[override ?? inferred_type]`."
+
+**Fix:**
+
+- **Server** — the override handler now mirrors the SQL's COALESCE: move `TypeConfidence` to the
+  newly selected type's measured fit rate from `TypeFitRates`; a pre-00006 column with no rates keeps
+  its existing confidence. `type_fit_rates` is now emitted on `publicColumn` (profiling.go),
+  `publicConfirmationColumn` (confirmation.go list), and the PATCH response (via `toPublicColumn`).
+- **Client** — `ConfirmationColumn` and schema `Column` carry optional `type_fit_rates`; the badge
+  reads `typeFitRate(col, active)` (fit-rate lookup, COALESCE-consistent fallback). `TypeReviewStep`
+  keeps per-row pending-override state so the badge + dropdown update in the same interaction, and
+  reverts to the server-backed value when the save fails.
+- **Tests** — the old `TestUpdateColumnOverridesInferredType` asserted the buggy `1.0`; it (and the
+  fake store, which mirrored the bug) now assert the measured fit rate plus a pre-migration
+  COALESCE-fallback case; client tests add same-interaction badge update (PATCH never resolves) and
+  a failure-revert assertion, and drop the fabricated `type_confidence: 1`.
+
+Verification: server `go vet` + fresh `go test` + `gofmt -l` clean; web `tsc --noEmit` + `vitest`
+139/139 + `eslint` (0 warnings) + `next build` all green.
+
 **Reported doc/architecture ambiguities from this wave (routed to product-shaper, not fixed):**
 
 1. **`Column.type_overridden_at` does not exist in schema.md.** FEAT-048 requires the confirmation to

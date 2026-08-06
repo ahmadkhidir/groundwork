@@ -52,8 +52,15 @@ type publicColumn struct {
 	Name           string  `json:"name"`
 	InferredType   string  `json:"inferred_type"`
 	TypeConfidence float64 `json:"type_confidence"`
-	PIIFlag        bool    `json:"pii_flag"`
-	PIIPattern     string  `json:"pii_pattern,omitempty"`
+	// TypeFitRates is the 0-1 fit rate for EVERY candidate type (schema.md Column.type_fit_rates).
+	// The confidence badge for whichever type is currently active is a client-side lookup into this
+	// map — FEAT-006's "updates in the same interaction" requirement — so it travels with every
+	// column the client renders. Empty for columns profiled before migration 00006; clients treat a
+	// missing entry as "unknown" and fall back to TypeConfidence, mirroring UpdateInferredType's
+	// COALESCE.
+	TypeFitRates map[domain.InferredType]float64 `json:"type_fit_rates,omitempty"`
+	PIIFlag      bool                            `json:"pii_flag"`
+	PIIPattern   string                          `json:"pii_pattern,omitempty"`
 	// PIIReviewedAt is RFC 3339, or "" when no user has ever explicitly reviewed this column's PII
 	// flag. Per schema.md, that emptiness is what distinguishes a column that was reviewed and
 	// cleared from one that was simply never flagged (FEAT-007).
@@ -70,6 +77,7 @@ func toPublicColumn(c domain.Column) publicColumn {
 		Name:              c.Name,
 		InferredType:      string(c.InferredType),
 		TypeConfidence:    c.TypeConfidence,
+		TypeFitRates:      c.TypeFitRates,
 		PIIFlag:           c.PIIFlag,
 		PIIPattern:        c.PIIPattern,
 		PIIReviewedAt:     c.PIIReviewedAt,

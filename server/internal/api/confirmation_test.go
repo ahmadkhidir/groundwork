@@ -77,7 +77,12 @@ func (f *fakeConfirmationColumnStore) GetByIDForWorkspace(ctx context.Context, i
 func (f *fakeConfirmationColumnStore) UpdateInferredType(ctx context.Context, id string, t domain.InferredType) error {
 	c := f.byID[id]
 	c.InferredType = t
-	c.TypeConfidence = 1.0
+	// Mirrors ColumnRepository.UpdateInferredType's COALESCE (columns.go): move confidence to the
+	// newly selected type's measured fit rate, keeping the existing confidence when the map lacks
+	// that type (a column profiled before migration 00006 — "unknown", never fabricated 1.0).
+	if rate, ok := c.TypeFitRates[t]; ok {
+		c.TypeConfidence = rate
+	}
 	f.byID[id] = c
 	return nil
 }
@@ -212,7 +217,18 @@ func TestUpdateColumnOverridesInferredType(t *testing.T) {
 	workspaces := newFakeWorkspaceStore()
 	workspaces.byID["ws-1"] = domain.Workspace{ID: "ws-1", OwnerID: "user-1"}
 	columns := newFakeConfirmationColumnStore()
-	columns.put("ws-1", domain.Column{ID: "col-1", DatasetID: "ds-1", Name: "zip", InferredType: domain.TypeInteger, TypeConfidence: 0.6})
+	columns.put("ws-1", domain.Column{
+		ID:             "col-1",
+		DatasetID:      "ds-1",
+		Name:           "zip",
+		InferredType:   domain.TypeInteger,
+		TypeConfidence: 0.6,
+		TypeFitRates: map[domain.InferredType]float64{
+			domain.TypeInteger: 0.6,
+			domain.TypeString:  0.35,
+			domain.TypeNumber:  0.0,
+		},
+	})
 	router := newTestConfirmationRouter(workspaces, &fakeConfirmationDatasetStore{byID: map[string]domain.Dataset{}}, columns, &fakeConfirmationCandidateJoinStore{byID: map[string]domain.CandidateJoin{}}, &fakeRelationshipStore{})
 
 	req := authedRequest(t, http.MethodPatch, "/v1/workspaces/ws-1/columns/col-1", map[string]any{"inferred_type": "string"}, "user-1", domain.TierFree)
@@ -226,8 +242,55 @@ func TestUpdateColumnOverridesInferredType(t *testing.T) {
 	if updated.InferredType != domain.TypeString {
 		t.Errorf("inferred_type = %q, want %q", updated.InferredType, domain.TypeString)
 	}
-	if updated.TypeConfidence != 1.0 {
-		t.Errorf("type_confidence = %v, want 1.0 for a human-confirmed override", updated.TypeConfidence)
+	// FEAT-006: confidence describes the newly selected type, from its MEASURED fit rate — never a
+	// fabricated 1.0. This regression test exists because a flat 1.0 shipped once, showing "100% of
+	// values fit this type" on a column where most values did not.
+	if updated.TypeConfidence != 0.35 {
+		t.Errorf("type_confidence = %v, want 0.35 (the measured fit rate for string)", updated.TypeConfidence)
+	}
+
+	// The response the client merges into the review table must carry the same honest number and the
+	// fit-rate map the badge reads client-side (FEAT-006's same-interaction update).
+	var body struct {
+		Column publicColumn `json:"column"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+	if body.Column.InferredType != "string" {
+		t.Errorf("response inferred_type = %q, want %q", body.Column.InferredType, "string")
+	}
+	if body.Column.TypeConfidence != 0.35 {
+		t.Errorf("response type_confidence = %v, want 0.35", body.Column.TypeConfidence)
+	}
+	if got := body.Column.TypeFitRates[domain.TypeString]; got != 0.35 {
+		t.Errorf("response type_fit_rates[string] = %v, want 0.35", got)
+	}
+	if got := body.Column.TypeFitRates[domain.TypeInteger]; got != 0.6 {
+		t.Errorf("response type_fit_rates[integer] = %v, want 0.6", got)
+	}
+}
+
+// A column profiled before migration 00006 has an empty type_fit_rates; overriding its type must keep
+// its existing type_confidence (the SQL's COALESCE fallback) rather than dropping to zero or being
+// promoted to a fabricated 1.0.
+func TestUpdateColumnOverrideKeepsConfidenceWhenFitRatesAbsent(t *testing.T) {
+	workspaces := newFakeWorkspaceStore()
+	workspaces.byID["ws-1"] = domain.Workspace{ID: "ws-1", OwnerID: "user-1"}
+	columns := newFakeConfirmationColumnStore()
+	columns.put("ws-1", domain.Column{ID: "col-1", DatasetID: "ds-1", Name: "zip", InferredType: domain.TypeInteger, TypeConfidence: 0.6})
+	router := newTestConfirmationRouter(workspaces, &fakeConfirmationDatasetStore{byID: map[string]domain.Dataset{}}, columns, &fakeConfirmationCandidateJoinStore{byID: map[string]domain.CandidateJoin{}}, &fakeRelationshipStore{})
+
+	req := authedRequest(t, http.MethodPatch, "/v1/workspaces/ws-1/columns/col-1", map[string]any{"inferred_type": "string"}, "user-1", domain.TierFree)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+	updated := columns.byID["col-1"]
+	if updated.TypeConfidence != 0.6 {
+		t.Errorf("type_confidence = %v, want existing 0.6 kept when type_fit_rates is empty", updated.TypeConfidence)
 	}
 }
 

@@ -126,8 +126,13 @@ type publicConfirmationColumn struct {
 	Name             string  `json:"name"`
 	InferredType     string  `json:"inferred_type"`
 	TypeConfidence   float64 `json:"type_confidence"`
-	PIIFlag          bool    `json:"pii_flag"`
-	PIIPattern       string  `json:"pii_pattern,omitempty"`
+	// TypeFitRates is the 0-1 fit rate for EVERY candidate type, so the Types step's confidence badge
+	// can update in the same interaction as an override via a client-side lookup into
+	// schema.md Column.type_fit_rates — FEAT-006's contract, and screens/07's stated rendering rule
+	// (`type_fit_rates[override ?? inferred_type]`).
+	TypeFitRates map[domain.InferredType]float64 `json:"type_fit_rates,omitempty"`
+	PIIFlag      bool                            `json:"pii_flag"`
+	PIIPattern   string                          `json:"pii_pattern,omitempty"`
 	// PIIReviewedAt is RFC 3339, or "" when no user has ever reviewed this column's flag — the
 	// distinction FEAT-007 requires between reviewed-and-cleared and never-flagged.
 	PIIReviewedAt     string  `json:"pii_reviewed_at,omitempty"`
@@ -188,6 +193,7 @@ func handleListWorkspaceColumns(workspaces WorkspaceStore, datasets Confirmation
 				Name:              c.Name,
 				InferredType:      string(c.InferredType),
 				TypeConfidence:    c.TypeConfidence,
+				TypeFitRates:      c.TypeFitRates,
 				PIIFlag:           c.PIIFlag,
 				PIIPattern:        c.PIIPattern,
 				PIIReviewedAt:     c.PIIReviewedAt,
@@ -286,7 +292,16 @@ func handleUpdateColumn(workspaces WorkspaceStore, columns ConfirmationColumnSto
 				return
 			}
 			col.InferredType = t
-			col.TypeConfidence = 1.0
+			// The response badge must describe the newly selected type, so move TypeConfidence to
+			// that type's measured fit rate — exactly what UpdateInferredType's SQL does via COALESCE
+			// (columns.go). A flat 1.0 here previously fabricated "100% of values fit this type" on a
+			// column whose data mostly did not, precisely the silent-wrongness failure the docs name
+			// as the product's differentiator. A column profiled before migration 00006 has no fit
+			// rates; like the SQL's COALESCE, it keeps its existing TypeConfidence rather than
+			// dropping to a confident-looking zero.
+			if rate, ok := col.TypeFitRates[t]; ok {
+				col.TypeConfidence = rate
+			}
 		}
 
 		if req.PIIFlag != nil {
@@ -335,19 +350,7 @@ func handleUpdateColumn(workspaces WorkspaceStore, columns ConfirmationColumnSto
 			}
 		}
 
-		respondJSON(w, http.StatusOK, map[string]any{"column": publicColumn{
-			ID:                col.ID,
-			DatasetID:         col.DatasetID,
-			Name:              col.Name,
-			InferredType:      string(col.InferredType),
-			TypeConfidence:    col.TypeConfidence,
-			PIIFlag:           col.PIIFlag,
-			PIIPattern:        col.PIIPattern,
-			PIIReviewedAt:     col.PIIReviewedAt,
-			ExcludedFromModel: col.ExcludedFromModel,
-			NullRate:          col.NullRate,
-			DistinctCount:     col.DistinctCount,
-		}})
+		respondJSON(w, http.StatusOK, map[string]any{"column": toPublicColumn(col)})
 	}
 }
 

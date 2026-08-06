@@ -18,8 +18,21 @@ export interface ConfirmationColumn {
   dataset_created_at: string;
   name: string;
   inferred_type: InferredType;
-  /** Confidence 0-1. Set to 1.0 the moment a human overrides the type or PII flag. */
+  /**
+   * Confidence 0-1, always describing `inferred_type` — the currently ACTIVE type (the user's
+   * override once set, else the inferred type). It is the fit rate for that type read from
+   * `type_fit_rates`, never a flat 1.0: confirming a type says what the user intended, not whether
+   * the data supports it — only the second of those is worth a badge (FEAT-005/FEAT-006).
+   */
   type_confidence: number;
+  /**
+   * 0-1 fit rate for every candidate type, keyed by the `InferredType` enum value — the basis of
+   * the confidence badge. The Types step renders `type_fit_rates[override ?? inferred_type]`, so the
+   * badge updates in the SAME interaction as an override with no re-query (FEAT-006, screens/07).
+   * Optional: columns profiled before this was introduced, and older responses, omit it — treat a
+   * missing key as "unknown" and fall back to `type_confidence` (mirrors the server's COALESCE).
+   */
+  type_fit_rates?: Partial<Record<InferredType, number>>;
   pii_flag: boolean;
   /** Detected (or "manual") pattern when pii_flag is true. Empty string otherwise. */
   pii_pattern?: string;
@@ -102,6 +115,21 @@ export function confidenceTier(score: number): ConfidenceTier {
   if (score >= 0.85) return "high";
   if (score >= 0.6) return "medium";
   return "low";
+}
+
+/**
+ * The live fit rate for a column's ACTIVE type — the override if one is set, else the inferred
+ * type. Reads `type_fit_rates` (measured once at profiling) so the badge describes whichever type
+ * the user selects without a re-query; falls back to the stored `type_confidence` when the map
+ * lacks the key, mirroring the server's COALESCE in `UpdateInferredType` for pre-`type_fit_rates`
+ * columns.
+ */
+export function typeFitRate(
+  column: Pick<ConfirmationColumn, "type_confidence" | "type_fit_rates">,
+  type: InferredType,
+): number {
+  const rate = column.type_fit_rates?.[type];
+  return typeof rate === "number" ? rate : column.type_confidence;
 }
 
 /** One dataset's columns, grouped for the sticky per-dataset sub-header on the Types/PII tables. */

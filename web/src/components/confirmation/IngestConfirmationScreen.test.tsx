@@ -175,9 +175,20 @@ describe("IngestConfirmationScreen", () => {
   });
 
   it("overrides a column's type via PATCH and reflects the confirmed value", async () => {
-    mockLoad([column({ id: "col-1", inferred_type: "integer" })]);
+    mockLoad([
+      column({
+        id: "col-1",
+        inferred_type: "integer",
+        type_fit_rates: { integer: 0.92, string: 0.4 },
+      }),
+    ]);
     patchMock.mockResolvedValue({
-      column: column({ id: "col-1", inferred_type: "string", type_confidence: 1 }),
+      column: column({
+        id: "col-1",
+        inferred_type: "string",
+        type_confidence: 0.4,
+        type_fit_rates: { integer: 0.92, string: 0.4 },
+      }),
     });
     render(<IngestConfirmationScreen workspaceId="ws-1" />);
     await waitFor(() => expect(screen.getAllByText("customer_id").length).toBeGreaterThan(0));
@@ -189,6 +200,43 @@ describe("IngestConfirmationScreen", () => {
       expect(patchMock).toHaveBeenCalledWith("/v1/workspaces/ws-1/columns/col-1", {
         inferred_type: "string",
       }),
+    );
+
+    // The badge describes the override's MEASURED fit rate (40%), never a fabricated 100% — the
+    // flat-1.0 regression this suite exists to prevent.
+    await waitFor(() =>
+      expect(screen.getAllByText(/40% of values fit Text/).length).toBeGreaterThan(0),
+    );
+  });
+
+  // FEAT-006 / screens/07: the confidence badge updates IN THE SAME INTERACTION as the override
+  // dropdown, read client-side from type_fit_rates (already-fetched data) — no loading state, no
+  // waiting on the PATCH. The PATCH below never resolves, which is exactly the point: the badge must
+  // move before any server response exists.
+  it("updates the confidence badge instantly to the override's measured fit rate", async () => {
+    mockLoad([
+      column({
+        id: "col-1",
+        name: "acct_date_open",
+        inferred_type: "date",
+        type_confidence: 0.92,
+        type_fit_rates: { date: 0.92, string: 0.4 },
+      }),
+    ]);
+    patchMock.mockReturnValue(new Promise(() => {}));
+
+    render(<IngestConfirmationScreen workspaceId="ws-1" />);
+    await waitFor(() => expect(screen.getAllByText("acct_date_open").length).toBeGreaterThan(0));
+
+    // Initially the badge describes the inferred type: Date, at its measured 92%.
+    expect(screen.getAllByText(/92% of values fit Date/).length).toBeGreaterThan(0);
+
+    const select = screen.getAllByLabelText("Override type for acct_date_open")[0];
+    await userEvent.selectOptions(select, "string");
+
+    // Now it describes string's measured fit rate — 40% — immediately, same interaction.
+    await waitFor(() =>
+      expect(screen.getAllByText(/40% of values fit Text/).length).toBeGreaterThan(0),
     );
   });
 
@@ -207,6 +255,9 @@ describe("IngestConfirmationScreen", () => {
     await waitFor(() =>
       expect(screen.getAllByText("Could not save this change.").length).toBeGreaterThan(0),
     );
+    // The failed selection reverts to the server-backed value rather than reading as applied —
+    // screens/07's Error state preserves the user's work as revertible, not as stuck.
+    await waitFor(() => expect(select).toHaveValue("integer"));
     // The other column's row is untouched.
     expect(screen.getAllByText("b").length).toBeGreaterThan(0);
   });
