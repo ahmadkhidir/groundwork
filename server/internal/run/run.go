@@ -1,19 +1,19 @@
 // Package run implements FEAT-013's linear persisted executor: the component that takes a created
-// run and advances it — engine wake, plan, generate_sql, execute — writing every boundary to real
-// runs/steps rows as it goes.
+// run and advances it — engine wake, plan, generate_sql, execute, chart_spec, narrate, then Report
+// materialization — writing every boundary to real runs/steps rows as it goes.
 //
 // This is the Phase 2 boundary in concrete form (IMPLEMENTATION.md "Phase 2 boundary assumptions"):
 // a LINEAR executor with no leases, heartbeats, forks, or resume. A step is created the moment its
 // work begins and completed or failed in a single follow-up write; the per-step idempotency key
 // (runID:stepName) is persisted so the schema's retry-safety guarantee is present from day one, but
-// no retry machinery runs this wave. static_check, reconcile, shadow_check, adversarial_review,
-// chart_spec, narrate, and assemble are Phase 3/5 and deliberately not implemented here.
+// no retry machinery runs this wave. static_check, reconcile, shadow_check, adversarial_review, and
+// assemble are Phase 3/5 and deliberately not implemented here.
 //
 // This package is the ONLY route to the model that exists at runtime: the executor builds every
-// payload through model.BuildPayload (the single shared construction function risk_log.md R-016
-// requires — see model/payload.go's package doc for why the type system enforces it) and transmits
-// it through model.Client, which writes the egress log in the same code path as the outbound call
-// (behavior rule 7).
+// metadata payload through model.BuildPayload and every facts payload through model.BuildFactsPayload
+// (the two shared construction functions risk_log.md R-016 requires — see model/payload.go's package
+// doc for why the type system enforces them) and transmits them through model.Client, which writes
+// the egress log in the same code path as the outbound call (behavior rule 7).
 package run
 
 import (
@@ -29,6 +29,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/ahmadkhidir/groundwork/server/internal/config"
 	"github.com/ahmadkhidir/groundwork/server/internal/domain"
 	"github.com/ahmadkhidir/groundwork/server/internal/engine"
 	"github.com/ahmadkhidir/groundwork/server/internal/model"
@@ -60,6 +61,16 @@ type DatasetStore interface {
 // ColumnStore lists a dataset's profiled columns. Satisfied by postgres.ColumnRepository.
 type ColumnStore interface {
 	ListByDataset(ctx context.Context, datasetID string) ([]domain.Column, error)
+}
+
+// ReportStore persists a completed run's Report object. Satisfied by postgres.ReportRepository.
+//
+// This is the materialization seam FEAT-014's report boundary names: when every step has succeeded,
+// the executor writes the Report row itself, in the same completion path — a completed run without
+// its Report is a corrupt state, so a persistence failure here fails the run rather than being
+// swallowed.
+type ReportStore interface {
+	Create(ctx context.Context, report domain.Report) error
 }
 
 // ObjectStore reads dataset files from object storage. Satisfied by storage.Client.
@@ -103,6 +114,7 @@ type Executor struct {
 	provider EngineProvider
 	audit    AuditWriter
 	client   ModelClient
+	reports  ReportStore
 	logger   *slog.Logger
 
 	// Semantic-layer listers feed semantic.AssembleGroundingContext (FEAT-019's building block).
@@ -123,6 +135,7 @@ func NewExecutor(
 	provider EngineProvider,
 	audit AuditWriter,
 	client ModelClient,
+	reports ReportStore,
 	relationships semantic.RelationshipLister,
 	metrics semantic.MetricDefinitionLister,
 	corrections semantic.CorrectionLister,
@@ -137,6 +150,7 @@ func NewExecutor(
 		provider:      provider,
 		audit:         audit,
 		client:        client,
+		reports:       reports,
 		logger:        logger,
 		relationships: relationships,
 		metrics:       metrics,
@@ -247,11 +261,61 @@ func (e *Executor) execute(ctx context.Context, userID string, run domain.Run) {
 	}
 
 	// execute
-	_, err = e.execStep(ctx, sc, domain.StepExecute, generateSQLOutput, log, func() (string, error) {
-		return e.runExecute(ctx, sc, handle, genSQL.SQL, log)
+	var reconcile domain.ReconciliationSummary
+	executeOutput, err := e.execStep(ctx, sc, domain.StepExecute, generateSQLOutput, log, func() (string, error) {
+		return e.runExecute(ctx, sc, handle, genSQL.SQL, &reconcile, log)
 	})
 	if err != nil {
 		log.Error("execute step failed", slog.String("error", err.Error()))
+		e.failRun(ctx, log, run.ID)
+		return
+	}
+
+	var executeOut domain.ExecuteStepOutput
+	if err := json.Unmarshal([]byte(executeOutput), &executeOut); err != nil {
+		log.Error("parsing execute output", slog.String("error", err.Error()))
+		e.failRun(ctx, log, run.ID)
+		return
+	}
+
+	// chart_spec (FEAT-016) — the model emits a parsable ChartSpec over the execute facts only.
+	chartSpecOutput, err := e.execStep(ctx, sc, domain.StepChartSpec, executeOutput, log, func() (string, error) {
+		return e.runChartSpec(ctx, sc, run, executeOut, log)
+	})
+	if err != nil {
+		log.Error("chart_spec step failed", slog.String("error", err.Error()))
+		e.failRun(ctx, log, run.ID)
+		return
+	}
+	var chartOut domain.ChartSpecStepOutput
+	if err := json.Unmarshal([]byte(chartSpecOutput), &chartOut); err != nil {
+		log.Error("parsing chart_spec output", slog.String("error", err.Error()))
+		e.failRun(ctx, log, run.ID)
+		return
+	}
+
+	// narrate (FEAT-015) — plain-language prose over the execute facts only, never data outside the
+	// result set. The step's input is the execute output JSON, per features.md; architecture.md's
+	// PipelineOrder places chart_spec before narrate.
+	narrateOutput, err := e.execStep(ctx, sc, domain.StepNarrate, executeOutput, log, func() (string, error) {
+		return e.runNarrate(ctx, sc, run, executeOut, log)
+	})
+	if err != nil {
+		log.Error("narrate step failed", slog.String("error", err.Error()))
+		e.failRun(ctx, log, run.ID)
+		return
+	}
+	var narrateOut domain.NarrateStepOutput
+	if err := json.Unmarshal([]byte(narrateOutput), &narrateOut); err != nil {
+		log.Error("parsing narrate output", slog.String("error", err.Error()))
+		e.failRun(ctx, log, run.ID)
+		return
+	}
+
+	// Report materialization (FEAT-014's completion boundary): a run whose steps all succeeded but
+	// whose Report could not be persisted is a corrupt state, so a failure here fails the run.
+	if err := e.createReport(ctx, sc, run, reconcile, chartOut.ChartSpec, narrateOut.Narrative); err != nil {
+		log.Error("creating report", slog.String("error", err.Error()))
 		e.failRun(ctx, log, run.ID)
 		return
 	}
@@ -369,9 +433,88 @@ func (e *Executor) runGenerateSQL(ctx context.Context, sc stepContext, run domai
 	return string(encoded), nil
 }
 
+// runChartSpec executes the chart_spec step (FEAT-016): the model emits a parsable domain.ChartSpec
+// over the execute step's facts — a chart type plus column-to-axis encodings, never a chart image or
+// arbitrary markup. The spec is color-free by construction; the Wave 4 renderer assigns the branding
+// chart tokens, and the prompt constrains encodings to be token-compatible.
+func (e *Executor) runChartSpec(ctx context.Context, sc stepContext, run domain.Run, out domain.ExecuteStepOutput, log *slog.Logger) (string, error) {
+	payload, err := e.buildFactsPayload(ctx, sc.workspaceID, run.QuestionText, "", out)
+	if err != nil {
+		return "", err
+	}
+
+	raw, err := e.client.Complete(ctx, sc.workspaceID, sc.userID, chartSpecSystemPrompt, payload)
+	if err != nil {
+		return "", err
+	}
+
+	var spec domain.ChartSpec
+	if err := json.Unmarshal([]byte(raw), &spec); err != nil {
+		return "", fmt.Errorf("chart_spec step returned unparseable output: %w", err)
+	}
+	if !isValidChartType(spec.ChartType) {
+		return "", fmt.Errorf("chart_spec step returned unsupported chart type %q", spec.ChartType)
+	}
+
+	encoded, err := json.Marshal(domain.ChartSpecStepOutput{ChartSpec: spec})
+	if err != nil {
+		return "", fmt.Errorf("encoding chart_spec output: %w", err)
+	}
+	return string(encoded), nil
+}
+
+// runNarrate executes the narrate step (FEAT-015): the model writes plain-language prose explaining
+// what the facts show. It narrates ONLY over the execute result set carried by the facts payload —
+// never over data outside the result set, and never over withheld column values (BuildFactsPayload
+// drops them before the payload is sealed).
+func (e *Executor) runNarrate(ctx context.Context, sc stepContext, run domain.Run, out domain.ExecuteStepOutput, log *slog.Logger) (string, error) {
+	payload, err := e.buildFactsPayload(ctx, sc.workspaceID, run.QuestionText, "", out)
+	if err != nil {
+		return "", err
+	}
+
+	raw, err := e.client.Complete(ctx, sc.workspaceID, sc.userID, narrateSystemPrompt, payload)
+	if err != nil {
+		return "", err
+	}
+
+	var outNarrate domain.NarrateStepOutput
+	if err := json.Unmarshal([]byte(raw), &outNarrate); err != nil {
+		return "", fmt.Errorf("narrate step returned unparseable output: %w", err)
+	}
+	if strings.TrimSpace(outNarrate.Narrative) == "" {
+		return "", errors.New("narrate step returned no narrative")
+	}
+
+	encoded, err := json.Marshal(outNarrate)
+	if err != nil {
+		return "", fmt.Errorf("encoding narrate output: %w", err)
+	}
+	return string(encoded), nil
+}
+
+// isValidChartType reports whether t is one of the chart types the first-party renderer supports and
+// the schema's enum allows.
+func isValidChartType(t domain.ChartType) bool {
+	switch t {
+	case domain.ChartBar, domain.ChartLine, domain.ChartPie, domain.ChartScatter, domain.ChartTable:
+		return true
+	default:
+		return false
+	}
+}
+
 // runExecute executes the generated SQL against the workspace's engine and returns the typed
-// ExecuteStepOutput — the facts FEAT-014 returns, converted to JSON scalars at this boundary.
-func (e *Executor) runExecute(ctx context.Context, sc stepContext, handle engine.Handle, sql string, log *slog.Logger) (string, error) {
+// ExecuteStepOutput — the facts FEAT-014 returns, converted to JSON scalars at this boundary. It
+// also fills reconcile with the run's reconciliation measurements: rows_out is the executed result's
+// row count (never fabricated), rows_in is the measured source-row total the SQL referenced (summed
+// count(*) over the dataset views the SQL mentions), and an exclusion warning is recorded when
+// rows_in could not be measured.
+//
+// The row-count ceiling (config.MaxExecuteRows) is enforced HERE, not at payload time: a query that
+// returns more rows than the ceiling fails the execute step with an honest message, and the run
+// with it — a silent truncation would corrupt every downstream number.
+func (e *Executor) runExecute(ctx context.Context, sc stepContext, handle engine.Handle, sql string, reconcile *domain.ReconciliationSummary, log *slog.Logger) (string, error) {
 	cleanups, err := e.prepareViews(ctx, handle, sc.workspaceID)
 	if err != nil {
 		return "", err
@@ -409,6 +552,22 @@ func (e *Executor) runExecute(ctx context.Context, sc stepContext, handle engine
 	}
 	out.RowCount = len(out.Rows)
 
+	if out.RowCount > config.MaxExecuteRows {
+		return "", fmt.Errorf(
+			"This query returned %d rows, more than the %d-row limit per answer. Refine the question to return fewer rows — for example by adding a filter or using an aggregate — and try again.",
+			out.RowCount, config.MaxExecuteRows)
+	}
+
+	// Reconciliation rows_in is measured at execute time, while the views the SQL references are
+	// still attached: count(*) over each known dataset view the SQL mentions, summed.
+	rowsIn, warnings, err := e.measureRowsIn(ctx, handle, sql, sc.workspaceID)
+	if err != nil {
+		return "", err
+	}
+	reconcile.RowsIn = rowsIn
+	reconcile.RowsOut = int64(out.RowCount)
+	reconcile.ExclusionWarnings = warnings
+
 	// Query executed — the workspace-scoped action is logged by the code that performed it, in the
 	// same code path (audit's one rule).
 	if err := e.audit.WriteQueryExecuted(ctx, sc.workspaceID, sc.userID); err != nil {
@@ -422,19 +581,205 @@ func (e *Executor) runExecute(ctx context.Context, sc stepContext, handle engine
 	return string(encoded), nil
 }
 
-// buildPayload assembles the single shared model payload for a model-calling step: the grounding
-// context from the workspace's semantic layer, plus every complete dataset's column profile under
-// its engine view name. This is the FEAT-013 / R-016 seam — every payload for every step comes from
-// model.BuildPayload, never from per-step ad hoc assembly.
+// measureRowsIn computes the number of source rows the reconciliation summary's rows_in should
+// report for SQL: it scans the SQL for each known dataset view name (tableNameForDataset, the same
+// name prepareViews attaches and the model is taught) and sums count(*) over every view it
+// references.
+//
+// If no known view name can be matched — which should not happen for valid generated SQL but could
+// for hand-crafted SQL — rows_in is set to 0 AND an explicit exclusion warning is recorded, so a
+// fabricated-looking number is never silently reported.
+func (e *Executor) measureRowsIn(ctx context.Context, handle engine.Handle, sql string, workspaceID string) (rowsIn int64, warnings []string, err error) {
+	datasets, err := e.datasets.ListByWorkspace(ctx, workspaceID)
+	if err != nil {
+		return 0, nil, fmt.Errorf("listing datasets for row measurement: %w", err)
+	}
+	known := make([]string, 0, len(datasets))
+	for _, ds := range datasets {
+		if ds.IngestStatus != domain.IngestComplete {
+			continue
+		}
+		known = append(known, tableNameForDataset(ds))
+	}
+
+	lowerSQL := strings.ToLower(sql)
+	var matched int
+	for _, name := range known {
+		if !containsSQLIdentifier(lowerSQL, name) {
+			continue
+		}
+		n, err := e.countRowsInView(ctx, handle, name)
+		if err != nil {
+			return 0, nil, err
+		}
+		rowsIn += n
+		matched++
+	}
+
+	if matched == 0 {
+		warnings = append(warnings,
+			"This query's input row count couldn't be measured — it didn't reference a recognized dataset view, so rows_in is reported as 0.")
+	}
+	return rowsIn, warnings, nil
+}
+
+// countRowsInView runs count(*) over a single engine view and returns the integer total.
+func (e *Executor) countRowsInView(ctx context.Context, handle engine.Handle, view string) (int64, error) {
+	// view is a sanitized identifier (letters/digits/underscore) built by tableNameForDataset, so it
+	// is safe to embed unquoted in the SELECT.
+	rows, err := handle.Query(ctx, "SELECT count(*) FROM "+view)
+	if err != nil {
+		return 0, fmt.Errorf("counting rows in %s: %w", view, err)
+	}
+	defer rows.Close()
+
+	var total int64
+	for rows.Next() {
+		var raw any
+		if err := rows.Scan(&raw); err != nil {
+			return 0, fmt.Errorf("scanning row count for %s: %w", view, err)
+		}
+		total += countValue(raw)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("iterating row count for %s: %w", view, err)
+	}
+	return total, nil
+}
+
+// countValue converts a scanned scalar to an int64 for a count. DuckDB's driver may surface a count
+// as int64, int32, or (for some result typing) float64; all are accepted so a runtime variance never
+// misreports rows_in.
+func countValue(v any) int64 {
+	switch t := v.(type) {
+	case int:
+		return int64(t)
+	case int32:
+		return int64(t)
+	case int64:
+		return t
+	case float32:
+		return int64(t)
+	case float64:
+		return int64(t)
+	case json.Number:
+		if n, err := t.Int64(); err == nil {
+			return n
+		}
+	}
+	return 0
+}
+
+// containsSQLIdentifier reports whether needle (a lowercased dataset view name) appears in haystack
+// as a standalone SQL identifier — not as a suffix or prefix of a longer identifier, which keeps a
+// string constant or a longer name from being miscounted as a reference.
+func containsSQLIdentifier(haystack, needle string) bool {
+	if needle == "" {
+		return false
+	}
+	start := 0
+	for {
+		i := strings.Index(haystack[start:], needle)
+		if i < 0 {
+			return false
+		}
+		pos := start + i
+		beforeOK := pos == 0 || !isIdentifierByte(haystack[pos-1])
+		after := pos + len(needle)
+		afterOK := after == len(haystack) || !isIdentifierByte(haystack[after])
+		if beforeOK && afterOK {
+			return true
+		}
+		start = pos + len(needle)
+	}
+}
+
+// isIdentifierByte reports whether b is a character that can continue a bare SQL identifier.
+func isIdentifierByte(b byte) bool {
+	return b == '_' || (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9')
+}
+
+// createReport materializes the run's Report at completion (FEAT-014's assembly boundary). The
+// Report is fully self-contained: title derived from the question, the narrate step's narrative, the
+// chart_spec step's spec, an empty provenance_links array (FEAT-030 is Phase 3), and the measured
+// reconciliation summary. A run whose steps all succeeded but whose Report cannot be persisted is a
+// corrupt state, so this fails the run rather than being best-effort.
+func (e *Executor) createReport(ctx context.Context, sc stepContext, run domain.Run, reconcile domain.ReconciliationSummary, chart domain.ChartSpec, narrative string) error {
+	report := domain.Report{
+		ID:                    uuid.NewString(),
+		WorkspaceID:           sc.workspaceID,
+		RunID:                 sc.runID,
+		Title:                 deriveReportTitle(run.QuestionText),
+		Narrative:             narrative,
+		ChartSpec:             chart,
+		ProvenanceLinks:       []string{},
+		ReconciliationSummary: reconcile,
+		ParentReportID:        "",
+		CreatedAt:             time.Now().UTC(),
+	}
+	if err := e.reports.Create(ctx, report); err != nil {
+		return fmt.Errorf("persisting report: %w", err)
+	}
+	return nil
+}
+
+// reportTitleMax is the plain character ceiling a derived report title is truncated to. No ellipsis
+// gymnastics — schema.md calls for "a short, human-readable title", and simple truncation is all
+// that adds.
+const reportTitleMax = 80
+
+// deriveReportTitle turns the question text into a short report title by collapsing whitespace and
+// truncating to the length bounded by reportTitleMax.
+func deriveReportTitle(question string) string {
+	title := strings.Join(strings.Fields(strings.TrimSpace(question)), " ")
+	if len(title) > reportTitleMax {
+		title = title[:reportTitleMax]
+	}
+	return title
+}
+
+// buildPayload assembles the single shared model payload for a metadata-only step (plan,
 func (e *Executor) buildPayload(ctx context.Context, workspaceID, question, priorContext string) (model.Payload, error) {
 	grounding, err := semantic.AssembleGroundingContext(ctx, workspaceID, e.relationships, e.metrics, e.corrections)
 	if err != nil {
 		return model.Payload{}, err
 	}
 
+	tables, err := e.assembleTables(ctx, workspaceID)
+	if err != nil {
+		return model.Payload{}, err
+	}
+
+	return model.BuildPayload(question, priorContext, tables, grounding), nil
+}
+
+// buildFactsPayload assembles the facts payload for the narrate and chart_spec steps: the SAME
+// metadata every step sees, plus the executed result set — filtered by model.BuildFactsPayload so
+// any PII-flagged or excluded column's VALUES never enter the payload. This is the R-016 seam for
+// facts-consuming steps: narrate/chart_spec never construct a payload by hand.
+func (e *Executor) buildFactsPayload(ctx context.Context, workspaceID, question, priorContext string, out domain.ExecuteStepOutput) (model.Payload, error) {
+	grounding, err := semantic.AssembleGroundingContext(ctx, workspaceID, e.relationships, e.metrics, e.corrections)
+	if err != nil {
+		return model.Payload{}, err
+	}
+
+	tables, err := e.assembleTables(ctx, workspaceID)
+	if err != nil {
+		return model.Payload{}, err
+	}
+
+	return model.BuildFactsPayload(question, priorContext, tables, grounding, model.Facts{
+		Columns: out.Columns,
+		Rows:    out.Rows,
+	}), nil
+}
+
+// assembleTables builds the TableMetadata list for a workspace's complete datasets, mirroring the
+// metadata surface the payload seam consumes (see buildPayload).
+func (e *Executor) assembleTables(ctx context.Context, workspaceID string) ([]model.TableMetadata, error) {
 	datasets, err := e.datasets.ListByWorkspace(ctx, workspaceID)
 	if err != nil {
-		return model.Payload{}, fmt.Errorf("listing datasets: %w", err)
+		return nil, fmt.Errorf("listing datasets: %w", err)
 	}
 
 	tables := make([]model.TableMetadata, 0, len(datasets))
@@ -446,7 +791,7 @@ func (e *Executor) buildPayload(ctx context.Context, workspaceID, question, prio
 		}
 		cols, err := e.columns.ListByDataset(ctx, ds.ID)
 		if err != nil {
-			return model.Payload{}, fmt.Errorf("listing columns for %s: %w", ds.ID, err)
+			return nil, fmt.Errorf("listing columns for %s: %w", ds.ID, err)
 		}
 		tm := model.TableMetadata{
 			DatasetID: ds.ID,
@@ -467,10 +812,9 @@ func (e *Executor) buildPayload(ctx context.Context, workspaceID, question, prio
 	}
 
 	if len(tables) == 0 {
-		return model.Payload{}, errors.New("workspace has no complete datasets to query")
+		return nil, errors.New("workspace has no complete datasets to query")
 	}
-
-	return model.BuildPayload(question, priorContext, tables, grounding), nil
+	return tables, nil
 }
 
 // prepareViews makes every complete dataset queryable inside the workspace's engine session by
@@ -650,3 +994,45 @@ Write read-only analytical SQL that answers the question. Requirements:
 - Never return row-level values for columns that are withheld (they will not be listed in the payload — do not try to select them).
 
 Respond with ONLY a JSON object of the form {"sql": "..."} containing the SQL as a string. Escape any embedded double quotes. Do not include markdown fences or any text outside the JSON object.`
+
+// chartSpecSystemPrompt frames the chart_spec step (FEAT-016): the model receives the executed
+// result set (the facts) and must emit a parsable ChartSpec — never a chart image or freeform
+// markup. The spec is color-free BY CONTRACT: the first-party renderer assigns the branding chart
+// tokens (chart-cat-1..8 / chart-seq / chart-div from branding.md) in Wave 4, so the model must
+// choose token-compatible encodings now — a categorical series split for the categorical tokens, a
+// single magnitude column for the sequential ramp, and above/below-baseline directionality for the
+// diverging tokens (red/green-coded meaning must only ever be used for directional values).
+//
+// A chart only earns its place when it adds clarity; otherwise the spec MUST be a table.
+const chartSpecSystemPrompt = `You are the chart specification step of a grounded analytics system. You are given the executed result set of a user's question: its column names and the actual data rows.
+
+Your job is to decide whether a chart would make this result set clearer, and if so emit a structured specification for the first-party renderer to draw. You NEVER produce an image, SVG, HTML, or any markup — only a JSON specification object.
+
+Respond with ONLY a JSON object of the form:
+{"chart_type": "...", "x_axis_column": "...", "y_axis_column": "...", "series_column": "...", "title": "..."}
+
+Rules:
+- chart_type must be exactly one of: "bar", "line", "pie", "scatter", "table".
+- When a chart does not add clarity (few rows, one value, purely tabular detail, or when the question is answered best by reading the numbers), chart_type MUST be "table". Every result set still gets a spec.
+- x_axis_column and y_axis_column must be actual column names from the result set. For a "table" spec, set them to the most relevant columns (or empty strings if not applicable); title still describes the table.
+- series_column splits the data into multiple series. It may be empty (single series). NEVER invent a series column that is not present in the result set.
+- The spec carries NO colors. The renderer assigns the product's chart tokens, so choose encodings that stay token-compatible: use series_column for genuinely categorical groupings (the categorical token family has 8 fixed hues, assigned in fixed order), and for values that are directional relative to a baseline (above/below budget, period-over-period change) prefer a bar/line with the diverging token family in mind. Never encode direction as two unrelated categorical series.
+- title is a short, human-readable chart title that does not restate the entire question.
+Use ONLY column names exactly as they appear in the result set. Do not include markdown fences or any text outside the JSON object.`
+
+// narrateSystemPrompt frames the narrate step (FEAT-015): the model receives ONLY the executed
+// result set (the facts) plus the workspace's schema metadata — it narrates over the facts and
+// nothing else. Every stated number must be traceable to the result set (FEAT-030's eligibility),
+// and the prose must stand alone for someone who never sees the SQL or schema.
+const narrateSystemPrompt = `You are the narrative step of a grounded analytics system. You are given the executed result set of a user's question: the actual data rows the query returned, alongside the workspace's schema metadata.
+
+Your job is to write a clear, plain-language answer to the user's question that explains what the data shows. The result set is the ONLY data you may reference — never invent, estimate, or reach for numbers that are not present in the rows you were given.
+
+Rules:
+- Write prose a non-technical reader can act on. No SQL, no column names as jargon, no schema terminology.
+- Every number you state must come from the provided result set, and each one should be stated so a reader could trace it back to a specific value (it will be eligible for provenance linking).
+- If the result set contains values that a human should treat carefully (for example a null in a key cell or an obvious outlier), mention it plainly rather than glossing over it.
+- Keep the narrative focused and proportionate to the question. Do not pad.
+- Do not restate the raw table row by row; summarize, compare, and call out what matters.
+
+Respond with ONLY a JSON object of the form {"narrative": "..."} containing the narrative as a single string. Escape any embedded double quotes. Do not include markdown fences or any text outside the JSON object.`

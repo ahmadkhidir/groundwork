@@ -356,7 +356,7 @@ loaded via `next/font` and bound to `--font-display`, `--font-body`, `--font-mon
 |---|---|---|
 | **A — Foundation** | Scaffold, theme tokens, schema entities, auth, routing skeleton, docker-compose | **Complete** |
 | **1 — Foundation: Workspace, Ingest & Trust** | FEAT-001 ✅ 002 ✅ 003 ✅ 004 ✅ 005 ✅ 006 ✅ 007 ✅ 008 ✅ 009 ✅ 011 ✅ 042 ✅ 044 ✅ 048 ✅ 049 ✅ | **Complete** — reopened for FEAT-048/049 by docs `ff8d5b2` (2026-08-06) and closed by this wave; see below |
-| **2 — Core Grounded Answer Loop** | FEAT-013 ✅, 014, 015, 016, 017, 018, 019 ✅, 020 | In progress — FEAT-019 (Wave 1) and FEAT-013 (Wave 2) landed |
+| **2 — Core Grounded Answer Loop** | FEAT-013 ✅, 014 ✅, 015 ✅, 016 ✅, 017, 018, 019 ✅, 020 | In progress — FEAT-019 (Wave 1), FEAT-013 (Wave 2), FEAT-014/015/016 (Wave 3) landed |
 | **3 — Trust & Observability** | FEAT-022, 023, 024, 027, 028, 029, 030 | Not started |
 | **4 — Reports & Delivery** | FEAT-034, 035, 036, 041, 043 | Not started |
 | **5 — Polish & Expansion** | FEAT-010, 012, 021, 025, 026, 031, 032, 033, 037, 038, 039, 040, 045, 046, 047 | Not started |
@@ -373,6 +373,15 @@ loaded via `next/font` and bound to `--font-display`, `--font-body`, `--font-mon
 > as a solo pass — see the "FEAT-013 — Natural-Language Question → SQL Generation" note below for
 > what shipped, what the linear executor persists, and what the approved phase boundary left for
 > later waves.
+>
+> **FEAT-014 (SQL Execution & Fact Return), FEAT-015 (Narrative Generation), and FEAT-016 (Chart Spec
+> Generation) landed in Phase 2's Wave 3** as a single implementation pass: the executor's pipeline
+> grew to plan → generate_sql → execute → chart_spec → narrate, then materializes a self-contained
+> `Report` (title, narrative, chart spec, reconciliation summary, empty provenance link array) at
+> completion; the report read endpoint `GET /api/workspaces/:id/reports/:reportId` serves it. The
+> row-ceiling AC lands here (`config.MaxExecuteRows`, 10k, fail-closed); the R-016 facts seam extends
+> to `model.BuildFactsPayload`, which drops any PII/excluded column's VALUES from the facts before
+> they reach chart_spec/narrate; `chart_spec`/`narrate` emit only parsable payloads (no chart image, no markup). Wave 3 is verification-clean (`go vet` + fresh `go test` + `gofmt`).
 
 ### Phase 1 reopened for FEAT-048 / FEAT-049 (docs `ff8d5b2`, user-approved 2026-08-06) — CLOSED
 
@@ -756,11 +765,12 @@ library. `make` puts it on PATH; running the binary by hand needs it there too.
   `WorkspaceHomeScreen` now renders it; the Run Viewer route page replaces its `PlaceholderScreen`.
 
 **Boundaries honoured (approved 2026-08-05):** linear executor (no leases/heartbeats/forks/resume);
-polling viewer (no stream); unanswerable → failed run with plain reason; wave ends at `execute` —
-facts persisted, **no Report row** (FEAT-034 Phase 4); SQL visible but not editable (FEAT-018 next
-wave); static_check/reconcile/shadow_check/adversarial_review/chart_spec/narrate/assemble are
-Phase 3/5 and deliberately absent. `execute` output rows are unbounded this wave (the row-ceiling AC
-belongs to FEAT-014).
+polling viewer (no stream); unanswerable → failed run with plain reason; **as of this wave** the
+pipeline ended at `execute` with no Report row (FEAT-034 Phase 4) and an unbounded row count — both
+were then extended by Wave 3: `chart_spec`/`narrate` and Report materialization (row ceiling
+`config.MaxExecuteRows`) landed there, so this note reads as the Wave 2 snapshot, not current state.
+SQL visible but not editable (FEAT-018 next wave); static_check/reconcile/shadow_check/
+adversarial_review are Phase 3/5 and still deliberately absent.
 
 **Assumptions / notes:**
 
@@ -780,6 +790,57 @@ naming/identifier sanitization/value conversion), `api/runs_test.go` (create/get
 navigation, disabled/error). Verification: server `make vet` + fresh `make test` (all packages) +
 `make build` + `gofmt -l` clean; web `vitest` 149/149 + `eslint` + `tsc --noEmit` + `next build` all
 green.
+
+### FEAT-014 / FEAT-015 / FEAT-016 — SQL Execution, Narrative, Chart Spec + Report materialization (Phase 2, Wave 3)
+
+**What shipped:**
+
+- `server/internal/run/run.go` (extended) — the executor pipeline grew to
+  `plan → generate_sql → execute → chart_spec → narrate`, then materializes a self-contained
+  `Report` at completion before marking the run `complete`. The row-ceiling AC from FEAT-014 lands
+  here: a result set over `config.MaxExecuteRows` (10,000, user-confirmed 2026-08-06) fails the
+  execute step with an honest message — never a silent truncation. The reconciliation summary is
+  measured at execute time: `rows_out` is the executed `RowCount`, `rows_in` is the summed
+  `count(*)` over every known dataset view the SQL references (name-matched via the same
+  `tableNameForDataset` convention the model is taught), with an explicit exclusion warning when no
+  known view can be matched (rows_in = 0 rather than a fabricated number). `chart_spec` runs before
+  `narrate` per architecture.md's `PipelineOrder`; the narrate step's input is the execute output
+  JSON (FEAT-015's literal contract), and both facts-consuming steps receive their payload only
+  through `model.BuildFactsPayload`.
+- `server/internal/model/payload.go` (extended) — `BuildFactsPayload`: the same sealed construction
+  seam as `BuildPayload`, plus the executed result set. Any result column whose `PIIFlag` or
+  `ExcludedFromModel` is set in the workspace metadata has its VALUES dropped (column index removed
+  from both the column list and every row, order and row width preserved) before the payload is
+  sealed — the R-016 value-withholding rule now covers facts, not just metadata. The payload wire
+  shape is unchanged except an optional `facts` key that metadata-only steps never carry.
+- `server/internal/domain/run.go` (extended) — `ChartSpecStepOutput`, `NarrateStepOutput` step
+  output shapes (the domain `ChartSpec`, `Report`, and `ReconciliationSummary` types already existed
+  in `domain.go`; no schema change — the `reports` table was in migration `00001`).
+- `server/internal/store/postgres/reports.go` (new) — `ReportRepository`: `Create` (JSONB
+  chart_spec/reconciliation_summary; provenance deliberately not written — FEAT-030 Phase 3) and
+  workspace-scoped `GetByID` (a cross-workspace id reads as not-found in SQL).
+- `server/internal/api/reports.go` (new) — `GET /v1/workspaces/:id/reports/:reportId` serving the
+  fully self-contained report (ownership enforced, 404 non-enumeration). Wired via
+  `Dependencies.Reports` + `RegisterReportRoutes` in `api.go`, and `ReportRepository` in
+  `cmd/api/main.go`.
+- `server/internal/config/config.go` — `MaxExecuteRows = 10000` as the single config knob for the
+  row ceiling (threshold in config, never hardcoded at a call site).
+
+**Boundaries honoured:** `chart_spec`/`narrate` emit only parsable payloads (no chart image, no
+markup; the chart prompt forces token-compatible encodings — categorical series for the
+`chart-cat-1..8` tokens, directional series for `chart-div`, `table` when a chart adds no clarity).
+`ProvenanceLinks` stays an empty array (FEAT-030 Phase 3). Report persistence failure fails the run
+— a corrupt state is never reported complete. Row measurement is a bounded identifier scan, not a
+SQL parser.
+
+**Tests:** `run_test.go` (happy path now 5 steps + report materialization with reconciliation
+assertions; row-ceiling failure; chart_spec garbage → run failed; narrate garbage → run failed with
+no report; report-persistence failure → run failed; `measureRowsIn` matched/unmatched + exclusion
+warning; `deriveReportTitle` truncation), `model/payload_test.go` (BuildFactsPayload drops PII and
+excluded VALUES from facts; facts key absent on metadata-only payloads; wire shape), `api/
+reports_test.go` (auth, 200, unknown/cross-workspace/non-owner 404s), `config_test.go`
+(`MaxExecuteRows` pin). Verification: `make vet` + fresh `make test` (all packages) + `make build` +
+`gofmt -l` clean.
 
 ## 8. Key Commands
 

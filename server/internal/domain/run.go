@@ -2,11 +2,12 @@
 // Step.Output — both JSON-ENCODED STRINGS on domain.Step (see domain.go's doc comment on Step),
 // because payload shape genuinely varies by StepName. Run and Step themselves already exist in
 // domain.go; this file only adds the typed shapes for parsing/building those strings at the
-// boundary, for the three steps this wave's linear executor implements: plan, generate_sql, execute.
+// boundary: plan, generate_sql, execute, chart_spec, and narrate — the five steps this wave's
+// linear executor implements.
 //
-// Phase 2 boundary (see IMPLEMENTATION.md "Phase 2 boundary assumptions"): only plan, generate_sql,
-// and execute run this wave. static_check, reconcile, shadow_check, adversarial_review, chart_spec,
-// narrate, and assemble are Phase 3/5 and have no payload shape here yet.
+// Phase 2 boundary (see IMPLEMENTATION.md "Phase 2 boundary assumptions"): plan, generate_sql,
+// execute, chart_spec, and narrate run this wave. static_check, reconcile, shadow_check,
+// adversarial_review, and assemble are Phase 3/5 and have no payload shape here yet.
 package domain
 
 // PlanStepOutput is the parsed shape of the "plan" step's Step.Output.
@@ -42,4 +43,23 @@ type ExecuteStepOutput struct {
 	// RowCount is len(Rows), carried explicitly so a client never has to recompute it and so a future
 	// reconcile step (Phase 3) has a stable field name to diff against.
 	RowCount int `json:"row_count"`
+}
+
+// ChartSpecStepOutput is the parsed shape of the "chart_spec" step's Step.Output (FEAT-016).
+//
+// The model emits a parsable domain.ChartSpec — a chart type plus column-to-axis encodings — never
+// a chart image or freeform markup. The spec is deliberately color-free: the first-party renderer
+// assigns branding chart tokens (chart-cat-1..8 / chart-seq / chart-div, branding.md) in Wave 4, and
+// the generation prompt forces token-compatible encodings so that assignment is always well-defined.
+type ChartSpecStepOutput struct {
+	ChartSpec ChartSpec `json:"chart_spec"`
+}
+
+// NarrateStepOutput is the parsed shape of the "narrate" step's Step.Output (FEAT-015).
+//
+// Narrative is plain-language prose over ONLY the facts returned by execute — the model never sees
+// data outside the result set, and the payload it receives is built by model.BuildFactsPayload,
+// which applies the same R-016 filter to result values as BuildPayload applies to metadata.
+type NarrateStepOutput struct {
+	Narrative string `json:"narrative"`
 }

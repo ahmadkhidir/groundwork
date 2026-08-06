@@ -115,6 +115,11 @@ type Dependencies struct {
 	Runs        RunStore
 	RunSteps    RunStepStore
 	RunExecutor RunExecutor
+
+	// Reports backs FEAT-014's report read endpoint — screens/09-report-view.md's single self-
+	// contained fetch. Satisfied by postgres.ReportRepository, the same instance the executor uses
+	// to materialize reports on run completion.
+	Reports ReportStore
 }
 
 // Server wires configuration and dependencies into an http.Handler.
@@ -245,6 +250,11 @@ func (s *Server) routes() {
 				// screens/04-workspace-home.md, screens/08-run-viewer.md.
 				if s.deps.Runs != nil && s.deps.RunSteps != nil && s.deps.RunExecutor != nil {
 					RegisterRunRoutes(r, s.deps.Workspaces, s.deps.Runs, s.deps.RunSteps, s.deps.RunExecutor, s.logger)
+				}
+
+				// FEAT-014: read a completed run's materialized Report — screens/09-report-view.md.
+				if s.deps.Reports != nil {
+					RegisterReportRoutes(r, s.deps.Workspaces, s.deps.Reports, s.logger)
 				}
 			})
 		}

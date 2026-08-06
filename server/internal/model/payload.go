@@ -11,19 +11,24 @@
 //
 //  1. Payload's fields are UNEXPORTED. Nothing outside this package can construct a populated
 //     Payload — there is no struct literal a caller in internal/run (or any future step package) can
-//     write that produces one. The only way to obtain a Payload is to call BuildPayload, which is
-//     where the filtering rule lives.
+//     write that produces one. The only ways to obtain a Payload are to call BuildPayload (metadata
+//     only) or BuildFactsPayload (metadata plus the R-016-filtered execute result set) — both of
+//     which are where the filtering rules live.
 //  2. Client.Complete (client.go) accepts a Payload, not a []byte, string, or any other shape a
 //     caller could hand-assemble and slip past BuildPayload. A future model-calling step (Phase 3's
-//     adversarial_review, narrate) can only compile against this seam by first calling BuildPayload.
-//  3. Payload never carries row-level data at all, filtered or not — per architecture.md's egress
-//     rule, "schema/profile/aggregate metadata by default... never raw rows." ColumnMetadata below
-//     has no field for a data value; there is nothing to accidentally forget to strip.
+//     adversarial_review, or a facts-consuming narrate/chart_spec) can only compile against this
+//     seam by first calling one of the two constructors.
+//  3. Metadata payloads never carry row-level data at all, filtered or not — per architecture.md's
+//     egress rule, "schema/profile/aggregate metadata by default... never raw rows." ColumnMetadata
+//     below has no field for a data value; there is nothing to accidentally forget to strip. Row
+//     data exists only in the second constructor's Facts input, where BuildFactsPayload drops every
+//     flagged/excluded column's values before the payload is sealed.
 package model
 
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/ahmadkhidir/groundwork/server/internal/semantic"
 )
@@ -50,6 +55,23 @@ type TableMetadata struct {
 	// SQL — see internal/run's table-naming helper. Never the object-storage Parquet path.
 	Name    string
 	Columns []ColumnMetadata
+}
+
+// Facts is the executed result set FEAT-015 (narrate) and FEAT-016 (chart_spec) narrate/render
+// against — the VALUES returned by the run's execute step, in contrast to TableMetadata, which
+// carries only schema/profile aggregates.
+//
+// Facts is the second sealed payload input (alongside BuildFactsPayload below): it is the ONE shape
+// that carries real row data toward the model, and it exists so architecture.md's "chart_spec +
+// narrate consume facts only, not a raw context dump" rule has a typed conduit instead of an ad hoc
+// channel. Rows MUST already be JSON scalars (string, float64, bool, or nil) — internal/run converts
+// them at the execute boundary before constructing Facts.
+type Facts struct {
+	// Columns are the result column names, in order, one slot per element of every row.
+	Columns []string
+	// Rows is the executed result set, one []any per row, in Columns order. Every row must have
+	// exactly len(Columns) elements.
+	Rows [][]any
 }
 
 // payloadColumn is what actually reaches the model for one column: always name and type, plus the
@@ -90,7 +112,8 @@ type payloadCorrection struct {
 }
 
 // Payload is the ONLY shape that may reach Client.Complete. Every field is unexported; the sole
-// constructor is BuildPayload. See this file's package doc for why that is load-bearing rather than
+// constructors are BuildPayload (metadata only) and BuildFactsPayload (metadata plus the execute
+// result set, R-016-filtered). See this file's package doc for why that is load-bearing rather than
 // a style preference.
 type Payload struct {
 	question      string
@@ -99,6 +122,16 @@ type Payload struct {
 	relationships []payloadRelationship
 	metrics       []payloadMetric
 	corrections   []payloadCorrection
+	// facts is nil for metadata-only steps (plan, generate_sql); it is populated ONLY through
+	// BuildFactsPayload, after the R-016 value filter has run. See BuildFactsPayload.
+	facts *factSet
+}
+
+// factSet is the serialized form of Facts inside a Payload. Pointer so `omitempty` can drop it from
+// metadata-only payloads entirely — a plan step must not carry a facts key at all.
+type factSet struct {
+	Columns []string `json:"columns"`
+	Rows    [][]any  `json:"rows"`
 }
 
 // wirePayload is Payload's exported mirror, used only internally by JSON to produce the exact bytes
@@ -113,6 +146,9 @@ type wirePayload struct {
 	Relationships []payloadRelationship `json:"relationships,omitempty"`
 	Metrics       []payloadMetric       `json:"metrics,omitempty"`
 	Corrections   []payloadCorrection   `json:"corrections,omitempty"`
+	// Facts is present only when a step is built by BuildFactsPayload (narrate, chart_spec). Its
+	// values have already been filtered by the R-016 exposure rule.
+	Facts *factSet `json:"facts,omitempty"`
 }
 
 // BuildPayload is the single shared payload-construction function FEAT-013's description and R-016's
@@ -183,6 +219,70 @@ func BuildPayload(question, priorContext string, tables []TableMetadata, groundi
 	return out
 }
 
+// BuildFactsPayload constructs the payload for a facts-consuming step — narrate and chart_spec,
+// the two steps architecture.md's egress rule says consume "facts only" (never a raw context dump).
+//
+// It is built on top of the SAME metadata payload as BuildPayload (same tables, same R-016
+// reduction of flagged/excluded columns to name-and-type in the metadata) PLUS the executed result
+// set FEAT-015/FEAT-016 actually narrate against. facts carries row VALUES, which is exactly the
+// category R-016 treats as the risk: any result column whose PIIFlag or ExcludedFromModel is set in
+// the workspace metadata has its VALUES dropped from the facts before the payload is built — the
+// column may still appear, name and type only, in the metadata (that is BuildPayload's job), but not
+// a single value of it ever enters the returned payload. This keeps the "one shared construction
+// function per step-type, no per-step ad hoc filtering" rule intact for the facts-consuming steps
+// too: narrate/chart_spec must never assemble a facts payload by hand.
+//
+// facts.Rows must already be JSON scalars (internal/run converts them at the execute boundary).
+func BuildFactsPayload(question, priorContext string, tables []TableMetadata, grounding semantic.GroundingContext, facts Facts) Payload {
+	out := BuildPayload(question, priorContext, tables, grounding)
+
+	// Build the set of column names whose VALUES must never leave: any column flagged PII or
+	// excluded from the model in ANY known table.
+	flag := make(map[int]bool) // facts.Columns index → drop
+	flagged := flaggedColumnNames(tables)
+	for i, col := range facts.Columns {
+		if flagged[strings.ToLower(strings.TrimSpace(col))] {
+			flag[i] = true
+		}
+	}
+
+	// Reduce: drop the flagged columns' slots from both the column list and every row, preserving
+	// order and row width consistency (every output row has exactly len(outColumns) elements).
+	keptColumns := make([]string, 0, len(facts.Columns))
+	for i, col := range facts.Columns {
+		if !flag[i] {
+			keptColumns = append(keptColumns, col)
+		}
+	}
+	keptRows := make([][]any, 0, len(facts.Rows))
+	for _, row := range facts.Rows {
+		kept := make([]any, 0, len(keptColumns))
+		for i, v := range row {
+			if !flag[i] {
+				kept = append(kept, v)
+			}
+		}
+		keptRows = append(keptRows, kept)
+	}
+
+	out.facts = &factSet{Columns: keptColumns, Rows: keptRows}
+	return out
+}
+
+// flaggedColumnNames returns the lowercased name of every column in tables whose values are
+// withheld by FEAT-007 (PII) or FEAT-010 (excluded_from_model).
+func flaggedColumnNames(tables []TableMetadata) map[string]bool {
+	out := make(map[string]bool)
+	for _, t := range tables {
+		for _, c := range t.Columns {
+			if c.PIIFlag || c.ExcludedFromModel {
+				out[strings.ToLower(c.Name)] = true
+			}
+		}
+	}
+	return out
+}
+
 // JSON renders the exact bytes that will be (or were) sent to the model, as a string. This is what
 // Client.Complete both transmits and writes verbatim to the audit/egress log via
 // audit.Writer.WriteModelCall, in the same code path as the outbound call — never reconciled after
@@ -198,6 +298,7 @@ func (p Payload) JSON() (string, error) {
 		Relationships: p.relationships,
 		Metrics:       p.metrics,
 		Corrections:   p.corrections,
+		Facts:         p.facts,
 	}
 	body, err := json.Marshal(wire)
 	if err != nil {

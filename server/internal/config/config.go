@@ -25,7 +25,17 @@ import (
 // before upload starts, but that is a UX affordance — this check is the control.
 const MaxUploadBytesDefault int64 = 500 * 1024 * 1024
 
-// EngineIdleTimeoutDefault is how long a session engine may sit idle before teardown.
+// MaxExecuteRows is the ceiling on how many result rows a single query may return — and therefore
+// how many facts may ever feed the narrate/chart_spec payloads (FEAT-014).
+//
+// Confirmed by the product owner on 2026-08-06. features.md FEAT-014 AC-3 states the pipeline
+// scales to the product's "stated row-count ceiling" without naming a figure; this constant is the
+// figure. It applies to three things at once and is the single knob for all three: a query that
+// returns more than this many rows FAILS the run with a clear, honest message (never a silent
+// truncation), and the narrate/chart_spec facts payloads share the same cap.
+const MaxExecuteRows = 10000
+
+// EngineIdleTimeoutDefault is how long a session engine may sit idle before shutdown.
 //
 // Per architecture.md, wake latency is dominated by compute provisioning rather than dataset size,
 // so tearing down an idle engine is cheap to reverse and saves metered engine-seconds.

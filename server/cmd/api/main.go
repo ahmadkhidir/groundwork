@@ -109,13 +109,15 @@ func run(logger *slog.Logger) error {
 	// environment still boots — but the gap is logged, not hidden.
 	runRepo := postgres.NewRunRepository(pool)
 	stepRepo := postgres.NewStepRepository(pool)
+	// FEAT-014's Report Store is materialized by the executor and read by the report read endpoint.
+	reportRepo := postgres.NewReportRepository(pool)
 	modelClient := model.NewClient(cfg.AnthropicAPIKey, auditWriter, logger)
 	if cfg.AnthropicAPIKey == "" {
 		logger.Warn("ANTHROPIC_API_KEY is not set — FEAT-013 runs will fail at the model step")
 	}
 	runExecutor := runpkg.NewExecutor(
 		runRepo, stepRepo, datasetRepo, columnRepo, objectStore, engineProvider, auditWriter,
-		modelClient, relationshipRepo, metricDefinitionRepo, correctionRepo, logger)
+		modelClient, reportRepo, relationshipRepo, metricDefinitionRepo, correctionRepo, logger)
 
 	deps := api.Dependencies{
 		AuthSecret: cfg.AuthSecret,
@@ -167,6 +169,10 @@ func run(logger *slog.Logger) error {
 		Runs:        runRepo,
 		RunSteps:    stepRepo,
 		RunExecutor: runExecutor,
+
+		// FEAT-014: report read endpoint (screens/09-report-view.md). Materialized by the executor;
+		// read here through the same ReportRepository instance.
+		Reports: reportRepo,
 	}
 
 	server := &http.Server{

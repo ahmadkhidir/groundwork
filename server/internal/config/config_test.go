@@ -15,6 +15,17 @@ func TestMaxUploadBytesDefaultIs500MB(t *testing.T) {
 	}
 }
 
+func TestMaxExecuteRowsIsTenThousand(t *testing.T) {
+	// The confirmed product decision (2026-08-06). features.md FEAT-014 AC-3 references the product's
+	// "stated row-count ceiling" without a figure; this constant is that figure, applied both to the
+	// execute step (a query past it fails the run) and to the narrate/chart_spec facts payload.
+	const want = 10000
+
+	if MaxExecuteRows != want {
+		t.Errorf("MaxExecuteRows = %d, want %d", MaxExecuteRows, want)
+	}
+}
+
 // requiredEnv is the minimum set that lets Load succeed. Tests start from this and override or
 // remove individual keys, so adding a new required variable breaks one obvious place rather than
 // every case at once.

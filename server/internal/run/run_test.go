@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ahmadkhidir/groundwork/server/internal/config"
 	"github.com/ahmadkhidir/groundwork/server/internal/domain"
 	"github.com/ahmadkhidir/groundwork/server/internal/engine"
 	"github.com/ahmadkhidir/groundwork/server/internal/model"
@@ -19,6 +20,16 @@ import (
 
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// singleColumnRows builds a fake result set of n rows, each a single "region" value, for driving
+// row-count sensitive paths without allocating an outsize slice by hand.
+func singleColumnRows(n int) [][]any {
+	out := make([][]any, n)
+	for i := range out {
+		out[i] = []any{"region-val"}
+	}
+	return out
 }
 
 // waitFor polls cond until it is true or the deadline passes, failing the test.
@@ -173,6 +184,10 @@ type fakeHandle struct {
 	mu             sync.Mutex
 	execStatements []string
 	rows           engine.Rows
+	// countRows, when set, is returned for SELECT count(*) queries (reconciliation measurement),
+	// so the fake can produce a distinct row count without exhausting rows. Kept as data, not an
+	// engine.Rows, so each count query gets a fresh cursor (fakeRows is stateful).
+	countRows [][]any
 }
 
 func (f *fakeHandle) WorkspaceID() string { return "ws-1" }
@@ -180,7 +195,12 @@ func (f *fakeHandle) AcquiredAt() time.Time {
 	return time.Now()
 }
 
-func (f *fakeHandle) Query(_ context.Context, _ string, _ ...any) (engine.Rows, error) {
+func (f *fakeHandle) Query(_ context.Context, sql string, _ ...any) (engine.Rows, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.countRows != nil && strings.HasPrefix(sql, "SELECT count(*)") {
+		return &fakeRows{cols: []string{"count"}, rows: f.countRows}, nil
+	}
 	return f.rows, nil
 }
 
@@ -279,6 +299,30 @@ func (f *fakeAudit) queryCount() int {
 	return f.queryExecuted
 }
 
+type fakeReportStore struct {
+	mu             sync.Mutex
+	createdReports []domain.Report
+	err            error
+}
+
+func (f *fakeReportStore) Create(_ context.Context, report domain.Report) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return f.err
+	}
+	f.createdReports = append(f.createdReports, report)
+	return nil
+}
+
+func (f *fakeReportStore) created() []domain.Report {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]domain.Report, len(f.createdReports))
+	copy(out, f.createdReports)
+	return out
+}
+
 type fakeRelationshipLister struct{}
 
 func (f *fakeRelationshipLister) ListByWorkspace(_ context.Context, _ string) ([]domain.Relationship, error) {
@@ -298,12 +342,13 @@ func (f *fakeCorrectionLister) ListByWorkspace(_ context.Context, _ string) ([]d
 }
 
 // newTestExecutor wires a fully fake Executor plus all fakes back to the caller.
-func newTestExecutor() (*Executor, *fakeRunStore, *fakeStepStore, *fakeHandle, *fakeModelClient, *fakeAudit) {
+func newTestExecutor() (*Executor, *fakeRunStore, *fakeStepStore, *fakeHandle, *fakeModelClient, *fakeAudit, *fakeReportStore) {
 	runs := &fakeRunStore{}
 	steps := &fakeStepStore{}
 	handle := &fakeHandle{rows: &fakeRows{cols: []string{"region", "cnt"}, rows: [][]any{{"North", int64(10)}}}}
 	modelClient := &fakeModelClient{}
 	audit := &fakeAudit{}
+	reports := &fakeReportStore{}
 
 	executor := NewExecutor(
 		runs,
@@ -314,12 +359,13 @@ func newTestExecutor() (*Executor, *fakeRunStore, *fakeStepStore, *fakeHandle, *
 		&fakeProvider{handle: handle},
 		audit,
 		modelClient,
+		reports,
 		&fakeRelationshipLister{},
 		&fakeMetricLister{},
 		&fakeCorrectionLister{},
 		discardLogger(),
 	)
-	return executor, runs, steps, handle, modelClient, audit
+	return executor, runs, steps, handle, modelClient, audit, reports
 }
 
 func testRun() domain.Run {
@@ -338,7 +384,7 @@ func testRun() domain.Run {
 // attachment under the canonical table name, JSON-scalar row conversion, and the query-executed audit
 // entry.
 func TestExecutorHappyPath(t *testing.T) {
-	executor, runs, steps, handle, modelClient, audit := newTestExecutor()
+	executor, runs, steps, handle, modelClient, audit, reports := newTestExecutor()
 
 	// A complete dataset whose view name the assertions below pin exactly.
 	executor.datasets = &fakeDatasetStore{datasets: []domain.Dataset{{
@@ -358,6 +404,8 @@ func TestExecutorHappyPath(t *testing.T) {
 	modelClient.enqueue(
 		`{"answerable":true,"reason":"","approach":"group by region"}`,
 		`{"sql":"SELECT region, COUNT(*) AS cnt FROM dataset_sales_data_q3_csv_d5f3e2a1 GROUP BY region"}`,
+		`{"chart_type":"bar","x_axis_column":"region","y_axis_column":"cnt","title":"Customers by region"}`,
+		`{"narrative":"The dataset has sales across regions; North leads the count."}`,
 	)
 
 	executor.Submit("user-1", testRun())
@@ -378,10 +426,10 @@ func TestExecutorHappyPath(t *testing.T) {
 	}
 
 	all := steps.all()
-	if len(all) != 3 {
-		t.Fatalf("steps = %d, want 3", len(all))
+	if len(all) != 5 {
+		t.Fatalf("steps = %d, want 5", len(all))
 	}
-	wantNames := []domain.StepName{domain.StepPlan, domain.StepGenerateSQL, domain.StepExecute}
+	wantNames := []domain.StepName{domain.StepPlan, domain.StepGenerateSQL, domain.StepExecute, domain.StepChartSpec, domain.StepNarrate}
 	for i, name := range wantNames {
 		if all[i].StepName != name {
 			t.Errorf("step[%d] name = %s, want %s", i, all[i].StepName, name)
@@ -395,7 +443,7 @@ func TestExecutorHappyPath(t *testing.T) {
 	}
 
 	// Input chaining: the first model step gets no prior context, later steps get the previous
-	// step's JSON-encoded output verbatim.
+	// step's JSON-encoded output verbatim — chart_spec and narrate both consume the execute output.
 	if all[0].Input != "" {
 		t.Errorf("plan input = %q, want empty", all[0].Input)
 	}
@@ -404,6 +452,12 @@ func TestExecutorHappyPath(t *testing.T) {
 	}
 	if all[2].Input != all[1].Output {
 		t.Errorf("execute input = %q, want the generate_sql output %q", all[2].Input, all[1].Output)
+	}
+	if all[3].Input != all[2].Output {
+		t.Errorf("chart_spec input = %q, want the execute output %q", all[3].Input, all[2].Output)
+	}
+	if all[4].Input != all[2].Output {
+		t.Errorf("narrate input = %q, want the execute output %q", all[4].Input, all[2].Output)
 	}
 
 	var plan domain.PlanStepOutput
@@ -430,6 +484,15 @@ func TestExecutorHappyPath(t *testing.T) {
 		t.Errorf("row = %v, want [North 10] as JSON scalars", out.Rows[0])
 	}
 
+	// chart_spec (FEAT-016) output must parse as a ChartSpec.
+	var chartOut domain.ChartSpecStepOutput
+	if err := json.Unmarshal([]byte(all[3].Output), &chartOut); err != nil {
+		t.Fatalf("chart_spec output not parseable: %v", err)
+	}
+	if chartOut.ChartSpec.ChartType != domain.ChartBar || chartOut.ChartSpec.XAxisColumn != "region" || chartOut.ChartSpec.YAxisColumn != "cnt" {
+		t.Errorf("chart_spec = %+v", chartOut.ChartSpec)
+	}
+
 	// The engine view is attached under the exact canonical table name before the query runs.
 	stmts := handle.statements()
 	if len(stmts) != 1 {
@@ -446,18 +509,50 @@ func TestExecutorHappyPath(t *testing.T) {
 		t.Errorf("temp file %q still exists after the run, want cleanup", tempPath)
 	}
 
-	if got := modelClient.callCount(); got != 2 {
-		t.Errorf("model calls = %d, want 2 (plan, generate_sql)", got)
+	// Four model calls: plan, generate_sql, chart_spec, narrate.
+	if got := modelClient.callCount(); got != 4 {
+		t.Errorf("model calls = %d, want 4 (plan, generate_sql, chart_spec, narrate)", got)
 	}
 	if got := audit.queryCount(); got != 1 {
 		t.Errorf("query-executed audit entries = %d, want 1", got)
+	}
+
+	// The run materializes one fully self-contained Report.
+	created := reports.created()
+	if len(created) != 1 {
+		t.Fatalf("created reports = %d, want 1", len(created))
+	}
+	rep := created[0]
+	if rep.RunID != "run-1" || rep.WorkspaceID != "ws-1" {
+		t.Errorf("report run/workspace = %s/%s, want run-1/ws-1", rep.RunID, rep.WorkspaceID)
+	}
+	if rep.Title != testRun().QuestionText {
+		t.Errorf("report title = %q, want the question text", rep.Title)
+	}
+	// The report's narrative is exactly the narrate step's output.
+	var narrateOut domain.NarrateStepOutput
+	if err := json.Unmarshal([]byte(all[4].Output), &narrateOut); err != nil {
+		t.Fatalf("narrate output not parseable: %v", err)
+	}
+	if rep.Narrative != narrateOut.Narrative {
+		t.Errorf("report narrative = %q, want the narrate output %q", rep.Narrative, narrateOut.Narrative)
+	}
+	if rep.ChartSpec.ChartType != domain.ChartBar {
+		t.Errorf("report chart_spec = %+v, want the chart_spec output", rep.ChartSpec)
+	}
+	// rows_out is the executed row count; provenance_links is always an empty array this wave.
+	if rep.ReconciliationSummary.RowsOut != 1 {
+		t.Errorf("report rows_out = %d, want 1", rep.ReconciliationSummary.RowsOut)
+	}
+	if rep.ProvenanceLinks == nil || len(rep.ProvenanceLinks) != 0 {
+		t.Errorf("report provenance_links = %v, want an empty array", rep.ProvenanceLinks)
 	}
 }
 
 // TestExecutorNotAnswerableFailsRun pins the FEAT-033 Phase 2 boundary: an unanswerable question
 // fails the run after the plan step — it never reaches generate_sql or the engine.
 func TestExecutorNotAnswerableFailsRun(t *testing.T) {
-	executor, runs, steps, _, modelClient, audit := newTestExecutor()
+	executor, runs, steps, _, modelClient, audit, _ := newTestExecutor()
 	executor.datasets = &fakeDatasetStore{datasets: []domain.Dataset{{
 		ID: "d5f3e2a1b9c8472d9a1b2c3d4e5f60718", OriginalFilename: "sales.csv",
 		IngestStatus: domain.IngestComplete,
@@ -494,7 +589,7 @@ func TestExecutorNotAnswerableFailsRun(t *testing.T) {
 }
 
 func TestExecutorFailsWhenEngineUnavailable(t *testing.T) {
-	executor, runs, steps, _, modelClient, _ := newTestExecutor()
+	executor, runs, steps, _, modelClient, _, _ := newTestExecutor()
 	executor.provider = &fakeProvider{acquireErr: engine.ErrEngineUnavailable}
 
 	executor.Submit("user-1", testRun())
@@ -512,7 +607,7 @@ func TestExecutorFailsWhenEngineUnavailable(t *testing.T) {
 }
 
 func TestExecutorFailsWhenPlanStepReturnsGarbage(t *testing.T) {
-	executor, runs, steps, _, modelClient, _ := newTestExecutor()
+	executor, runs, steps, _, modelClient, _, _ := newTestExecutor()
 	executor.datasets = &fakeDatasetStore{datasets: []domain.Dataset{{
 		ID: "d5f3e2a1b9c8472d9a1b2c3d4e5f60718", OriginalFilename: "sales.csv",
 		IngestStatus: domain.IngestComplete,
@@ -535,7 +630,7 @@ func TestExecutorFailsWhenPlanStepReturnsGarbage(t *testing.T) {
 }
 
 func TestExecutorFailsWhenWorkspaceHasNoCompleteDatasets(t *testing.T) {
-	executor, runs, steps, _, modelClient, _ := newTestExecutor()
+	executor, runs, steps, _, modelClient, _, _ := newTestExecutor()
 	executor.datasets = &fakeDatasetStore{datasets: []domain.Dataset{{
 		ID: "abc", OriginalFilename: "still-ingesting.csv", IngestStatus: domain.IngestPending,
 	}}}
@@ -555,6 +650,205 @@ func TestExecutorFailsWhenWorkspaceHasNoCompleteDatasets(t *testing.T) {
 	}
 	if got := modelClient.callCount(); got != 0 {
 		t.Errorf("model calls = %d, want 0 — no payload, no call", got)
+	}
+}
+
+// TestExecutorFailsWhenResultExceedsRowCeiling pins FEAT-014's Honest Output Cap: a query that
+// returns more rows than config.MaxExecuteRows fails the execute step (and the run) with an honest
+// message — never a silent truncation of the result set.
+func TestExecutorFailsWhenResultExceedsRowCeiling(t *testing.T) {
+	executor, runs, steps, _, modelClient, _, _ := newTestExecutor()
+	executor.datasets = &fakeDatasetStore{datasets: []domain.Dataset{{
+		ID: "d5f3e2a1b9c8472d9a1b2c3d4e5f60718", OriginalFilename: "sales.csv",
+		IngestStatus: domain.IngestComplete,
+	}}}
+	executor.provider = &fakeProvider{handle: &fakeHandle{rows: &fakeRows{
+		cols: []string{"region"},
+		// One row over the ceiling. Executor builds the full result set before checking, so a few
+		// rows above the cap is enough to fail without allocating an outsize slice.
+		rows: singleColumnRows(config.MaxExecuteRows + 1),
+	}}}
+
+	modelClient.enqueue(
+		`{"answerable":true,"reason":"","approach":"select all"}`,
+		`{"sql":"SELECT region FROM dataset_sales_csv_d5f3e2a1"}`,
+	)
+
+	executor.Submit("user-1", testRun())
+	waitFor(t, func() bool { return runs.current().Status.IsTerminal() })
+
+	if got := runs.current().Status; got != domain.RunFailed {
+		t.Fatalf("run status = %s, want failed after the row-count ceiling is exceeded", got)
+	}
+	all := steps.all()
+	if len(all) != 3 {
+		t.Fatalf("steps = %d, want 3 (plan, generate_sql, execute)", len(all))
+	}
+	if all[2].Status != domain.StepFailed {
+		t.Fatalf("execute step status = %s, want failed", all[2].Status)
+	}
+	if !strings.Contains(all[2].Output, "more than") {
+		t.Errorf("failed execute output = %q, want it to name the row ceiling honestly", all[2].Output)
+	}
+	if got := modelClient.callCount(); got != 2 {
+		t.Errorf("model calls = %d, want 2 (plan, generate_sql) — execute never reaches chart/narrate", got)
+	}
+}
+
+// TestExecutorFailsWhenChartSpecStepReturnsGarbage pins FEAT-016's parse boundary: an unparseable
+// chart_spec response fails the run at the chart_spec step, before narrate or report materialization.
+func TestExecutorFailsWhenChartSpecStepReturnsGarbage(t *testing.T) {
+	executor, runs, steps, _, modelClient, _, _ := newTestExecutor()
+	executor.datasets = &fakeDatasetStore{datasets: []domain.Dataset{{
+		ID: "d5f3e2a1b9c8472d9a1b2c3d4e5f60718", OriginalFilename: "sales.csv",
+		IngestStatus: domain.IngestComplete,
+	}}}
+	modelClient.enqueue(
+		`{"answerable":true,"reason":"","approach":"group by region"}`,
+		`{"sql":"SELECT region FROM dataset_sales_csv_d5f3e2a1"}`,
+		"definitely not json",
+	)
+
+	executor.Submit("user-1", testRun())
+	waitFor(t, func() bool { return runs.current().Status.IsTerminal() })
+
+	if got := runs.current().Status; got != domain.RunFailed {
+		t.Fatalf("run status = %s, want failed after unparseable chart_spec", got)
+	}
+	all := steps.all()
+	if len(all) != 4 {
+		t.Fatalf("steps = %d, want 4 (plan, generate_sql, execute, chart_spec)", len(all))
+	}
+	if all[3].Status != domain.StepFailed {
+		t.Fatalf("chart_spec step status = %s, want failed", all[3].Status)
+	}
+	if !strings.Contains(all[3].Output, "unparseable") {
+		t.Errorf("failed chart_spec output = %q, want it to name the parse failure", all[3].Output)
+	}
+}
+
+// TestExecutorFailsWhenNarrateStepReturnsGarbage pins FEAT-015's parse boundary: an unparseable
+// narrate response fails the run at the narrate step — never reaching report materialization.
+func TestExecutorFailsWhenNarrateStepReturnsGarbage(t *testing.T) {
+	executor, runs, steps, _, modelClient, _, reports := newTestExecutor()
+	executor.datasets = &fakeDatasetStore{datasets: []domain.Dataset{{
+		ID: "d5f3e2a1b9c8472d9a1b2c3d4e5f60718", OriginalFilename: "sales.csv",
+		IngestStatus: domain.IngestComplete,
+	}}}
+	modelClient.enqueue(
+		`{"answerable":true,"reason":"","approach":"group by region"}`,
+		`{"sql":"SELECT region FROM dataset_sales_csv_d5f3e2a1"}`,
+		`{"chart_type":"table","x_axis_column":"region","y_axis_column":"","title":"Regions"}`,
+		"definitely not json",
+	)
+
+	executor.Submit("user-1", testRun())
+	waitFor(t, func() bool { return runs.current().Status.IsTerminal() })
+
+	if got := runs.current().Status; got != domain.RunFailed {
+		t.Fatalf("run status = %s, want failed after unparseable narrate", got)
+	}
+	all := steps.all()
+	if len(all) != 5 {
+		t.Fatalf("steps = %d, want 5 (plan, generate_sql, execute, chart_spec, narrate)", len(all))
+	}
+	if all[4].Status != domain.StepFailed {
+		t.Fatalf("narrate step status = %s, want failed", all[4].Status)
+	}
+	if !strings.Contains(all[4].Output, "unparseable") {
+		t.Errorf("failed narrate output = %q, want it to name the parse failure", all[4].Output)
+	}
+	if created := reports.created(); len(created) != 0 {
+		t.Errorf("created reports = %v, want none — a failed narrate must not materialize a report", created)
+	}
+}
+
+// TestExecutorFailsWhenReportPersistenceFails pins FEAT-014's completion boundary: a run whose steps
+// all succeeded but whose Report cannot be persisted fails the run — a corrupt state is never
+// reported as complete.
+func TestExecutorFailsWhenReportPersistenceFails(t *testing.T) {
+	executor, runs, steps, _, modelClient, _, reports := newTestExecutor()
+	executor.datasets = &fakeDatasetStore{datasets: []domain.Dataset{{
+		ID: "d5f3e2a1b9c8472d9a1b2c3d4e5f60718", OriginalFilename: "sales.csv",
+		IngestStatus: domain.IngestComplete,
+	}}}
+	reports.err = errors.New("insert failed")
+	modelClient.enqueue(
+		`{"answerable":true,"reason":"","approach":"group by region"}`,
+		`{"sql":"SELECT region FROM dataset_sales_csv_d5f3e2a1"}`,
+		`{"chart_type":"table","x_axis_column":"region","y_axis_column":"","title":"Regions"}`,
+		`{"narrative":"All regions are listed."}`,
+	)
+
+	executor.Submit("user-1", testRun())
+	waitFor(t, func() bool { return runs.current().Status.IsTerminal() })
+
+	if got := runs.current().Status; got != domain.RunFailed {
+		t.Fatalf("run status = %s, want failed when report persistence fails", got)
+	}
+	all := steps.all()
+	if len(all) != 5 {
+		t.Fatalf("steps = %d, want 5 — chart_spec and narrate still completed", len(all))
+	}
+	for i, step := range all {
+		if step.Status != domain.StepComplete {
+			t.Errorf("step[%d] status = %s, want complete — failure is after the steps", i, step.Status)
+		}
+	}
+}
+
+// TestMeasureRowsIn pins the reconciliation rows_in measurement: the SQL text is scanned for each
+// known dataset view name, and the count(*) per referenced view is summed. SQL referencing no known
+// view records an explicit exclusion warning with rows_in 0 rather than a fabricated number.
+func TestMeasureRowsIn(t *testing.T) {
+	executor, _, _, _, _, _, _ := newTestExecutor()
+	executor.datasets = &fakeDatasetStore{datasets: []domain.Dataset{
+		{ID: "aaaaaaaaaaaaaaaa", OriginalFilename: "customers.csv", IngestStatus: domain.IngestComplete},
+		{ID: "bbbbbbbbbbbbbbbb", OriginalFilename: "orders.csv", IngestStatus: domain.IngestComplete},
+		{ID: "cccccccccccccccc", OriginalFilename: "still-ingesting.csv", IngestStatus: domain.IngestPending},
+	}}
+	handle := &fakeHandle{countRows: [][]any{{int64(500)}}}
+
+	// SQL joining both complete datasets references both views.
+	rowsIn, warnings, err := executor.measureRowsIn(context.Background(), handle,
+		`SELECT c.name FROM dataset_customers_csv_aaaaaaaa c JOIN dataset_orders_csv_bbbbbbbb o ON o.customer_id = c.id`,
+		"ws-1")
+	if err != nil {
+		t.Fatalf("measureRowsIn: %v", err)
+	}
+	if rowsIn != 1000 {
+		t.Errorf("rows_in = %d, want 1000 (500 per referenced view)", rowsIn)
+	}
+	if len(warnings) != 0 {
+		t.Errorf("warnings = %v, want none when views are referenced", warnings)
+	}
+
+	// SQL referencing no known dataset view gets rows_in 0 plus an explicit exclusion warning.
+	rowsIn, warnings, err = executor.measureRowsIn(context.Background(), handle,
+		`SELECT 1 FROM information_schema.tables`, "ws-1")
+	if err != nil {
+		t.Fatalf("measureRowsIn (no view): %v", err)
+	}
+	if rowsIn != 0 {
+		t.Errorf("rows_in = %d, want 0 for unmatched SQL", rowsIn)
+	}
+	if len(warnings) == 0 {
+		t.Errorf("warnings = %v, want an explicit exclusion warning for unmatched SQL", warnings)
+	}
+}
+
+// TestDeriveReportTitle pins the title derivation: whitespace collapses and plain truncation to 80
+// characters, exactly as schema.md's "short, human-readable title" is interpreted.
+func TestDeriveReportTitle(t *testing.T) {
+	if got := deriveReportTitle("How many customers per region?"); got != "How many customers per region?" {
+		t.Errorf("deriveReportTitle(short) = %q", got)
+	}
+	if got := deriveReportTitle("   What   are   monthly   sales?  "); got != "What are monthly sales?" {
+		t.Errorf("deriveReportTitle(collapse) = %q", got)
+	}
+	long := strings.Repeat("x", 100)
+	if got := deriveReportTitle(long); got != strings.Repeat("x", 80) {
+		t.Errorf("deriveReportTitle(long) length = %d, want 80", len(got))
 	}
 }
 
