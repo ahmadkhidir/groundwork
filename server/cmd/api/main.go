@@ -20,6 +20,8 @@ import (
 	"github.com/ahmadkhidir/groundwork/server/internal/config"
 	"github.com/ahmadkhidir/groundwork/server/internal/engine"
 	"github.com/ahmadkhidir/groundwork/server/internal/ingest"
+	"github.com/ahmadkhidir/groundwork/server/internal/model"
+	runpkg "github.com/ahmadkhidir/groundwork/server/internal/run"
 	"github.com/ahmadkhidir/groundwork/server/internal/storage"
 	"github.com/ahmadkhidir/groundwork/server/internal/store/postgres"
 )
@@ -102,6 +104,19 @@ func run(logger *slog.Logger) error {
 	ingestPipeline := ingest.NewPipeline(
 		datasetRepo, objectStore, engineProvider, columnRepo, candidateJoinRepo, ingestTracker, logger)
 
+	// FEAT-013 (Phase 2). The run executor is the only consumer of the Anthropic key; the model
+	// client is constructible without it (Complete fails honestly per-call), so a keyless dev
+	// environment still boots — but the gap is logged, not hidden.
+	runRepo := postgres.NewRunRepository(pool)
+	stepRepo := postgres.NewStepRepository(pool)
+	modelClient := model.NewClient(cfg.AnthropicAPIKey, auditWriter, logger)
+	if cfg.AnthropicAPIKey == "" {
+		logger.Warn("ANTHROPIC_API_KEY is not set — FEAT-013 runs will fail at the model step")
+	}
+	runExecutor := runpkg.NewExecutor(
+		runRepo, stepRepo, datasetRepo, columnRepo, objectStore, engineProvider, auditWriter,
+		modelClient, relationshipRepo, metricDefinitionRepo, correctionRepo, logger)
+
 	deps := api.Dependencies{
 		AuthSecret: cfg.AuthSecret,
 		Workspaces: workspaceRepo,
@@ -146,6 +161,12 @@ func run(logger *slog.Logger) error {
 		DatasetObjects:       objectStore,
 		DatasetDeletionAudit: auditWriter,
 		DuplicateCheck:       datasetRepo,
+
+		// FEAT-013: question → run lifecycle. Same repositories as the seams above, satisfying the
+		// further narrow interfaces runs.go declares (see Dependencies' doc comment).
+		Runs:        runRepo,
+		RunSteps:    stepRepo,
+		RunExecutor: runExecutor,
 	}
 
 	server := &http.Server{

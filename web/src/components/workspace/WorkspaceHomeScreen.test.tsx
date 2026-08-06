@@ -15,6 +15,12 @@ vi.mock("@/lib/api-client", async () => {
 
 const getMock = vi.mocked(api.get);
 
+// AskPanel uses next/navigation's useRouter to navigate to the created run; the workspace screen
+// test renders it inside WorkspaceHomeScreen, so the router must be present.
+vi.mock("next/navigation", () => ({
+  useRouter: () => ({ push: vi.fn() }),
+}));
+
 function workspaceWith(engineStatus: EngineStatus, hasDatasets = false) {
   return {
     id: "ws-1",
@@ -128,13 +134,12 @@ describe("WorkspaceHomeScreen", () => {
     expect(screen.queryByText("Something went wrong")).not.toBeInTheDocument();
   });
 
-  it("renders the Ask panel as visibly disabled rather than silently inert", async () => {
+  it("renders the Ask panel as a live question input (FEAT-013)", async () => {
     getMock.mockResolvedValue({ workspace: workspaceWith(EngineStatus.Ready) });
     render(<WorkspaceHomeScreen workspaceId="ws-1" />);
 
     await waitFor(() => expect(screen.getByText("Q3 Numbers")).toBeInTheDocument());
-    expect(screen.getByPlaceholderText("Ask a question about your data...")).toBeDisabled();
-    expect(screen.getByText("Asking questions arrives in Phase 2 (FEAT-013).")).toBeInTheDocument();
+    expect(screen.getByPlaceholderText("Ask a question about your data...")).toBeEnabled();
   });
 
   it("renders the honest empty state for recent reports and the real semantic layer summary counts", async () => {

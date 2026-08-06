@@ -106,6 +106,15 @@ type Dependencies struct {
 	DatasetObjects       DatasetObjectDeleter
 	DatasetDeletionAudit DatasetDeletionAuditWriter
 	DuplicateCheck       DuplicateCheckStore
+
+	// Runs, RunSteps, and RunExecutor back FEAT-013 (Natural-Language Question → SQL Generation) —
+	// screens/04-workspace-home.md's Ask panel and screens/08-run-viewer.md's live run. Runs is the
+	// create/get seam over the runs table; RunSteps exposes a run's persisted step feed to the
+	// viewer; RunExecutor starts the background linear executor (internal/run.Executor) — the only
+	// thing allowed to create step rows or advance run status after the handler's queued insert.
+	Runs        RunStore
+	RunSteps    RunStepStore
+	RunExecutor RunExecutor
 }
 
 // Server wires configuration and dependencies into an http.Handler.
@@ -230,6 +239,12 @@ func (s *Server) routes() {
 					s.deps.SemanticCorrections != nil && s.deps.SemanticSummary != nil {
 					RegisterSemanticRoutes(r, s.deps.Workspaces, s.deps.SemanticRelationships,
 						s.deps.SemanticMetrics, s.deps.SemanticCorrections, s.deps.SemanticSummary, s.logger)
+				}
+
+				// FEAT-013: ask-a-question run lifecycle — create a run and watch it execute.
+				// screens/04-workspace-home.md, screens/08-run-viewer.md.
+				if s.deps.Runs != nil && s.deps.RunSteps != nil && s.deps.RunExecutor != nil {
+					RegisterRunRoutes(r, s.deps.Workspaces, s.deps.Runs, s.deps.RunSteps, s.deps.RunExecutor, s.logger)
 				}
 			})
 		}

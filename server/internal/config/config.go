@@ -62,6 +62,15 @@ type Config struct {
 	// Storage is the S3-compatible object storage configuration: MinIO locally, Cloudflare R2 in
 	// production.
 	Storage StorageConfig
+
+	// AnthropicAPIKey authenticates model calls made through internal/model (FEAT-013, Phase 2).
+	//
+	// Deliberately NOT in the required-variables list below: a service without it can still start,
+	// serve every Phase 1 endpoint, and register the run routes — runs then fail honestly at the
+	// model step with "ANTHROPIC_API_KEY is not configured" rather than the whole service refusing
+	// to boot in a development environment that has no key. cmd/api/main.go logs a warning when it
+	// is unset so the gap is visible, not silent.
+	AnthropicAPIKey string
 }
 
 // StorageConfig describes the S3-compatible object store holding uploaded and normalized datasets.
@@ -114,6 +123,9 @@ func Load() (Config, error) {
 	}
 
 	cfg.AuthSecret = os.Getenv("AUTH_SECRET")
+
+	// Optional by design — see the field's doc comment. Model calls (FEAT-013) are the only consumer.
+	cfg.AnthropicAPIKey = os.Getenv("ANTHROPIC_API_KEY")
 
 	cfg.Storage = StorageConfig{
 		Endpoint:        os.Getenv("S3_ENDPOINT"),

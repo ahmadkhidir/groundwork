@@ -356,7 +356,7 @@ loaded via `next/font` and bound to `--font-display`, `--font-body`, `--font-mon
 |---|---|---|
 | **A — Foundation** | Scaffold, theme tokens, schema entities, auth, routing skeleton, docker-compose | **Complete** |
 | **1 — Foundation: Workspace, Ingest & Trust** | FEAT-001 ✅ 002 ✅ 003 ✅ 004 ✅ 005 ✅ 006 ✅ 007 ✅ 008 ✅ 009 ✅ 011 ✅ 042 ✅ 044 ✅ 048 ✅ 049 ✅ | **Complete** — reopened for FEAT-048/049 by docs `ff8d5b2` (2026-08-06) and closed by this wave; see below |
-| **2 — Core Grounded Answer Loop** | FEAT-013, 014, 015, 016, 017, 018, 019 ✅, 020 | In progress — FEAT-019 landed this wave |
+| **2 — Core Grounded Answer Loop** | FEAT-013 ✅, 014, 015, 016, 017, 018, 019 ✅, 020 | In progress — FEAT-019 (Wave 1) and FEAT-013 (Wave 2) landed |
 | **3 — Trust & Observability** | FEAT-022, 023, 024, 027, 028, 029, 030 | Not started |
 | **4 — Reports & Delivery** | FEAT-034, 035, 036, 041, 043 | Not started |
 | **5 — Polish & Expansion** | FEAT-010, 012, 021, 025, 026, 031, 032, 033, 037, 038, 039, 040, 045, 046, 047 | Not started |
@@ -368,6 +368,11 @@ loaded via `next/font` and bound to `--font-display`, `--font-body`, `--font-mon
 > **FEAT-019 (Semantic Layer Storage) landed in Phase 2's Wave 1**, as a solo pass (no parallel
 > dispatch) — see the "FEAT-019 — Semantic Layer Storage" note below for what shipped and what it
 > deliberately left for FEAT-013/FEAT-020.
+>
+> **FEAT-013 (Natural-Language Question → SQL Generation) landed in Phase 2's Wave 2** (this wave),
+> as a solo pass — see the "FEAT-013 — Natural-Language Question → SQL Generation" note below for
+> what shipped, what the linear executor persists, and what the approved phase boundary left for
+> later waves.
 
 ### Phase 1 reopened for FEAT-048 / FEAT-049 (docs `ff8d5b2`, user-approved 2026-08-06) — CLOSED
 
@@ -620,7 +625,9 @@ audit action.
 
 Wave 3's first two items are **closed** by Wave 4: the ingest pipeline now runs through to
 `ingest_status = "complete"`, and "Profiling columns" reflects real work. Wave 4's PII-safe-defaults
-item is **closed** by Wave 5: PII detection is real (`internal/pii`).
+item is **closed** by Wave 5: PII detection is real (`internal/pii`). The R-016 item below is
+**closed** by Phase 2's Wave 2 (FEAT-013): the payload builder is now exercised by every model call
+at runtime, with wire-level enforcement tests and an egress-before-call test — see the FEAT-013 note.
 
 | Item | Detail | Owner |
 |---|---|---|
@@ -628,7 +635,7 @@ item is **closed** by Wave 5: PII detection is real (`internal/pii`).
 | **`type_confidence`'s scoring heuristic is undocumented** | FEAT-008 now specifies the join-confidence bands and the value-overlap-only cap, and declares the weighting implementation-defined — that half is closed. `profiling.go`'s `confidenceBaseByType` still produces `type_confidence` by an undocumented rule, though `features.md` now specifies the HIGH/MEDIUM/LOW bands it is presented through. Lower stakes than the join case, but still a trust-facing number set by implementation. | Product |
 | **FEAT-008's "near-unique" exemption can swallow the cap it sits beside** | The value-overlap-only cap exempts identifier-shaped columns, and `features.md` defines that to include near-unique (≥0.95) columns. A money column with all-distinct values — common in real exports — therefore reads as identifier-shaped and escapes the cap. Observed live: `total` ↔ `amount` at 40 distinct values over 40 rows scored 0.75 with basis "one side is nearly unique, consistent with a key". **No acceptance criterion is violated** (it stayed below HIGH), and the code implements the doc exactly as written rather than narrowing it. If the intent was that a measure-shaped name never escapes on distinctness alone, the rule needs a name-based override. | Product |
 | **FEAT-006's "type corrections... used for all subsequent ingest of the same schema shape" is NOT implemented** | `schema.md`'s `Column` has no field keying a correction to a reusable "schema shape" (e.g. a hash of column names+types), and nothing else in `docs/` defines what a schema shape is. Implemented instead: overriding a column's type persists on that specific column (`PATCH /v1/workspaces/:id/columns/:columnId`), which is everything the schema supports today. A future re-ingest of the same file gets a fresh Column row with the ORIGINAL heuristic type, not the prior correction. Needs a schema-shape-keyed corrections table (+ migration) before this acceptance criterion can be met — route to product-shaper for the data model, since nothing was invented here. | Product |
-| 🔴 **FEAT-007's "name-and-type-only exposure to the model" still has NO ENFORCEMENT POINT** | **Now complete:** detection, user override, `pii_reviewed_at`, and the `pii_override` audit entry — a reviewed-and-cleared column is distinguishable from one never flagged. **Still open:** `pii_flag` governs nothing at runtime, because the rule is enforced where a model payload is built and no payload builder exists until FEAT-013 in Phase 2. `columns.excluded_from_model` is deliberately NOT used for this — `schema.md` assigns it to FEAT-010, a Phase 5 *user* override, so wiring automatic flags into it would conflate an inference with a deliberate decision. **If FEAT-013's payload builder ignores `pii_flag`, flagged PII reaches the model, no test fails, and the product's central privacy promise breaks silently.** Now tracked as `risk_log.md` **R-016 (score 15)**, and `architecture.md` requires a single shared payload-construction function so no future step can bypass it. | **Phase 2 / FEAT-013** |
+| ~~**FEAT-007's "name-and-type-only exposure to the model" has NO ENFORCEMENT POINT**~~ — **Closed in Phase 2 Wave 2 (FEAT-013)** | Detection, user override, `pii_reviewed_at`, and the `pii_override` audit entry made a reviewed-and-cleared column distinguishable from a never-flagged one; FEAT-013 (this wave) made `pii_flag`/`excluded_from_model` govern egress at runtime by routing every model call through the one shared `model.BuildPayload` → `model.Client.Complete` seam, which reduces any flagged/excluded column to name-and-type only. The old gap text ("no payload builder exists until FEAT-013") no longer holds: `internal/model/payload_test.go` pins the wire-level filter and `client_test.go` pins egress-before-call (fail-closed), closing `risk_log.md` R-016. | **done** |
 | **FEAT-009's accepted joins land directly in `relationships`, not a full semantic layer** | FEAT-019 (Semantic Layer Storage — listing, editing, using relationships as query-planning grounding) is Phase 2 and not authorized this wave. `internal/store/postgres.RelationshipRepository` is deliberately `Create`-only; there is no read/update/delete surface, and no UI beyond ingest confirmation shows a relationship once created. This is intentional under-scoping, not a gap. | FEAT-019 (Phase 2) |
 | **Rejected-join resurrection is guarded by (dataset filename, column name), not a content hash** | `CandidateJoinRepository.ExistsRejectedForNamePair` matches on original filename + column name, since nothing in `docs/` defines a stronger notion of "the same file" across re-ingests. Renaming a file, or uploading a genuinely different file that happens to share both a name and a column name, are both outside this heuristic's guarantee. Verified live against a real re-ingest (see Wave 5's report) that the literal scenario in FEAT-009's acceptance criterion works. | Product (if a stronger identity is wanted) |
 
@@ -710,6 +717,69 @@ library. `make` puts it on PATH; running the binary by hand needs it there too.
 **Left unimplemented, on purpose:** any model call, run, or step consuming the grounding context
 (FEAT-013, next wave); capturing a correction during a run, and editing/removing a stored correction
 (FEAT-020, later wave — the Corrections tab's Empty state is therefore expected, not a bug).
+
+### FEAT-013 — Natural-Language Question → SQL Generation (Phase 2, this wave)
+
+**What shipped:**
+
+- `server/internal/model/client.go` (new) — the only route to Anthropic. `Client.Complete` accepts
+  the sealed `model.Payload`, renders the exact bytes via `Payload.JSON()`, writes the egress entry
+  through `audit.Writer.WriteModelCall` **before** the outbound call and **fails closed** if the log
+  write fails, then sends via the official SDK (`github.com/anthropics/anthropic-sdk-go` **v1.61.0**,
+  model `claude-haiku-4-5`, `DefaultMaxTokens 4096`). Missing `ANTHROPIC_API_KEY` fails per-call with
+  a clear error, never at boot.
+- `server/internal/run/` (new) — the linear persisted executor (`plan → generate_sql → execute`).
+  Persists real `runs`/`steps` rows with per-step idempotency keys (`runID:stepName`), reports
+  `waking` before `Acquire` blocks, and marks the run `complete` only after execute persists its
+  facts. `Answerable=false` from the plan step **fails the run with the plan's plain-language
+  reason** (FEAT-033 boundary). Every model payload flows through `semantic.AssembleGroundingContext`
+  + `model.BuildPayload` (the R-016 seam, now exercised at runtime). Engine views are attached per
+  dataset under the canonical table name `dataset_<sanitized-filename-stem>_<id8>`, which is exactly
+  the identifier taught to the model — the SQL handoff is consistent by construction.
+- `server/internal/store/postgres/runs.go` + `steps.go` (new) — `RunRepository`/`StepRepository`
+  over the tables migration `00001` already created; no migration needed this wave.
+- `server/internal/api/runs.go` (new) — `POST /v1/workspaces/:id/runs` (202, starts execution in the
+  background — runs are server-side state, the UI is a viewer) and `GET /v1/workspaces/:id/runs/:runId`
+  returning the run with its step feed (the approved **polling** contract; no SSE this wave). Ownership
+  enforced (404 cross-workspace); read-only members cannot trigger runs. Wired via the usual
+  `Dependencies` seams + `RegisterRunRoutes` guard in `api.go` and `cmd/api/main.go`.
+- `server/internal/config/config.go` — `AnthropicAPIKey`, **optional at Load** (user-approved
+  deviation: a keyless dev environment boots and serves everything except model calls; `main.go`
+  logs a warning when unset).
+- `web/src/components/run/` (new) — `RunViewerScreen` (1s polling until terminal; waking notice;
+  clarification banner for unanswerable runs; view-only SQL with "SQL editing arrives with FEAT-018"
+  hint — no halt/amend controls, per the phase boundary), `StepFeed` (step list in `PipelineOrder`,
+  icon per status, failed-step reason), `ResultTable` (facts with null → "—", empty state),
+  `step-payloads.ts` (per-step parsers). Plus `shared/CodeBlock.tsx` (new, read-only, themed).
+- `web/src/components/workspace/AskPanel.tsx` — rewritten from the honest disabled placeholder to
+  live submission (trim, POST → 202 → navigate to `routes.run(...)`, loading/error/disabled states).
+  `WorkspaceHomeScreen` now renders it; the Run Viewer route page replaces its `PlaceholderScreen`.
+
+**Boundaries honoured (approved 2026-08-05):** linear executor (no leases/heartbeats/forks/resume);
+polling viewer (no stream); unanswerable → failed run with plain reason; wave ends at `execute` —
+facts persisted, **no Report row** (FEAT-034 Phase 4); SQL visible but not editable (FEAT-018 next
+wave); static_check/reconcile/shadow_check/adversarial_review/chart_spec/narrate/assemble are
+Phase 3/5 and deliberately absent. `execute` output rows are unbounded this wave (the row-ceiling AC
+belongs to FEAT-014).
+
+**Assumptions / notes:**
+
+- `ingest.Pipeline.downloadToTemp` is unexported, so `internal/run` mirrors the download-to-temp
+  Parquet pattern internally (documented in `prepareViews`). If a later phase wants one shared
+  helper, `ingest` should export it — no change made this wave.
+- Only `ingest_status = complete` datasets are queryable; a workspace with none fails the run
+  honestly at the plan step.
+- The egress log now carries real `model_call` entries (plan + generate_sql) and `query_executed`
+  entries for executed SQL, in the same code path as each action.
+
+**Tests:** `payload_test.go` (R-016 wire-level pin: PII/excluded columns reach the wire name+type
+only), `client_test.go` (egress-before-call, fail-closed on key/audit error), `run_test.go`
+(happy path, not-answerable, engine-unavailable, garbage plan output, no-complete-datasets, table
+naming/identifier sanitization/value conversion), `api/runs_test.go` (create/get, cross-workspace
+404s), web `RunViewerScreen.test.tsx` (polling stop, states) and `AskPanel.test.tsx` (submit,
+navigation, disabled/error). Verification: server `make vet` + fresh `make test` (all packages) +
+`make build` + `gofmt -l` clean; web `vitest` 149/149 + `eslint` + `tsc --noEmit` + `next build` all
+green.
 
 ## 8. Key Commands
 

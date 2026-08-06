@@ -162,7 +162,7 @@ export function WorkspaceHomeScreen({ workspaceId }: WorkspaceHomeScreenProps) {
       </div>
 
       <Card className="mb-6">
-        <AskPanel />
+        <AskPanel workspaceId={workspaceId} />
       </Card>
 
       {/* "Upload data prompt... Shown when no files ingested yet" (screens/04-workspace-home.md) —
