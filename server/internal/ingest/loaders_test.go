@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -153,4 +154,164 @@ func TestNormalizeToParquetRejectsUnsupportedFormat(t *testing.T) {
 	if !strings.Contains(err.Error(), "not a supported dataset format") {
 		t.Errorf("error = %q, want it to name the unsupported format", err)
 	}
+}
+
+// parquetColumnTypes runs DESCRIBE over a Parquet file and returns column name → DuckDB type.
+func parquetColumnTypes(t *testing.T, handle engine.Handle, path string) map[string]string {
+	t.Helper()
+	rows, err := handle.Query(context.Background(), "DESCRIBE SELECT * FROM read_parquet('"+path+"')")
+	if err != nil {
+		t.Fatalf("DESCRIBE parquet %s: %v", path, err)
+	}
+	defer rows.Close()
+
+	cols := len(rows.Columns())
+	if cols == 0 {
+		cols = 6
+	}
+	out := map[string]string{}
+	for rows.Next() {
+		dest := make([]any, cols)
+		ptrs := make([]any, cols)
+		for i := range dest {
+			ptrs[i] = &dest[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			t.Fatalf("scan DESCRIBE parquet %s: %v", path, err)
+		}
+		out[fmt.Sprintf("%v", dest[0])] = fmt.Sprintf("%v", dest[1])
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate DESCRIBE parquet %s: %v", path, err)
+	}
+	return out
+}
+
+// TestNormalizeCSVConvertsDDMonYYDates is the regression test for Option C (dd-mmm-yy date support):
+// DuckDB's sniffer reads such columns as VARCHAR, which left date columns inferred as Text with a
+// floored 40% confidence badge and made date math fail at query time. The normalizer must turn a
+// column whose every non-null value parses into a real DATE in the normalized Parquet.
+func TestNormalizeCSVConvertsDDMonYYDates(t *testing.T) {
+	handle := acquireTestHandle(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	source := filepath.Join(dir, "dates.csv")
+	target := filepath.Join(dir, "out.parquet")
+
+	// Covers the user's real shapes: two-digit years, four-digit years, single-digit days,
+	// and lowercase month names, all mixed in one column.
+	csv := "acct_date_open,amount,label\n" +
+		"29-Aug-18,1,first\n" +
+		"1-Nov-18,2,second\n" +
+		"31-Dec-08,3,third\n" +
+		"31-Dec-2008,4,fourth\n" +
+		"1-nov-18,5,fifth\n"
+	if err := os.WriteFile(source, []byte(csv), 0o644); err != nil {
+		t.Fatalf("writing csv fixture: %v", err)
+	}
+
+	if err := normalizeToParquet(ctx, handle, domain.FormatCSV, source, target); err != nil {
+		t.Fatalf("normalizeToParquet(CSV) error = %v", err)
+	}
+
+	types := parquetColumnTypes(t, handle, target)
+	if got := types["acct_date_open"]; got != "DATE" {
+		t.Errorf("acct_date_open normalized type = %q, want DATE", got)
+	}
+
+	// Values survive the conversion exactly — nothing silently nulled or shifted.
+	rows, err := handle.Query(ctx, "SELECT strftime(acct_date_open, '%Y-%m-%d') FROM read_parquet('"+target+"') ORDER BY amount")
+	if err != nil {
+		t.Fatalf("reading normalized dates: %v", err)
+	}
+	defer rows.Close()
+	var got []string
+	for rows.Next() {
+		var d string
+		if err := rows.Scan(&d); err != nil {
+			t.Fatalf("scanning normalized date: %v", err)
+		}
+		got = append(got, d)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterating normalized dates: %v", err)
+	}
+	want := []string{"2018-08-29", "2018-11-01", "2008-12-31", "2008-12-31", "2018-11-01"}
+	if !slicesEqual(got, want) {
+		t.Errorf("normalized dates = %v, want %v", got, want)
+	}
+}
+
+// TestNormalizeCSVKeepsAmbiguousColumnsAsText pins the conservative side of the CSV normalizer: a
+// column stays VARCHAR — never silently nulled — unless every non-null value actually parses as a
+// dd-mmm-yy date. That keeps ambiguous data visible to the type-review step instead of quietly
+// corrupting it (the same philosophy as normalizeExcel's fallback).
+func TestNormalizeCSVKeepsAmbiguousColumnsAsText(t *testing.T) {
+	handle := acquireTestHandle(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	source := filepath.Join(dir, "mixed.csv")
+	target := filepath.Join(dir, "out.parquet")
+
+	csv := "amount,when_note,empty_dates,mobile_no\n" +
+		"1,29-Aug-18,,8034720413\n" +
+		"2,n/a,,0401234567\n" +
+		"3,1-Nov-18,,9911122233\n"
+	if err := os.WriteFile(source, []byte(csv), 0o644); err != nil {
+		t.Fatalf("writing csv fixture: %v", err)
+	}
+
+	if err := normalizeToParquet(ctx, handle, domain.FormatCSV, source, target); err != nil {
+		t.Fatalf("normalizeToParquet(CSV) error = %v", err)
+	}
+
+	types := parquetColumnTypes(t, handle, target)
+
+	// The date-looking column has one unparseable value ("n/a"): the whole column stays text,
+	// so the review step still sees the low fit rate instead of losing the value.
+	if got := types["when_note"]; got != "VARCHAR" {
+		t.Errorf("when_note type = %q, want VARCHAR (mixed values must not convert)", got)
+	}
+
+	// An all-empty column converts on zero evidence: stays text.
+	if got := types["empty_dates"]; got != "VARCHAR" {
+		t.Errorf("empty_dates type = %q, want VARCHAR", got)
+	}
+
+	// The phone column must survive exactly as written — leading zero included.
+	if got := types["mobile_no"]; got != "VARCHAR" {
+		t.Errorf("mobile_no type = %q, want VARCHAR", got)
+	}
+	rows, err := handle.Query(ctx, "SELECT mobile_no FROM read_parquet('"+target+"') ORDER BY amount")
+	if err != nil {
+		t.Fatalf("reading mobile_no: %v", err)
+	}
+	defer rows.Close()
+	var got []string
+	for rows.Next() {
+		var v string
+		if err := rows.Scan(&v); err != nil {
+			t.Fatalf("scanning mobile_no: %v", err)
+		}
+		got = append(got, v)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterating mobile_no: %v", err)
+	}
+	want := []string{"8034720413", "0401234567", "9911122233"}
+	if !slicesEqual(got, want) {
+		t.Errorf("mobile_no values = %v, want %v", got, want)
+	}
+}
+
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

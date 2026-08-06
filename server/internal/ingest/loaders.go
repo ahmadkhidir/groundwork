@@ -43,9 +43,7 @@ type execer interface {
 func normalizeToParquet(ctx context.Context, h execer, format domain.DatasetFormat, sourcePath, parquetPath string) error {
 	switch format {
 	case domain.FormatCSV:
-		return copyToParquet(ctx, h,
-			fmt.Sprintf("SELECT * FROM read_csv(%s, auto_detect=true, sample_size=-1)", sqlQuote(sourcePath)),
-			parquetPath, "CSV")
+		return normalizeCSV(ctx, h, sourcePath, parquetPath)
 
 	case domain.FormatParquet:
 		return copyToParquet(ctx, h,
@@ -73,6 +71,175 @@ func copyToParquet(ctx context.Context, h execer, selectSQL, parquetPath, format
 		return fmt.Errorf("could not read this %s file: %s", formatLabel, cleanDriverError(err))
 	}
 	return nil
+}
+
+// csvDateFormats are the strptime formats the CSV normalizer recognizes as dates that DuckDB's
+// sniffer misses. The sniffer reads ISO and numeric date formats itself, so this list exists only for
+// the formats it does not know at all — Excel's dd-mmm-yy exports like "29-Aug-18". %b matches
+// abbreviated month names case-insensitively; %y is the two-digit Excel-export year (00-68 maps to
+// 2000s, 69-99 to 1900s, per strptime), %Y the four-digit form. strptime returns TIMESTAMP, so
+// callers CAST the result to DATE. Formats other than these (e.g. "29 Aug 18") are out of scope:
+// they stay VARCHAR and surface in the type-review step as low-confidence text, which is exactly what
+// the review step exists for.
+var csvDateFormats = []string{"%d-%b-%y", "%d-%b-%Y"}
+
+// strptimeDateExpr builds a COALESCE over every recognized date format, so a single column mixing
+// two- and four-digit years (common in hand-maintained CSVs) still converts completely.
+func strptimeDateExpr(ident string) string {
+	exprs := make([]string, 0, len(csvDateFormats))
+	for _, format := range csvDateFormats {
+		exprs = append(exprs, fmt.Sprintf("TRY_STRPTIME(%s, '%s')", ident, format))
+	}
+	return "COALESCE(" + strings.Join(exprs, ", ") + ")"
+}
+
+// csvColumn is one column of a CSV as the sniffer sees it.
+type csvColumn struct {
+	name     string
+	duckType string
+}
+
+// normalizeCSV ingests a .csv file via DuckDB's sniffer (read_csv with auto-detect over the whole
+// file), then repairs one specific sniffer blind spot: columns of dd-mmm-yy dates, which the sniffer
+// reads as VARCHAR because it does not recognize that format at all.
+//
+// A column of "29-Aug-18" values previously stayed text end to end: inferred type string, date fit
+// rate 0 (floored to the 40% confidence badge), and date math failing at query time — all because
+// nothing in the pipeline could parse the format. The sniffer's own DATE inference handles ISO and
+// numeric formats, so this only looks at columns that came out VARCHAR.
+//
+// The conversion is deliberately conservative, matching normalizeExcel's philosophy: a VARCHAR column
+// becomes DATE only if EVERY non-null value parses with strptime. Any value that does not parse keeps
+// the whole column VARCHAR — never silently nulled — so the review step still sees the ambiguity
+// (a low text fit rate) rather than quietly losing data.
+func normalizeCSV(ctx context.Context, h execer, sourcePath, parquetPath string) error {
+	readExpr := fmt.Sprintf("read_csv(%s, auto_detect=true, sample_size=-1)", sqlQuote(sourcePath))
+
+	columns, err := csvColumns(ctx, h, readExpr)
+	if err != nil {
+		return err
+	}
+	if len(columns) == 0 {
+		return fmt.Errorf("this CSV file has no columns to ingest")
+	}
+
+	// One combined detection query (one extra scan of the file) rather than one query per text
+	// column. Columns the sniffer already typed correctly are never touched, and a CSV with no
+	// VARCHAR columns (the common case: all numeric or ISO dates) costs nothing beyond the DESCRIBE.
+	convertible := make([]bool, len(columns))
+	var textIdx []int
+	for i, col := range columns {
+		if strings.EqualFold(col.duckType, "VARCHAR") {
+			textIdx = append(textIdx, i)
+		}
+	}
+	if len(textIdx) > 0 {
+		var detection []string
+		for _, i := range textIdx {
+			ident := quoteIdent(columns[i].name)
+			detection = append(detection,
+				fmt.Sprintf("count(*) FILTER (WHERE %[1]s IS NOT NULL AND %[2]s IS NOT NULL) AS __csv_parse_%[3]d__", ident, strptimeDateExpr(ident), i),
+				fmt.Sprintf("count(*) FILTER (WHERE %[1]s IS NOT NULL) AS __csv_nonnull_%[2]d__", ident, i),
+			)
+		}
+		rows, err := h.Query(ctx, fmt.Sprintf("SELECT %s FROM %s", strings.Join(detection, ", "), readExpr))
+		if err != nil {
+			return fmt.Errorf("could not inspect this CSV file: %s", cleanDriverError(err))
+		}
+		// count(*) FILTER aggregates are scanned into *int64 per text column; a NULL scan
+		// destination (no data rows at all) keeps the column text.
+		type dateCount struct {
+			index   int
+			parse   int64
+			nonNull int64
+		}
+		counts := make([]*dateCount, 0, len(textIdx))
+		dests := make([]any, 0, len(textIdx)*2)
+		for _, i := range textIdx {
+			c := &dateCount{index: i}
+			counts = append(counts, c)
+			dests = append(dests, &c.parse, &c.nonNull)
+		}
+		if !rows.Next() {
+			rows.Close()
+			return fmt.Errorf("could not inspect this CSV file: the schema scan returned no rows")
+		}
+		if err := rows.Scan(dests...); err != nil {
+			rows.Close()
+			return fmt.Errorf("could not inspect this CSV file: %s", cleanDriverError(err))
+		}
+		rows.Close()
+		for _, c := range counts {
+			// A column converts only when it has at least one value and EVERY non-null value
+			// parsed. nonNull == 0 (all-empty column) stays text — converting on zero evidence
+			// would be a type decision nothing supported.
+			if c.nonNull > 0 && c.parse == c.nonNull {
+				convertible[c.index] = true
+			}
+		}
+	}
+
+	// Only columns that parsed as dates on every non-null value get cast; the rest pass through
+	// exactly as the sniffer read them.
+	projections := make([]string, 0, len(columns))
+	for i, col := range columns {
+		ident := quoteIdent(col.name)
+		if convertible[i] {
+			projections = append(projections, fmt.Sprintf("CAST(%s AS DATE) AS %s", strptimeDateExpr(ident), ident))
+		} else {
+			projections = append(projections, ident)
+		}
+	}
+	return copyToParquet(ctx, h,
+		fmt.Sprintf("SELECT %s FROM %s", strings.Join(projections, ", "), readExpr),
+		parquetPath, "CSV")
+}
+
+// csvColumns lists column names and DuckDB types from the sniffer's read of a CSV.
+func csvColumns(ctx context.Context, h execer, readExpr string) ([]csvColumn, error) {
+	rows, err := h.Query(ctx, fmt.Sprintf("DESCRIBE SELECT * FROM %s", readExpr))
+	if err != nil {
+		return nil, fmt.Errorf("could not inspect this CSV file: %s", cleanDriverError(err))
+	}
+	defer rows.Close()
+
+	// DESCRIBE reports six columns (column_name, column_type, null, key, default, extra); read them
+	// all rather than assuming a shape, so a DuckDB minor version cannot silently shift the scan.
+	numCols := len(rows.Columns())
+	if numCols == 0 {
+		numCols = 6
+	}
+	var out []csvColumn
+	for rows.Next() {
+		dest := make([]any, numCols)
+		ptrs := make([]any, numCols)
+		for i := range dest {
+			ptrs[i] = &dest[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return nil, fmt.Errorf("could not inspect this CSV file: %w", err)
+		}
+		out = append(out, csvColumn{name: cellString(dest[0]), duckType: cellString(dest[1])})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("could not inspect this CSV file: %w", err)
+	}
+	return out, nil
+}
+
+// cellString renders a scan destination cell as a string, handling the string/[]byte shapes DuckDB
+// drivers return.
+func cellString(v any) string {
+	switch val := v.(type) {
+	case string:
+		return val
+	case []byte:
+		return string(val)
+	case nil:
+		return ""
+	default:
+		return fmt.Sprintf("%v", val)
+	}
 }
 
 // normalizeExcel ingests an .xlsx file, falling back to whole-file type inference when DuckDB's

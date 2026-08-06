@@ -501,6 +501,39 @@ Verification: server `go vet` + fresh `go test` + `gofmt -l` clean; web `tsc --n
 `make check` fails at the `fmt` step under cmd (`'out' is not recognized`). Run `make vet` + `make
 test` and check `gofmt -l .` manually instead. Pre-existing, not introduced by this wave.
 
+### Post-closure bugfix — dd-mmm-yy CSV dates read as text (FEAT-003), committed after the closure wave
+
+A user's CSV carried an `ACCT_LEVEL_DATE` column of Excel-style `dd-mmm-yy` values (`29-Aug-18`,
+`1-Nov-18`). DuckDB's `read_csv` sniffer does not recognize that format at all, so it typed the
+column VARCHAR; profiling inferred Text; the confidence badge showed the floored 40% (`string` fit
+0.4); and date math on the column failed at query time. Nothing in the pipeline could parse the
+format — the entire failure traced to the loader, not to profiling or the confirmation screen.
+
+**Fix (Option C, pipeline-level):** `normalizeCSV` (`server/internal/ingest/loaders.go`) now, after
+the sniffer's whole-file read, scans any column the sniffer typed VARCHAR and converts the column to
+a real DATE in the normalized Parquet when **every non-null value** parses via
+`TRY_STRPTIME(col, '%d-%b-%y')` / `'%d-%b-%Y'` (COALESCE over both, so a column mixing two- and
+four-digit years converts completely; `%b` matches month names case-insensitively; `%y` two-digit
+year pivot is strptime's 00-68→2000s/69-99→1900s; `strptime` returns TIMESTAMP, so the result is
+explicitly `CAST(... AS DATE)`). The conversion is deliberately conservative, matching
+`normalizeExcel`'s philosophy: any value that does not parse keeps the whole column VARCHAR — never
+silently nulled — so the review step still sees the ambiguity (a low text fit rate) instead of
+quietly losing data. Columns the sniffer typed correctly (numeric, ISO dates) are never touched, and
+a CSV with no VARCHAR columns costs nothing beyond the DESCRIBE. Verified against the user's exact
+shape: `ACCT_LEVEL_DATE` now profiles as `date` at fit 1.0 end to end.
+
+- **Docs basis:** `features.md` FEAT-003 (ingest normalizes the file into a canonical form) and
+  `schema.md` (line 129: exact coercion rules are implementation-defined). No docs change required —
+  the normalization happens inside the loader, before profiling, so inference/fit/badge/query-time
+  date math all agree.
+- **Tests:** `TestNormalizeCSVConvertsDDMonYYDates` (mixed two-digit, four-digit, single-digit-day,
+  lowercase-month values → DATE column, values preserved exactly) and
+  `TestNormalizeCSVKeepsAmbiguousColumnsAsText` (an unparseable value, an all-empty column, and a
+  phone column with a leading zero all stay VARCHAR, values preserved) in `loaders_test.go`, against
+  the real-engine fixture pattern.
+
+Verification: server `go vet` + fresh `go test ./...` (all packages green) + `gofmt -l` clean.
+
 ### Phase 2 boundary assumptions (user-approved 2026-08-05)
 
 Four Phase 2 features lean on capabilities `roadmap.md` schedules for Phase 3+. These are the
