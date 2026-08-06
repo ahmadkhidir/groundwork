@@ -1044,3 +1044,63 @@ func TestConvertValue(t *testing.T) {
 		}
 	}
 }
+
+// TestParseModelJSON pins the tolerant JSON parser every model step output goes through: plain
+// JSON, the markdown-fenced wrapper the model occasionally emits (the production "invalid character
+// '`'" failure), and whitespace padding all decode; genuinely invalid JSON still fails honestly.
+func TestParseModelJSON(t *testing.T) {
+	type out struct {
+		Answerable bool   `json:"answerable"`
+		Reason     string `json:"reason"`
+	}
+	tests := []struct {
+		name    string
+		raw     string
+		wantErr bool
+		want    out
+	}{
+		{
+			name: "plain json",
+			raw:  `{"answerable":true,"reason":"ok"}`,
+			want: out{Answerable: true, Reason: "ok"},
+		},
+		{
+			name: "json fenced with language tag",
+			raw:  "```json\n{\"answerable\":false,\"reason\":\"needs data\"}\n```",
+			want: out{Answerable: false, Reason: "needs data"},
+		},
+		{
+			name: "fenced with no language tag",
+			raw:  "```\n{\"answerable\":true,\"reason\":\"ok\"}\n```",
+			want: out{Answerable: true, Reason: "ok"},
+		},
+		{
+			name: "surrounding whitespace and blank lines",
+			raw:  "\n\n  {\"answerable\":true,\"reason\":\"ok\"}  \n",
+			want: out{Answerable: true, Reason: "ok"},
+		},
+		{
+			name:    "truly invalid json still fails",
+			raw:     `not json at all`,
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got out
+			err := parseModelJSON([]byte(tt.raw), &got)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("parseModelJSON(%q) = %v, want error", tt.raw, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseModelJSON(%q) returned error: %v", tt.raw, err)
+			}
+			if got != tt.want {
+				t.Errorf("parseModelJSON(%q) = %+v, want %+v", tt.raw, got, tt.want)
+			}
+		})
+	}
+}

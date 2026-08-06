@@ -17,6 +17,7 @@
 package run
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -429,6 +430,32 @@ func (e *Executor) execStep(
 
 // runPlan executes the plan step: build the workspace's payload, ask the model whether the question
 // is answerable and how to approach it, and persist the typed PlanStepOutput.
+// parseModelJSON unmarshals a model step response into v, tolerating the markdown fenced-code
+// wrapper (```json ... ```) the Anthropic model occasionally wraps its JSON in despite the prompt.
+// json.Unmarshal rejects the backticks outright — the "plan step returned unparseable output:
+// invalid character '`' looking for beginning of value" failure seen in production. Stripping the
+// fence before parsing is not leniency that hides bad output: the stored step output remains the
+// parsed JSON (never the fence), and a body that is still invalid JSON after the fence is removed
+// surfaces the same honest unparseable-output error as before.
+func parseModelJSON(raw []byte, v any) error {
+	b := bytes.TrimSpace(raw)
+	if bytes.HasPrefix(b, []byte("```")) {
+		lines := bytes.Split(b, []byte("\n"))
+		// Drop the opening fence line (``` or ```json).
+		lines = lines[1:]
+		// Drop a trailing closing fence line if one is present.
+		for n := len(lines); n > 0; n-- {
+			last := bytes.TrimSpace(lines[n-1])
+			if bytes.HasPrefix(last, []byte("```")) {
+				lines = lines[:n-1]
+				break
+			}
+		}
+		b = bytes.TrimSpace(bytes.Join(lines, []byte("\n")))
+	}
+	return json.Unmarshal(b, v)
+}
+
 func (e *Executor) runPlan(ctx context.Context, sc stepContext, run domain.Run, log *slog.Logger) (string, error) {
 	payload, err := e.buildPayload(ctx, sc.workspaceID, run.QuestionText, "")
 	if err != nil {
@@ -441,7 +468,7 @@ func (e *Executor) runPlan(ctx context.Context, sc stepContext, run domain.Run, 
 	}
 
 	var out domain.PlanStepOutput
-	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+	if err := parseModelJSON([]byte(raw), &out); err != nil {
 		return "", fmt.Errorf("plan step returned unparseable output: %w", err)
 	}
 	encoded, err := json.Marshal(out)
@@ -465,7 +492,7 @@ func (e *Executor) runGenerateSQL(ctx context.Context, sc stepContext, run domai
 	}
 
 	var out domain.GenerateSQLStepOutput
-	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+	if err := parseModelJSON([]byte(raw), &out); err != nil {
 		return "", fmt.Errorf("generate_sql step returned unparseable output: %w", err)
 	}
 	if strings.TrimSpace(out.SQL) == "" {
@@ -510,7 +537,7 @@ func (e *Executor) runChartSpec(ctx context.Context, sc stepContext, run domain.
 	}
 
 	var spec domain.ChartSpec
-	if err := json.Unmarshal([]byte(raw), &spec); err != nil {
+	if err := parseModelJSON([]byte(raw), &spec); err != nil {
 		return "", fmt.Errorf("chart_spec step returned unparseable output: %w", err)
 	}
 	if !isValidChartType(spec.ChartType) {
@@ -540,7 +567,7 @@ func (e *Executor) runNarrate(ctx context.Context, sc stepContext, run domain.Ru
 	}
 
 	var outNarrate domain.NarrateStepOutput
-	if err := json.Unmarshal([]byte(raw), &outNarrate); err != nil {
+	if err := parseModelJSON([]byte(raw), &outNarrate); err != nil {
 		return "", fmt.Errorf("narrate step returned unparseable output: %w", err)
 	}
 	if strings.TrimSpace(outNarrate.Narrative) == "" {
