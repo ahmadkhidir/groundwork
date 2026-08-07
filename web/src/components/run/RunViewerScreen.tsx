@@ -97,6 +97,11 @@ export function RunViewerScreen({ workspaceId, runId }: RunViewerScreenProps) {
   const loaded = useRef(false);
   // Guards the completion auto-navigate so it fires once per mount.
   const navigatedToReport = useRef(false);
+  // Only a run that COMPLETES WHILE THIS VIEWER IS WATCHING (the assemble-transition arriving over
+  // the live stream) auto-navigates to its report. A run already complete on mount was navigated to
+  // deliberately (e.g. the report page's "View source run"), so re-firing the redirect there would
+  // trap the user in a report↔run loop — the exact defect this flag prevents.
+  const completionObserved = useRef(false);
   // The prior run a determinism-cache hit was replayed from (the SSE cache.hit's cached_run_id), for
   // the "answered from cache" banner. Null on a fresh execution.
   const [cachedFrom, setCachedFrom] = useState<string | null>(null);
@@ -116,9 +121,11 @@ export function RunViewerScreen({ workspaceId, runId }: RunViewerScreenProps) {
         reportId,
       });
       loaded.current = true;
-      // FEAT-018 auto-navigate: a run that completed materialized a report, and the viewer follows
-      // the user there.
+      // FEAT-018 auto-navigate: a run that completed while the viewer was watching materialized a
+      // report, and the viewer follows the user there. Gate on completionObserved so an
+      // already-complete run visited deliberately (report page's "View source run") stays put.
       if (
+        completionObserved.current &&
         response.run.status === RunStatus.Complete &&
         reportId &&
         !navigatedToReport.current
@@ -175,8 +182,13 @@ export function RunViewerScreen({ workspaceId, runId }: RunViewerScreenProps) {
               ? { ...prev, run: { ...prev.run, status } }
               : prev,
           );
-          // On completion, refresh once to pick up the materialized report_id and auto-navigate.
-          if (status === RunStatus.Complete) void load();
+          // Only a completion observed while watching arms the report auto-navigate. Refresh once
+          // to pick up the materialized report_id; load() gates the redirect on this flag, so a
+          // terminal run mounted from elsewhere (report → "View source run") never bounces back.
+          if (status === RunStatus.Complete) {
+            completionObserved.current = true;
+            void load();
+          }
           break;
         }
         case "cache.hit":
@@ -228,6 +240,7 @@ export function RunViewerScreen({ workspaceId, runId }: RunViewerScreenProps) {
   useEffect(() => {
     loaded.current = false;
     navigatedToReport.current = false;
+    completionObserved.current = false;
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setCachedFrom(null);
     // Mount-triggered async fetch; see WorkspaceHomeScreen.tsx for why this eslint rule is

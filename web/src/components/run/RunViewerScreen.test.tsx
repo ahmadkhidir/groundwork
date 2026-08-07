@@ -226,7 +226,28 @@ describe("RunViewerScreen", () => {
     expect(screen.getByText(/cached from run run-9/i)).toBeInTheDocument();
   });
 
-  it("auto-navigates to the report on completion when a report_id is attached (FEAT-018)", async () => {
+  it("auto-navigates to the report when completion is observed over the live stream (FEAT-018)", async () => {
+    // Watch flow: the viewer mounts while the run is running, then the assemble step completes.
+    getMock
+      .mockResolvedValueOnce({ run: run("running"), steps: [] })
+      .mockResolvedValueOnce({
+        run: run("complete"),
+        steps: completeRunSteps(),
+        report_id: "report-1",
+      });
+    render(<RunViewerScreen workspaceId="ws-1" runId="run-1" />);
+    await screen.findByText("How many customers per region?");
+
+    emit(0, JSON.stringify({ type: "run.status", status: "complete" }));
+
+    await waitFor(() =>
+      expect(pushMock).toHaveBeenCalledWith("/workspaces/ws-1/reports/report-1"),
+    );
+  });
+
+  it("does not auto-navigate when mounting an already-complete run (report page's View source run)", async () => {
+    // Arriving at a finished run's viewer — e.g. from the Report View's "View source run" — must
+    // keep the user there, not bounce them back to the report in a report↔run loop.
     getMock.mockResolvedValue({
       run: run("complete"),
       steps: completeRunSteps(),
@@ -235,7 +256,12 @@ describe("RunViewerScreen", () => {
     render(<RunViewerScreen workspaceId="ws-1" runId="run-1" />);
 
     await screen.findByText("How many customers per region?");
-    expect(pushMock).toHaveBeenCalledWith("/workspaces/ws-1/reports/report-1");
+    expect(pushMock).not.toHaveBeenCalled();
+    // The report is still reachable through the explicit link.
+    expect(screen.getByRole("link", { name: /View report/ })).toHaveAttribute(
+      "href",
+      "/workspaces/ws-1/reports/report-1",
+    );
   });
 
   it("does not navigate away when a completed run has no report yet", async () => {
