@@ -18,7 +18,12 @@ import (
 // A COMPLETED run is a no-op, and a queued/waking/running run (already being driven by the executor)
 // is skipped rather than double-driven.
 func (e *Executor) Resume(userID, runID string) {
-	go e.resume(context.Background(), userID, runID)
+	ctx, cancel := e.runContext(runID)
+	go func() {
+		defer cancel()
+		defer e.releaseRunContext(runID)
+		e.resume(ctx, userID, runID)
+	}()
 }
 
 func (e *Executor) resume(ctx context.Context, userID, runID string) {

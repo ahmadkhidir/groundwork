@@ -26,6 +26,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -51,13 +52,23 @@ type RunStore interface {
 
 // StepStore persists step rows. Satisfied by postgres.StepRepository. It is deliberately the same
 // width as orchestrator.StepStore — the executor hands this seam to the orchestrator engine, which
-// drives the per-step claim/persist/replay loop (FEAT-022).
+// drives the per-step claim/persist/replay loop (FEAT-022) — plus two methods the orchestrator
+// must NOT own: Halt and InvalidateFromStep are the halt/amend writes (FEAT-024), which
+// deliberately exceed orchestrator.Reset's "a completed step is never reset" guarantee. Keeping
+// them off orchestrator.StepStore preserves that guarantee for plain retries while letting the
+// executor's own halt/amend entry points settle and re-claim rows.
 type StepStore interface {
 	ListByRun(ctx context.Context, runID string) ([]domain.Step, error)
 	Create(ctx context.Context, workspaceID string, step domain.Step) error
 	Reset(ctx context.Context, id string) error
 	Complete(ctx context.Context, id, output string) error
 	Fail(ctx context.Context, id, reason string) error
+	// Halt settles an in-flight step to halted (FEAT-024). A completed row is left untouched.
+	Halt(ctx context.Context, id string) error
+	// InvalidateFromStep re-claims stepName and every step after it in pipeline order into a fresh
+	// running attempt, so an amendment re-runs its downstream (FEAT-024). Existing rows only — the
+	// idempotency_key UNIQUE constraint is never violated.
+	InvalidateFromStep(ctx context.Context, runID string, stepName domain.StepName) error
 }
 
 // DatasetStore lists a workspace's datasets. Satisfied by postgres.DatasetRepository.
@@ -139,6 +150,13 @@ type Executor struct {
 	relationships semantic.RelationshipLister
 	metrics       semantic.MetricDefinitionLister
 	corrections   semantic.CorrectionLister
+
+	// cancels maps runID → the cancel func of its background execution context. Registering a
+	// cancellable context per run is what makes Halt (FEAT-024) real: cancelling it aborts the
+	// current step's model/engine work (both honor ctx cancellation) instead of letting the query
+	// run to completion unobserved.
+	cancelMu sync.RWMutex
+	cancels  map[string]context.CancelFunc
 }
 
 // Option configures an Executor at construction. Options run before the internal step engine is
@@ -188,6 +206,7 @@ func NewExecutor(
 		relationships: relationships,
 		metrics:       metrics,
 		corrections:   corrections,
+		cancels:       make(map[string]context.CancelFunc),
 	}
 	for _, opt := range opts {
 		opt(e)
@@ -206,6 +225,42 @@ func (e *Executor) rebuildEngine() {
 func (e *Executor) publish(runID string, ev events.Event) {
 	if e.hub != nil {
 		e.hub.Publish(runID, ev)
+	}
+}
+
+// runContext returns a per-run cancellable context for background execution and registers its cancel
+// func so Halt can stop in-flight work (FEAT-024): every model call and engine query in this run's
+// pipeline is issued with this context, so cancelling it aborts the current step's work instead of
+// letting a query run to completion unobserved.
+//
+// The returned cancel func must be released with releaseRunContext when the run's goroutine ends,
+// so the registry never leaks an entry for a finished run.
+func (e *Executor) runContext(runID string) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	e.cancelMu.Lock()
+	e.cancels[runID] = cancel
+	e.cancelMu.Unlock()
+	return ctx, cancel
+}
+
+// releaseRunContext drops runID's registered cancel func once its execution goroutine has finished.
+// A later Halt of an already-terminal run is a no-op anyway (Halt guards on run status), so the
+// missing entry is never consulted.
+func (e *Executor) releaseRunContext(runID string) {
+	e.cancelMu.Lock()
+	delete(e.cancels, runID)
+	e.cancelMu.Unlock()
+}
+
+// cancelRun invokes runID's registered cancel func, if any. This is the load-bearing half of Halt
+// (FEAT-024): the in-flight step's model/engine work observes the cancelled context and returns
+// immediately, after which the executor settles the step to halted rather than failing it.
+func (e *Executor) cancelRun(runID string) {
+	e.cancelMu.RLock()
+	cancel := e.cancels[runID]
+	e.cancelMu.RUnlock()
+	if cancel != nil {
+		cancel()
 	}
 }
 
@@ -229,7 +284,12 @@ func (e *Executor) setRunStatus(ctx context.Context, log *slog.Logger, runID str
 // if the submitting user navigates away. userID is the run's initiating user, needed for the
 // workspace-scoped audit entries (domain.Run carries no user field).
 func (e *Executor) Submit(userID string, run domain.Run) {
-	go e.execute(context.Background(), userID, run)
+	ctx, cancel := e.runContext(run.ID)
+	go func() {
+		defer cancel()
+		defer e.releaseRunContext(run.ID)
+		e.execute(ctx, userID, run)
+	}()
 }
 
 // SubmitWithSQL starts run's background execution with generate_sql seeded by the user's edited SQL
@@ -244,7 +304,12 @@ func (e *Executor) Submit(userID string, run domain.Run) {
 // sql is trimmed before being persisted; a whitespace-only value fails the run at the generate_sql
 // step with an honest message rather than executing nothing.
 func (e *Executor) SubmitWithSQL(userID string, run domain.Run, sql string) {
-	go e.executeSeeded(context.Background(), userID, run, sql)
+	ctx, cancel := e.runContext(run.ID)
+	go func() {
+		defer cancel()
+		defer e.releaseRunContext(run.ID)
+		e.executeSeeded(ctx, userID, run, sql)
+	}()
 }
 
 // stepContext carries the identity fields every step write needs, plus the resume ledger of already-
@@ -297,7 +362,7 @@ func (e *Executor) executePipeline(ctx context.Context, userID string, run domai
 	completed, err := e.engine.Load(ctx, run.ID)
 	if err != nil {
 		log.Error("loading completed steps", slog.String("error", err.Error()))
-		e.failRun(ctx, log, run.ID)
+		e.stepFailed(ctx, log, run)
 		return
 	}
 	sc.ledger = completed
@@ -307,7 +372,7 @@ func (e *Executor) executePipeline(ctx context.Context, userID string, run domai
 	// engine..." — the engine queued run announcing the wake it is about to cause.
 	if err := e.setRunStatus(ctx, log, run.ID, domain.RunWaking); err != nil {
 		log.Error("marking run waking", slog.String("error", err.Error()))
-		e.failRun(ctx, log, run.ID)
+		e.stepFailed(ctx, log, run)
 		return
 	}
 
@@ -318,6 +383,9 @@ func (e *Executor) executePipeline(ctx context.Context, userID string, run domai
 		// else is a generic failure. Both are specific enough for the user to act on.
 		if errors.Is(err, engine.ErrEngineUnavailable) {
 			e.failRun(ctx, log, run.ID, "The engine couldn't be started. Try again.")
+		} else if ctx.Err() == context.Canceled {
+			// A halt cancelled the wake (FEAT-024): settle to halted, never a generic failure.
+			e.haltRun(ctx, log, run)
 		} else {
 			e.failRun(ctx, log, run.ID, "Something went wrong starting the engine. Try again.")
 		}
@@ -331,7 +399,7 @@ func (e *Executor) executePipeline(ctx context.Context, userID string, run domai
 
 	if err := e.setRunStatus(ctx, log, run.ID, domain.RunRunning); err != nil {
 		log.Error("marking run running", slog.String("error", err.Error()))
-		e.failRun(ctx, log, run.ID)
+		e.stepFailed(ctx, log, run)
 		return
 	}
 
@@ -349,7 +417,7 @@ func (e *Executor) executePipeline(ctx context.Context, userID string, run domai
 		})
 		if err != nil {
 			log.Error("generate_sql step failed", slog.String("error", err.Error()))
-			e.failRun(ctx, log, run.ID)
+			e.stepFailed(ctx, log, run)
 			return
 		}
 	} else {
@@ -362,13 +430,13 @@ func (e *Executor) executePipeline(ctx context.Context, userID string, run domai
 			})
 			if err != nil {
 				log.Error("plan step failed", slog.String("error", err.Error()))
-				e.failRun(ctx, log, run.ID)
+				e.stepFailed(ctx, log, run)
 				return
 			}
 
 			if err := json.Unmarshal([]byte(planOutput), &plan); err != nil {
 				log.Error("parsing plan output", slog.String("error", err.Error()))
-				e.failRun(ctx, log, run.ID)
+				e.stepFailed(ctx, log, run)
 				return
 			}
 
@@ -381,7 +449,7 @@ func (e *Executor) executePipeline(ctx context.Context, userID string, run domai
 					reason = "This question couldn't be answered from the available data."
 				}
 				log.Info("run failed: question not answerable", slog.String("reason", reason))
-				e.failRun(ctx, log, run.ID)
+				e.stepFailed(ctx, log, run)
 				return
 			}
 		}
@@ -392,7 +460,7 @@ func (e *Executor) executePipeline(ctx context.Context, userID string, run domai
 		})
 		if err != nil {
 			log.Error("generate_sql step failed", slog.String("error", err.Error()))
-			e.failRun(ctx, log, run.ID)
+			e.stepFailed(ctx, log, run)
 			return
 		}
 	}
@@ -400,7 +468,20 @@ func (e *Executor) executePipeline(ctx context.Context, userID string, run domai
 	var genSQL domain.GenerateSQLStepOutput
 	if err := json.Unmarshal([]byte(generateSQLOutput), &genSQL); err != nil {
 		log.Error("parsing generate_sql output", slog.String("error", err.Error()))
-		e.failRun(ctx, log, run.ID)
+		e.stepFailed(ctx, log, run)
+		return
+	}
+
+	// static_check (FEAT-028): a pure, deterministic analysis of the generated SQL — no model call
+	// (AC3), no engine query. Findings are persisted as the step's output and surfaced in the Run
+	// Viewer BEFORE the execute results are shown (AC2), but they never block execution: the
+	// analysis is advisory (see domain.StaticCheckWarning's doc). The step's input is the
+	// generate_sql output — the exact SQL text about to run — mirroring PipelineOrder.
+	if _, err := e.execStep(ctx, sc, domain.StepStaticCheck, generateSQLOutput, log, func() (string, error) {
+		return e.runStaticCheck(ctx, sc, generateSQLOutput)
+	}); err != nil {
+		log.Error("static_check step failed", slog.String("error", err.Error()))
+		e.stepFailed(ctx, log, run)
 		return
 	}
 
@@ -411,14 +492,14 @@ func (e *Executor) executePipeline(ctx context.Context, userID string, run domai
 	})
 	if err != nil {
 		log.Error("execute step failed", slog.String("error", err.Error()))
-		e.failRun(ctx, log, run.ID)
+		e.stepFailed(ctx, log, run)
 		return
 	}
 
 	var executeOut domain.ExecuteStepOutput
 	if err := json.Unmarshal([]byte(executeOutput), &executeOut); err != nil {
 		log.Error("parsing execute output", slog.String("error", err.Error()))
-		e.failRun(ctx, log, run.ID)
+		e.stepFailed(ctx, log, run)
 		return
 	}
 
@@ -428,13 +509,13 @@ func (e *Executor) executePipeline(ctx context.Context, userID string, run domai
 	})
 	if err != nil {
 		log.Error("chart_spec step failed", slog.String("error", err.Error()))
-		e.failRun(ctx, log, run.ID)
+		e.stepFailed(ctx, log, run)
 		return
 	}
 	var chartOut domain.ChartSpecStepOutput
 	if err := json.Unmarshal([]byte(chartSpecOutput), &chartOut); err != nil {
 		log.Error("parsing chart_spec output", slog.String("error", err.Error()))
-		e.failRun(ctx, log, run.ID)
+		e.stepFailed(ctx, log, run)
 		return
 	}
 
@@ -446,13 +527,13 @@ func (e *Executor) executePipeline(ctx context.Context, userID string, run domai
 	})
 	if err != nil {
 		log.Error("narrate step failed", slog.String("error", err.Error()))
-		e.failRun(ctx, log, run.ID)
+		e.stepFailed(ctx, log, run)
 		return
 	}
 	var narrateOut domain.NarrateStepOutput
 	if err := json.Unmarshal([]byte(narrateOutput), &narrateOut); err != nil {
 		log.Error("parsing narrate output", slog.String("error", err.Error()))
-		e.failRun(ctx, log, run.ID)
+		e.stepFailed(ctx, log, run)
 		return
 	}
 
@@ -460,7 +541,7 @@ func (e *Executor) executePipeline(ctx context.Context, userID string, run domai
 	// whose Report could not be persisted is a corrupt state, so a failure here fails the run.
 	if err := e.createReport(ctx, sc, run, reconcile, chartOut.ChartSpec, narrateOut.Narrative); err != nil {
 		log.Error("creating report", slog.String("error", err.Error()))
-		e.failRun(ctx, log, run.ID)
+		e.stepFailed(ctx, log, run)
 		return
 	}
 
@@ -476,7 +557,7 @@ func (e *Executor) executePipeline(ctx context.Context, userID string, run domai
 
 	if err := e.setRunStatus(ctx, log, run.ID, domain.RunComplete); err != nil {
 		log.Error("marking run complete", slog.String("error", err.Error()))
-		e.failRun(ctx, log, run.ID)
+		e.stepFailed(ctx, log, run)
 		return
 	}
 	log.Info("run complete")

@@ -1,6 +1,8 @@
-import { CheckCircle2, Circle, Loader2, PauseCircle, XCircle } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Circle, Loader2, PauseCircle, XCircle } from "lucide-react";
+import type { ReactNode } from "react";
 import type { Step, StepStatus } from "@/types/schema";
 import { STEP_NAMES } from "@/types/schema";
+import { parseStaticCheckStep } from "@/components/run/step-payloads";
 
 export interface StepFeedProps {
   steps: Step[];
@@ -57,6 +59,28 @@ const STATUS_LABELS: Record<StepStatus, string> = {
  * the fact that later verification steps arrive in later phases rather than showing a permanent
  * "pending" row for a step that will never run.
  */
+/**
+ * Renders a completed static_check step's advisory findings (FEAT-028 AC2: surfaced, not buried).
+ * Warnings are informational — they never block a run — so they read quieter than a failed step.
+ */
+function renderStaticCheckWarnings(step: Step): ReactNode | null {
+  const payload = parseStaticCheckStep(step.output);
+  if (payload === null || payload.warnings.length === 0) return null;
+  return (
+    <ul className="mt-1 flex flex-col gap-1">
+      {payload.warnings.map((warning, i) => (
+        <li
+          key={`${warning.category}-${i}`}
+          className="flex items-start gap-1.5 rounded-md bg-surface-secondary px-2 py-1.5"
+        >
+          <AlertTriangle size={14} className="mt-[3px] shrink-0 text-warning" aria-hidden="true" />
+          <p className="text-body-small text-text-primary">{warning.message}</p>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 export function StepFeed({ steps }: StepFeedProps) {
   if (steps.length === 0) {
     return <p className="text-body-small text-text-secondary">Waiting for the run to begin…</p>;
@@ -90,6 +114,9 @@ export function StepFeed({ steps }: StepFeedProps) {
             {step.status === "failed" && step.output ? (
               <p className="mt-1 text-body-small text-error">{step.output}</p>
             ) : null}
+            {step.step_name === "static_check" && step.status === "complete"
+              ? renderStaticCheckWarnings(step)
+              : null}
           </div>
         </li>
       ))}

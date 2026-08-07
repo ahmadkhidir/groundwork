@@ -44,10 +44,19 @@ type RunStepStore interface {
 // Resume (FEAT-022) restarts a previously-failed/interrupted run from its first unfinished step; the
 // executor's step machine replays completed work and reclaims an incomplete step, so it can never
 // double-execute a step. It returns immediately.
+//
+// Halt (FEAT-024) stops an in-flight run: the executor cancels its background work (model/engine
+// calls abort) and marks the run halted so the viewer can edit the SQL. It returns immediately.
+//
+// AmendAndResume (FEAT-024) restarts a halted run from an amended step: the amended step and
+// everything after it in pipeline order are invalidated for re-execution, earlier completed steps
+// are preserved, and execution resumes. It returns immediately.
 type RunExecutor interface {
 	Submit(userID string, run domain.Run)
 	SubmitWithSQL(userID string, run domain.Run, sql string)
 	Resume(userID string, runID string)
+	Halt(userID string, runID string)
+	AmendAndResume(userID string, runID string, stepName domain.StepName, input string)
 }
 
 // RegisterRunRoutes wires FEAT-013's endpoints onto r. reports backs the GET run response's
@@ -68,6 +77,8 @@ func RegisterRunRoutes(r chi.Router, workspaces WorkspaceStore, runs RunStore, s
 	if hub != nil {
 		r.Get("/workspaces/{workspaceId}/runs/{runId}/stream", handleStreamRun(workspaces, runs, hub, logger))
 		r.Post("/workspaces/{workspaceId}/runs/{runId}/resume", handleResumeRun(workspaces, runs, executor, logger))
+		r.Post("/workspaces/{workspaceId}/runs/{runId}/halt", handleHaltRun(workspaces, runs, executor, logger))
+		r.Post("/workspaces/{workspaceId}/runs/{runId}/amend", handleAmendRun(workspaces, runs, executor, logger))
 	}
 }
 
@@ -420,5 +431,99 @@ func handleResumeRun(workspaces WorkspaceStore, runs RunStore, executor RunExecu
 				"code":  "run_not_resumable",
 			})
 		}
+	}
+}
+
+// handleHaltRun serves FEAT-024's halt endpoint: POST /api/workspaces/:id/runs/:runId/halt.
+//
+// It stops an in-flight run — the executor cancels the run's background execution context (aborting
+// the current step's model/engine work) and marks the run halted so the viewer pivots to the
+// halted/editable state. A terminal run has nothing to halt; the endpoint still acknowledges the
+// request (idempotent), mirroring how resume treats a no-op resume.
+func handleHaltRun(workspaces WorkspaceStore, runs RunStore, executor RunExecutor, logger *slog.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		claims, ok := requireClaims(w, r)
+		if !ok {
+			return
+		}
+
+		workspaceID := chi.URLParam(r, "workspaceId")
+		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+			return
+		}
+
+		runID := chi.URLParam(r, "runId")
+		run, err := runs.GetByID(r.Context(), runID)
+		if err != nil || run.WorkspaceID != workspaceID {
+			respondJSON(w, http.StatusNotFound, map[string]string{
+				"error": "Run not found.",
+				"code":  "not_found",
+			})
+			return
+		}
+
+		executor.Halt(claims.UserID, runID)
+		respondJSON(w, http.StatusAccepted, map[string]any{"status": "halted", "run_id": runID})
+	}
+}
+
+// amendRunRequest is the POST body for amending a halted step (FEAT-024): which step is being
+// amended and its new input. This wave's executor supports amending generate_sql, where input is
+// the user's edited SQL.
+type amendRunRequest struct {
+	StepName domain.StepName `json:"step_name"`
+	Input    string          `json:"input"`
+}
+
+// handleAmendRun serves FEAT-024's amend endpoint:
+// POST /api/workspaces/:id/runs/:runId/amend.
+//
+// It hands the amendment to the executor, which invalidates the amended step and everything after it
+// for re-execution and resumes the run from that step forward — earlier completed steps are never
+// re-run (AC3). The request is validated for the fields the executor consumes; a blank step or a
+// blank input is a client bug, not a model request.
+func handleAmendRun(workspaces WorkspaceStore, runs RunStore, executor RunExecutor, logger *slog.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		claims, ok := requireClaims(w, r)
+		if !ok {
+			return
+		}
+
+		workspaceID := chi.URLParam(r, "workspaceId")
+		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+			return
+		}
+
+		runID := chi.URLParam(r, "runId")
+		run, err := runs.GetByID(r.Context(), runID)
+		if err != nil || run.WorkspaceID != workspaceID {
+			respondJSON(w, http.StatusNotFound, map[string]string{
+				"error": "Run not found.",
+				"code":  "not_found",
+			})
+			return
+		}
+
+		var req amendRunRequest
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		if req.StepName == "" {
+			respondJSON(w, http.StatusBadRequest, map[string]string{
+				"error": "A step to amend is required.",
+				"code":  "invalid_step",
+			})
+			return
+		}
+		if strings.TrimSpace(req.Input) == "" {
+			respondJSON(w, http.StatusBadRequest, map[string]string{
+				"error": "Amended input cannot be empty.",
+				"code":  "invalid_input",
+			})
+			return
+		}
+
+		executor.AmendAndResume(claims.UserID, runID, req.StepName, req.Input)
+		respondJSON(w, http.StatusAccepted, map[string]any{"status": "amended", "run_id": runID})
 	}
 }

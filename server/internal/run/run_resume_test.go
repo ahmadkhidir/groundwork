@@ -52,8 +52,8 @@ func TestResumeReplaysCompletedStepsAndRunsFromFirstUnfinished(t *testing.T) {
 	}
 
 	all := steps.all()
-	if len(all) != 5 {
-		t.Fatalf("steps = %d, want 5 (plan + generate_sql + execute + chart_spec + narrate): %+v", len(all), all)
+	if len(all) != 6 {
+		t.Fatalf("steps = %d, want 6 (plan + generate_sql + static_check + execute + chart_spec + narrate): %+v", len(all), all)
 	}
 	// The replayed plan keeps its original row id and stays complete.
 	for _, s := range all {

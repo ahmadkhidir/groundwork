@@ -6,9 +6,9 @@
  * boundary rather than widening the shared schema. They mirror the Go shapes in
  * server/internal/domain/run.go — keep them in lockstep.
  *
- * Only the three Phase 2 steps exist here: plan, generate_sql, execute. static_check, reconcile,
- * shadow_check, adversarial_review, chart_spec, narrate, and assemble arrive in later phases and
- * have no payload shape on the client yet.
+ * The Phase 2 steps plus FEAT-028's static_check exist here: plan, generate_sql, static_check,
+ * execute. reconcile, shadow_check, adversarial_review, chart_spec, narrate, and assemble have no
+ * payload shape on the client yet.
  */
 
 /** Parsed output of the "plan" step: whether the question is answerable, and how. */
@@ -27,6 +27,22 @@ export interface GenerateSQLStepOutput {
 
 /** A single result value: JSON scalar (string, number, boolean, or null). */
 export type ResultValue = string | number | boolean | null;
+
+/**
+ * One FEAT-028 static-check finding: a risky pattern in the generated SQL that the user should
+ * know about. Warnings are advisory — they never block a run.
+ */
+export interface StaticCheckWarning {
+  /** Stable category id, e.g. "aggregate_over_join_without_dedup" or "null_dropping_filter". */
+  category: string;
+  /** Plain-language explanation of what the pattern risks. */
+  message: string;
+}
+
+/** Parsed output of the "static_check" step: a deterministic, model-free analysis of the SQL. */
+export interface StaticCheckStepOutput {
+  warnings: StaticCheckWarning[];
+}
 
 /** Parsed output of the "execute" step: the facts returned from running the generated SQL. */
 export interface ExecuteStepOutput {
@@ -69,6 +85,15 @@ export function parseGenerateSQLStep(output: string | undefined): GenerateSQLSte
     return null;
   }
   return parsed as GenerateSQLStepOutput;
+}
+
+/** Parses a static_check step's output, or null when it is absent or malformed. */
+export function parseStaticCheckStep(output: string | undefined): StaticCheckStepOutput | null {
+  const parsed = parseStepOutput("static_check", output);
+  if (parsed === null || !Array.isArray((parsed as StaticCheckStepOutput).warnings)) {
+    return null;
+  }
+  return parsed as StaticCheckStepOutput;
 }
 
 /** Parses an execute step's output, or null when it is absent or malformed. */

@@ -23,6 +23,11 @@ const (
 	TypeStepCompleted Type = "step.completed"
 	// TypeStepFailed is emitted when a step's work fails and the step row is marked failed.
 	TypeStepFailed Type = "step.failed"
+	// TypeStepHalted is emitted when a step is settled to halted by a user halt (FEAT-024): the run
+	// was stopped mid-step, the step row now reads halted, and the run is marked halted. The viewer
+	// already renders this event type (RunViewerScreen's step.halted branch); the Go side emitted no
+	// such event until halt existed.
+	TypeStepHalted Type = "step.halted"
 	// TypeCacheHit is emitted when a run was answered entirely from determinism cache (FEAT-027):
 	// plan/generate_sql/execute/chart_spec/narrate were replayed from a prior identical run, and no
 	// model or engine work happened. CachedRunID names that prior run.

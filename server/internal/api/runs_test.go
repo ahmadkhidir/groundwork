@@ -74,6 +74,14 @@ type fakeRunExecutor struct {
 	runs    []domain.Run
 	sqls    []string
 	resumed []string
+	halted  []string
+	amended []amendedRequest
+}
+
+type amendedRequest struct {
+	runID    string
+	stepName domain.StepName
+	input    string
 }
 
 func (f *fakeRunExecutor) Submit(userID string, run domain.Run) {
@@ -102,6 +110,24 @@ func (f *fakeRunExecutor) Resume(userID string, runID string) {
 	f.resumed = append(f.resumed, runID)
 }
 
+// Halt records the halt request (FEAT-024); the real executor runs a goroutine, so asserting the
+// request reached it is the handler test's boundary.
+func (f *fakeRunExecutor) Halt(userID string, runID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.userIDs = append(f.userIDs, userID)
+	f.halted = append(f.halted, runID)
+}
+
+// AmendAndResume records the amend request (FEAT-024); the real executor runs a goroutine, so
+// asserting the request reached it (and with what step/input) is the handler test's boundary.
+func (f *fakeRunExecutor) AmendAndResume(userID string, runID string, stepName domain.StepName, input string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.userIDs = append(f.userIDs, userID)
+	f.amended = append(f.amended, amendedRequest{runID: runID, stepName: stepName, input: input})
+}
+
 func (f *fakeRunExecutor) submitted() []domain.Run {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -115,6 +141,22 @@ func (f *fakeRunExecutor) submittedSQL() []string {
 	defer f.mu.Unlock()
 	out := make([]string, len(f.sqls))
 	copy(out, f.sqls)
+	return out
+}
+
+func (f *fakeRunExecutor) haltedRuns() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.halted))
+	copy(out, f.halted)
+	return out
+}
+
+func (f *fakeRunExecutor) amendedRuns() []amendedRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]amendedRequest, len(f.amended))
+	copy(out, f.amended)
 	return out
 }
 

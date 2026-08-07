@@ -63,3 +63,22 @@ type ChartSpecStepOutput struct {
 type NarrateStepOutput struct {
 	Narrative string `json:"narrative"`
 }
+
+// StaticCheckWarning is one finding recorded by FEAT-028's static SQL analysis. It is surfaced in
+// the Run Viewer before the execute results are shown, but it does NOT block the run — the
+// analysis is advisory, and the acceptance criteria are specifically "surfaced to the user", not
+// "prevent execution" (risk_log R-002's moat is verifiability visible, not gatekeeping).
+type StaticCheckWarning struct {
+	// Category is a stable short key naming the risky pattern, e.g. "fan_out_join",
+	// "null_dropping_filter", "hardcoded_date_window".
+	Category string `json:"category"`
+	// Message is a plain-language, actionable explanation.
+	Message string `json:"message"`
+}
+
+// StaticCheckStepOutput is the parsed shape of the "static_check" step's Step.Output (FEAT-028):
+// the findings of a deterministic, model-free analysis of the generated SQL, produced by
+// internal/run before execute. It makes no engine query and makes no model call (AC3).
+type StaticCheckStepOutput struct {
+	Warnings []StaticCheckWarning `json:"warnings"`
+}

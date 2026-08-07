@@ -160,6 +160,53 @@ func (f *fakeStepStore) all() []domain.Step {
 	return out
 }
 
+// Halt mirrors StepRepository.Halt: settle a non-complete step to halted; leave completed rows alone.
+func (f *fakeStepStore) Halt(_ context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := range f.steps {
+		if f.steps[i].ID == id {
+			if f.steps[i].Status == domain.StepComplete {
+				return nil
+			}
+			now := time.Now().UTC()
+			f.steps[i].Status = domain.StepHalted
+			f.steps[i].CompletedAt = &now
+			return nil
+		}
+	}
+	return errors.New("step not found")
+}
+
+// InvalidateFromStep mirrors StepRepository.InvalidateFromStep: flip stepName of runID and every
+// step after it in pipeline order back to a fresh running attempt (re-using rows, no inserts).
+func (f *fakeStepStore) InvalidateFromStep(_ context.Context, runID string, stepName domain.StepName) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	idx := -1
+	for i, name := range domain.PipelineOrder {
+		if name == stepName {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
+		return errors.New("step not in pipeline order")
+	}
+	inScope := make(map[domain.StepName]bool)
+	for _, name := range domain.PipelineOrder[idx:] {
+		inScope[name] = true
+	}
+	for i := range f.steps {
+		if f.steps[i].RunID == runID && inScope[f.steps[i].StepName] {
+			f.steps[i].Status = domain.StepRunning
+			f.steps[i].Output = ""
+			f.steps[i].CompletedAt = nil
+		}
+	}
+	return nil
+}
+
 type fakeDatasetStore struct {
 	datasets []domain.Dataset
 }
@@ -465,10 +512,10 @@ func TestExecutorHappyPath(t *testing.T) {
 	}
 
 	all := steps.all()
-	if len(all) != 5 {
-		t.Fatalf("steps = %d, want 5", len(all))
+	if len(all) != 6 {
+		t.Fatalf("steps = %d, want 6", len(all))
 	}
-	wantNames := []domain.StepName{domain.StepPlan, domain.StepGenerateSQL, domain.StepExecute, domain.StepChartSpec, domain.StepNarrate}
+	wantNames := []domain.StepName{domain.StepPlan, domain.StepGenerateSQL, domain.StepStaticCheck, domain.StepExecute, domain.StepChartSpec, domain.StepNarrate}
 	for i, name := range wantNames {
 		if all[i].StepName != name {
 			t.Errorf("step[%d] name = %s, want %s", i, all[i].StepName, name)
@@ -482,7 +529,8 @@ func TestExecutorHappyPath(t *testing.T) {
 	}
 
 	// Input chaining: the first model step gets no prior context, later steps get the previous
-	// step's JSON-encoded output verbatim — chart_spec and narrate both consume the execute output.
+	// step's JSON-encoded output verbatim — static_check and execute both consume the generate_sql
+	// output; chart_spec and narrate both consume the execute output.
 	if all[0].Input != "" {
 		t.Errorf("plan input = %q, want empty", all[0].Input)
 	}
@@ -490,13 +538,16 @@ func TestExecutorHappyPath(t *testing.T) {
 		t.Errorf("generate_sql input = %q, want the plan output %q", all[1].Input, all[0].Output)
 	}
 	if all[2].Input != all[1].Output {
-		t.Errorf("execute input = %q, want the generate_sql output %q", all[2].Input, all[1].Output)
+		t.Errorf("static_check input = %q, want the generate_sql output %q", all[2].Input, all[1].Output)
 	}
-	if all[3].Input != all[2].Output {
-		t.Errorf("chart_spec input = %q, want the execute output %q", all[3].Input, all[2].Output)
+	if all[3].Input != all[1].Output {
+		t.Errorf("execute input = %q, want the generate_sql output %q", all[3].Input, all[1].Output)
 	}
-	if all[4].Input != all[2].Output {
-		t.Errorf("narrate input = %q, want the execute output %q", all[4].Input, all[2].Output)
+	if all[4].Input != all[3].Output {
+		t.Errorf("chart_spec input = %q, want the execute output %q", all[4].Input, all[3].Output)
+	}
+	if all[5].Input != all[3].Output {
+		t.Errorf("narrate input = %q, want the execute output %q", all[5].Input, all[3].Output)
 	}
 
 	var plan domain.PlanStepOutput
@@ -507,8 +558,17 @@ func TestExecutorHappyPath(t *testing.T) {
 		t.Errorf("plan = %+v", plan)
 	}
 
+	// FEAT-028 static_check output must parse, and the deterministic happy-path SQL is clean.
+	var scOut domain.StaticCheckStepOutput
+	if err := json.Unmarshal([]byte(all[2].Output), &scOut); err != nil {
+		t.Fatalf("static_check output not parseable: %v", err)
+	}
+	if len(scOut.Warnings) != 0 {
+		t.Errorf("static_check warnings = %+v, want none", scOut.Warnings)
+	}
+
 	var out domain.ExecuteStepOutput
-	if err := json.Unmarshal([]byte(all[2].Output), &out); err != nil {
+	if err := json.Unmarshal([]byte(all[3].Output), &out); err != nil {
 		t.Fatalf("execute output not parseable: %v", err)
 	}
 	if len(out.Columns) != 2 || out.Columns[0] != "region" || out.Columns[1] != "cnt" {
@@ -525,7 +585,7 @@ func TestExecutorHappyPath(t *testing.T) {
 
 	// chart_spec (FEAT-016) output must parse as a ChartSpec.
 	var chartOut domain.ChartSpecStepOutput
-	if err := json.Unmarshal([]byte(all[3].Output), &chartOut); err != nil {
+	if err := json.Unmarshal([]byte(all[4].Output), &chartOut); err != nil {
 		t.Fatalf("chart_spec output not parseable: %v", err)
 	}
 	if chartOut.ChartSpec.ChartType != domain.ChartBar || chartOut.ChartSpec.XAxisColumn != "region" || chartOut.ChartSpec.YAxisColumn != "cnt" {
@@ -570,7 +630,7 @@ func TestExecutorHappyPath(t *testing.T) {
 	}
 	// The report's narrative is exactly the narrate step's output.
 	var narrateOut domain.NarrateStepOutput
-	if err := json.Unmarshal([]byte(all[4].Output), &narrateOut); err != nil {
+	if err := json.Unmarshal([]byte(all[5].Output), &narrateOut); err != nil {
 		t.Fatalf("narrate output not parseable: %v", err)
 	}
 	if rep.Narrative != narrateOut.Narrative {
@@ -627,10 +687,10 @@ func TestExecutorSeededSubmit(t *testing.T) {
 	}
 
 	all := steps.all()
-	if len(all) != 4 {
-		t.Fatalf("steps = %d, want 4 (generate_sql, execute, chart_spec, narrate)", len(all))
+	if len(all) != 5 {
+		t.Fatalf("steps = %d, want 5 (generate_sql, static_check, execute, chart_spec, narrate)", len(all))
 	}
-	wantNames := []domain.StepName{domain.StepGenerateSQL, domain.StepExecute, domain.StepChartSpec, domain.StepNarrate}
+	wantNames := []domain.StepName{domain.StepGenerateSQL, domain.StepStaticCheck, domain.StepExecute, domain.StepChartSpec, domain.StepNarrate}
 	for i, name := range wantNames {
 		if all[i].StepName != name || all[i].Status != domain.StepComplete {
 			t.Errorf("step[%d] = %s/%s, want %s complete", i, all[i].StepName, all[i].Status, name)
@@ -837,14 +897,14 @@ func TestExecutorFailsWhenResultExceedsRowCeiling(t *testing.T) {
 		t.Fatalf("run status = %s, want failed after the row-count ceiling is exceeded", got)
 	}
 	all := steps.all()
-	if len(all) != 3 {
-		t.Fatalf("steps = %d, want 3 (plan, generate_sql, execute)", len(all))
+	if len(all) != 4 {
+		t.Fatalf("steps = %d, want 4 (plan, generate_sql, static_check, execute)", len(all))
 	}
-	if all[2].Status != domain.StepFailed {
-		t.Fatalf("execute step status = %s, want failed", all[2].Status)
+	if all[3].Status != domain.StepFailed {
+		t.Fatalf("execute step status = %s, want failed", all[3].Status)
 	}
-	if !strings.Contains(all[2].Output, "more than") {
-		t.Errorf("failed execute output = %q, want it to name the row ceiling honestly", all[2].Output)
+	if !strings.Contains(all[3].Output, "more than") {
+		t.Errorf("failed execute output = %q, want it to name the row ceiling honestly", all[3].Output)
 	}
 	if got := modelClient.callCount(); got != 2 {
 		t.Errorf("model calls = %d, want 2 (plan, generate_sql) — execute never reaches chart/narrate", got)
@@ -872,14 +932,14 @@ func TestExecutorFailsWhenChartSpecStepReturnsGarbage(t *testing.T) {
 		t.Fatalf("run status = %s, want failed after unparseable chart_spec", got)
 	}
 	all := steps.all()
-	if len(all) != 4 {
-		t.Fatalf("steps = %d, want 4 (plan, generate_sql, execute, chart_spec)", len(all))
+	if len(all) != 5 {
+		t.Fatalf("steps = %d, want 5 (plan, generate_sql, static_check, execute, chart_spec)", len(all))
 	}
-	if all[3].Status != domain.StepFailed {
-		t.Fatalf("chart_spec step status = %s, want failed", all[3].Status)
+	if all[4].Status != domain.StepFailed {
+		t.Fatalf("chart_spec step status = %s, want failed", all[4].Status)
 	}
-	if !strings.Contains(all[3].Output, "unparseable") {
-		t.Errorf("failed chart_spec output = %q, want it to name the parse failure", all[3].Output)
+	if !strings.Contains(all[4].Output, "unparseable") {
+		t.Errorf("failed chart_spec output = %q, want it to name the parse failure", all[4].Output)
 	}
 }
 
@@ -905,14 +965,14 @@ func TestExecutorFailsWhenNarrateStepReturnsGarbage(t *testing.T) {
 		t.Fatalf("run status = %s, want failed after unparseable narrate", got)
 	}
 	all := steps.all()
-	if len(all) != 5 {
-		t.Fatalf("steps = %d, want 5 (plan, generate_sql, execute, chart_spec, narrate)", len(all))
+	if len(all) != 6 {
+		t.Fatalf("steps = %d, want 6 (plan, generate_sql, static_check, execute, chart_spec, narrate)", len(all))
 	}
-	if all[4].Status != domain.StepFailed {
-		t.Fatalf("narrate step status = %s, want failed", all[4].Status)
+	if all[5].Status != domain.StepFailed {
+		t.Fatalf("narrate step status = %s, want failed", all[5].Status)
 	}
-	if !strings.Contains(all[4].Output, "unparseable") {
-		t.Errorf("failed narrate output = %q, want it to name the parse failure", all[4].Output)
+	if !strings.Contains(all[5].Output, "unparseable") {
+		t.Errorf("failed narrate output = %q, want it to name the parse failure", all[5].Output)
 	}
 	if created := reports.created(); len(created) != 0 {
 		t.Errorf("created reports = %v, want none — a failed narrate must not materialize a report", created)
@@ -943,8 +1003,8 @@ func TestExecutorFailsWhenReportPersistenceFails(t *testing.T) {
 		t.Fatalf("run status = %s, want failed when report persistence fails", got)
 	}
 	all := steps.all()
-	if len(all) != 5 {
-		t.Fatalf("steps = %d, want 5 — chart_spec and narrate still completed", len(all))
+	if len(all) != 6 {
+		t.Fatalf("steps = %d, want 6 — chart_spec and narrate still completed", len(all))
 	}
 	for i, step := range all {
 		if step.Status != domain.StepComplete {

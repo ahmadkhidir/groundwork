@@ -157,6 +157,72 @@ func (r *StepRepository) Reset(ctx context.Context, id string) error {
 	return nil
 }
 
+// Halt settles a step to "halted" (FEAT-024). It targets any step that is NOT already complete — a
+// running, failed, or stale-pending row — because only unfinished work can be stopped; a completed
+// step's persisted output is never rewritten. completion time is stamped so the Run Viewer renders
+// a coherent "halted" leaf rather than a row that looks mid-flight.
+//
+// A completed row is left untouched (no error, RowsAffected 0): halting a finished step is a
+// harmless no-op, not an error the caller must handle.
+func (r *StepRepository) Halt(ctx context.Context, id string) error {
+	_, err := r.pool.Exec(ctx,
+		`UPDATE steps SET status = 'halted', completed_at = now() WHERE id = $1 AND status <> 'complete'`,
+		id,
+	)
+	if err != nil {
+		return fmt.Errorf("halting step: %w", err)
+	}
+	return nil
+}
+
+// InvalidateFromStep re-claims stepName of runID and every step after it (in domain.PipelineOrder)
+// into a fresh running attempt, so the amended step and its dependents re-execute on resume
+// (FEAT-024/025's amendment semantics).
+//
+// This is the amend path's DELIBERATE exception to orchestrator.Reset's "a completed step is never
+// reset" contract: amending a step explicitly requests recomputation of its downstream, so those
+// completed rows MUST be flipped back to re-runnable. The method lives on the store — not on
+// orchestrator.StepStore, which keeps its never-reset-completed guarantee for plain retries — and
+// is called by internal/run's own seam, keeping the orchestrator untouched.
+//
+// Only EXISTING rows are updated — the method never inserts — so the schema's UNIQUE
+// idempotency_key is never violated: the same row is re-claimed, exactly as orchestrator.Reset
+// re-claims a failed attempt. Rows before stepName in pipeline order are untouched.
+func (r *StepRepository) InvalidateFromStep(ctx context.Context, runID string, stepName domain.StepName) error {
+	idx := -1
+	for i, name := range domain.PipelineOrder {
+		if name == stepName {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
+		return fmt.Errorf("invalidating from %s: not in pipeline order", stepName)
+	}
+
+	names := make([]string, 0, len(domain.PipelineOrder)-idx)
+	for _, name := range domain.PipelineOrder[idx:] {
+		names = append(names, string(name))
+	}
+
+	_, err := r.pool.Exec(ctx,
+		`UPDATE steps
+		    SET status = 'running',
+		        attempt_count = attempt_count + 1,
+		        output = '',
+		        completed_at = NULL,
+		        lease_holder = '',
+		        lease_expires_at = NULL,
+		        started_at = now()
+		  WHERE run_id = $1 AND step_name = ANY($2)`,
+		runID, names,
+	)
+	if err != nil {
+		return fmt.Errorf("invalidating steps from %s: %w", stepName, err)
+	}
+	return nil
+}
+
 // scanSteps scans every row of a `steps` query sharing the column list above.
 func scanSteps(rows pgx.Rows) ([]domain.Step, error) {
 	var out []domain.Step
