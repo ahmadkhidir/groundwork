@@ -159,3 +159,63 @@ func waitForEvent(t *testing.T, ch <-chan events.Event, typ events.Type) *events
 	}
 	return nil
 }
+
+// TestSchemaDigestInvalidatesOnDataChange pins FEAT-027's determinism contract: the SAME workspace
+// state hashes to the SAME key (so an identical question hits the cache), and any change to the
+// underlying DATA — a re-ingested row count, a new dataset row — changes the key (AC2: "invalidated
+// automatically when the underlying schema or data changes"). The digest mixes the schema surface
+// with a per-dataset data-version stamp (id + row_count + created_at), so this is asserted at the
+// key level, not just on the schema shape.
+func TestSchemaDigestInvalidatesOnDataChange(t *testing.T) {
+	executor, _, _, _, _, _, _ := newTestExecutor()
+	base := domain.Dataset{
+		ID: "d1", WorkspaceID: "ws-1", OriginalFilename: "Sales.csv",
+		IngestStatus: domain.IngestComplete, RowCount: 1000,
+		CreatedAt: time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC),
+	}
+	mk := func(ds domain.Dataset) {
+		executor.datasets = &fakeDatasetStore{datasets: []domain.Dataset{ds}}
+		executor.columns = &fakeColumnStore{byDataset: map[string][]domain.Column{
+			ds.ID: {{Name: "region", InferredType: domain.TypeString}},
+		}}
+	}
+
+	mk(base)
+	first, err := executor.schemaDigest(context.Background(), "ws-1")
+	if err != nil {
+		t.Fatalf("schemaDigest: %v", err)
+	}
+
+	// Identical state → identical key (AC1's same-question-same-data hit path).
+	mk(base)
+	second, err := executor.schemaDigest(context.Background(), "ws-1")
+	if err != nil {
+		t.Fatalf("schemaDigest: %v", err)
+	}
+	if first != second {
+		t.Errorf("identical state hashed differently: %s != %s — cache would miss a same-question same-data hit", first, second)
+	}
+
+	// The DATA changed (row count) while the schema surface is byte-identical: the key MUST change
+	// so the cache cannot serve a stale answer.
+	changed := base
+	changed.RowCount = 1001
+	mk(changed)
+	if got, err := executor.schemaDigest(context.Background(), "ws-1"); err != nil {
+		t.Fatalf("schemaDigest: %v", err)
+	} else if got == first {
+		t.Error("digest unchanged after data row_count changed — FEAT-027 AC2 data invalidation broken")
+	}
+
+	// A brand-new dataset (Replace / Keep-both land as a new row) must also change the key.
+	mk(domain.Dataset{
+		ID: "d2", WorkspaceID: "ws-1", OriginalFilename: "Sales.csv",
+		IngestStatus: domain.IngestComplete, RowCount: 999,
+		CreatedAt: time.Date(2026, 8, 7, 13, 0, 0, 0, time.UTC),
+	})
+	if got, err := executor.schemaDigest(context.Background(), "ws-1"); err != nil {
+		t.Fatalf("schemaDigest: %v", err)
+	} else if got == first {
+		t.Error("digest unchanged after a new dataset row — cache must invalidate on re-upload/replace/delete")
+	}
+}

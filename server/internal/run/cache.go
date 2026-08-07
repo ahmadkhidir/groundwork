@@ -15,6 +15,7 @@ import (
 
 	"github.com/ahmadkhidir/groundwork/server/internal/domain"
 	"github.com/ahmadkhidir/groundwork/server/internal/events"
+	"github.com/ahmadkhidir/groundwork/server/internal/model"
 	"github.com/ahmadkhidir/groundwork/server/internal/orchestrator"
 )
 
@@ -109,13 +110,49 @@ func (e *Executor) cacheDigest(ctx context.Context, workspaceID, question string
 	return qHash, schemaHash, nil
 }
 
-// schemaDigest returns sha256 over the JSON of the workspace's queryable schema surface.
+// schemaDigest returns sha256 over the JSON of the workspace's queryable schema surface, folded
+// together with a per-dataset DATA-VERSION stamp (FEAT-027 AC2: "invalidated automatically when the
+// underlying schema or data changes").
+//
+// The stamp carries each complete dataset's id, row_count, and created_at. It is deliberately
+// combined even though the schema surface already embeds DatasetID, so that a data change is
+// invalidated by the stamp's own terms and not only by the incidental fact that a replacement
+// usually lands as a new row id: if a future path ever updated a completed dataset's contents in
+// place, the row_count/created_at half of the stamp still changes the key. Data is otherwise
+// immutable per fully-ingested dataset (every re-upload, Replace, or Keep both creates a new
+// Dataset row), so this metadata-only read — no data scan, no engine query — is the cheap O(1)
+// data-version signal for the whole cache.
 func (e *Executor) schemaDigest(ctx context.Context, workspaceID string) (string, error) {
 	tables, err := e.assembleTables(ctx, workspaceID)
 	if err != nil {
 		return "", err
 	}
-	b, err := json.Marshal(tables)
+
+	datasets, err := e.datasets.ListByWorkspace(ctx, workspaceID)
+	if err != nil {
+		return "", fmt.Errorf("listing datasets for data version: %w", err)
+	}
+	type dataVersion struct {
+		ID        string `json:"id"`
+		RowCount  int64  `json:"row_count"`
+		CreatedAt string `json:"created_at"`
+	}
+	var stamps []dataVersion
+	for _, ds := range datasets {
+		if ds.IngestStatus != domain.IngestComplete {
+			continue
+		}
+		stamps = append(stamps, dataVersion{
+			ID:        ds.ID,
+			RowCount:  ds.RowCount,
+			CreatedAt: ds.CreatedAt.UTC().Format(time.RFC3339Nano),
+		})
+	}
+
+	b, err := json.Marshal(struct {
+		Tables []model.TableMetadata `json:"schema"`
+		Data   []dataVersion         `json:"data_version"`
+	}{Tables: tables, Data: stamps})
 	if err != nil {
 		return "", err
 	}
