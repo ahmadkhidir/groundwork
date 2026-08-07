@@ -200,6 +200,10 @@ describe("RunViewerScreen", () => {
     );
     await screen.findByText(SQL_TEXT);
 
+    // The server replays the current run.status as the first message of a connection (snapshot);
+    // it matches the state the viewer joined (still running), so it must not arm auto-navigation.
+    emit(0, JSON.stringify({ type: "run.status", status: "running", run_id: "run-1" }));
+
     // A step absent from the initial snapshot is added live.
     emit(
       0,
@@ -238,6 +242,9 @@ describe("RunViewerScreen", () => {
     render(<RunViewerScreen workspaceId="ws-1" runId="run-1" />);
     await screen.findByText("How many customers per region?");
 
+    // The connection's first run.status is the replayed snapshot (still running) — not a transition.
+    emit(0, JSON.stringify({ type: "run.status", status: "running", run_id: "run-1" }));
+    // The real completion transition follows after the viewer has joined.
     emit(0, JSON.stringify({ type: "run.status", status: "complete" }));
 
     await waitFor(() =>
@@ -247,7 +254,9 @@ describe("RunViewerScreen", () => {
 
   it("does not auto-navigate when mounting an already-complete run (report page's View source run)", async () => {
     // Arriving at a finished run's viewer — e.g. from the Report View's "View source run" — must
-    // keep the user there, not bounce them back to the report in a report↔run loop.
+    // keep the user there, not bounce them back to the report in a report↔run loop. The server
+    // still replays a "complete" run.status snapshot on connect; that snapshot is the state the
+    // viewer JOINED, so it must not be mistaken for a transition that arms navigation.
     getMock.mockResolvedValue({
       run: run("complete"),
       steps: completeRunSteps(),
@@ -256,6 +265,8 @@ describe("RunViewerScreen", () => {
     render(<RunViewerScreen workspaceId="ws-1" runId="run-1" />);
 
     await screen.findByText("How many customers per region?");
+    emit(0, JSON.stringify({ type: "run.status", status: "complete", run_id: "run-1" }));
+
     expect(pushMock).not.toHaveBeenCalled();
     // The report is still reachable through the explicit link.
     expect(screen.getByRole("link", { name: /View report/ })).toHaveAttribute(

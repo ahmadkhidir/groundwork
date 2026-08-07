@@ -102,6 +102,12 @@ export function RunViewerScreen({ workspaceId, runId }: RunViewerScreenProps) {
   // deliberately (e.g. the report page's "View source run"), so re-firing the redirect there would
   // trap the user in a report↔run loop — the exact defect this flag prevents.
   const completionObserved = useRef(false);
+  // The stream endpoint replays the run's CURRENT persisted status as a run.status snapshot, sent as
+  // the first message of each SSE connection (live transitions follow after). That snapshot is the
+  // state the viewer JOINED — never a transition to arm on — so once per connection the first
+  // run.status message is skipped as the snapshot. Reset in onopen so an auto-reconnect after
+  // stream.end starts its own connection fresh.
+  const runStatusSnapshotSeen = useRef(false);
   // The prior run a determinism-cache hit was replayed from (the SSE cache.hit's cached_run_id), for
   // the "answered from cache" banner. Null on a fresh execution.
   const [cachedFrom, setCachedFrom] = useState<string | null>(null);
@@ -182,13 +188,19 @@ export function RunViewerScreen({ workspaceId, runId }: RunViewerScreenProps) {
               ? { ...prev, run: { ...prev.run, status } }
               : prev,
           );
-          // Only a completion observed while watching arms the report auto-navigate. Refresh once
-          // to pick up the materialized report_id; load() gates the redirect on this flag, so a
-          // terminal run mounted from elsewhere (report → "View source run") never bounces back.
-          if (status === RunStatus.Complete) {
-            completionObserved.current = true;
-            void load();
+          // The first run.status message of this connection is the server's replayed snapshot of the
+          // state the viewer JOINED (a terminal run replays "complete"), not a transition — only a
+          // completion observed AFTER joining arms the report auto-navigate. Refresh once for the
+          // real transition to pick up the materialized report_id; load() gates the redirect on
+          // completionObserved, so a terminal run mounted from elsewhere (report → "View source run")
+          // never bounces back.
+          if (runStatusSnapshotSeen.current) {
+            if (status === RunStatus.Complete) {
+              completionObserved.current = true;
+              void load();
+            }
           }
+          runStatusSnapshotSeen.current = true;
           break;
         }
         case "cache.hit":
@@ -252,6 +264,11 @@ export function RunViewerScreen({ workspaceId, runId }: RunViewerScreenProps) {
     const unsubscribe = subscribeToStream(
       `/v1/workspaces/${workspaceId}/runs/${runId}/stream`,
       {
+        onOpen: () => {
+          // Every (re)connection begins with the server replaying a run.status snapshot; reset the
+          // per-connection snapshot guard so that snapshot is never mistaken for a transition.
+          runStatusSnapshotSeen.current = false;
+        },
         onMessage: (data) => {
           try {
             applyStreamEvent(JSON.parse(data) as StreamEvent);
