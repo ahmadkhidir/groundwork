@@ -357,13 +357,14 @@ loaded via `next/font` and bound to `--font-display`, `--font-body`, `--font-mon
 | **A — Foundation** | Scaffold, theme tokens, schema entities, auth, routing skeleton, docker-compose | **Complete** |
 | **1 — Foundation: Workspace, Ingest & Trust** | FEAT-001 ✅ 002 ✅ 003 ✅ 004 ✅ 005 ✅ 006 ✅ 007 ✅ 008 ✅ 009 ✅ 011 ✅ 042 ✅ 044 ✅ 048 ✅ 049 ✅ | **Complete** — reopened for FEAT-048/049 by docs `ff8d5b2` (2026-08-06) and closed by this wave; see below |
 | **2 — Core Grounded Answer Loop** | FEAT-013 ✅, 014 ✅, 015 ✅, 016 ✅, 017 ✅, 018 ✅, 019 ✅, 020 ✅ | **Complete** — Waves 1–5 landed (FEAT-020 in Wave 5) |
-| **3 — Trust & Observability** | FEAT-022, 023, 024, 027, 028, 029, 030 | Not started |
+| **3 — Trust & Observability** | FEAT-022 ✅ 023 ✅ 024 ✅ 027 ✅ 028 ✅ — 029, 030 remaining | **In progress** — Pass 1 (FEAT-022/023/027) landed in `01d7c34`+`2c2e08a`, Pass 2 (FEAT-024/028) landed in `f408a40`; Pass 3 (FEAT-029/030) next |
 | **4 — Reports & Delivery** | FEAT-034, 035, 036, 041, 043 | Not started |
 | **5 — Polish & Expansion** | FEAT-010, 012, 021, 025, 026, 031, 032, 033, 037, 038, 039, 040, 045, 046, 047 | Not started |
 
-> **Current authorized scope: Foundation + Phases 1 and 2** (user-approved 2026-08-05, along with
-> the four phase-boundary assumptions recorded under "Phase 2 boundary assumptions" below). Phases
-> 3–5 are documented but not authorized. Do not begin a later phase without explicit approval.
+> **Current authorized scope: Foundation + Phases 1, 2 and 3** (Phases 1–2 user-approved 2026-08-05,
+> with the four phase-boundary assumptions recorded under "Phase 2 boundary assumptions" below; Phase
+> 3 user-authorized 2026-08-07). Phases 4–5 are documented but not authorized. Do not begin a later
+> phase without explicit approval.
 >
 > **FEAT-019 (Semantic Layer Storage) landed in Phase 2's Wave 1**, as a solo pass (no parallel
 > dispatch) — see the "FEAT-019 — Semantic Layer Storage" note below for what shipped and what it
