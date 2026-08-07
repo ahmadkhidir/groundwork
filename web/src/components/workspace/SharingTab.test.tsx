@@ -55,6 +55,12 @@ describe("SharingTab", () => {
     expect(
       screen.getByText(/Shared report links are available on the Pro and Team plans/),
     ).toBeInTheDocument();
+    // Both locked sections carry the shared Upgrade Prompt, routed to the account plan screen.
+    const upgradeLinks = screen.getAllByRole("link", { name: /Upgrade to Pro\/Team/ });
+    expect(upgradeLinks).toHaveLength(2);
+    for (const link of upgradeLinks) {
+      expect(link).toHaveAttribute("href", "/settings");
+    }
     // Locked sections never fetch (screens/13 Data Flow step 3).
     expect(getMock).not.toHaveBeenCalledWith("/v1/workspaces/ws-1/members");
     expect(getMock).not.toHaveBeenCalledWith("/v1/workspaces/ws-1/report-shares");
@@ -64,6 +70,8 @@ describe("SharingTab", () => {
     render(<SharingTab workspaceId="ws-1" tier={SubscriptionTier.Pro} />);
 
     expect(screen.getByText(/Workspace sharing is available on the Team plan/)).toBeInTheDocument();
+    const upgradeLink = screen.getByRole("link", { name: /Upgrade to Pro\/Team/ });
+    expect(upgradeLink).toHaveAttribute("href", "/settings");
     // Pro unlocks the report links section — it fetches.
     expect(getMock).toHaveBeenCalledWith("/v1/workspaces/ws-1/report-shares");
     expect(getMock).not.toHaveBeenCalledWith("/v1/workspaces/ws-1/members");

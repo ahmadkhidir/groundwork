@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ColumnVisibilityTab } from "./ColumnVisibilityTab";
 import { ApiError, api } from "@/lib/api-client";
 import type { ConfirmationColumn } from "@/components/confirmation/types";
-import type { InferredType } from "@/types/schema";
+import { SubscriptionTier, type InferredType } from "@/types/schema";
 
 vi.mock("@/lib/api-client", async () => {
   const actual =
@@ -17,6 +17,12 @@ vi.mock("@/lib/api-client", async () => {
 
 const getMock = vi.mocked(api.get);
 const patchMock = vi.mocked(api.patch);
+
+/**
+ * The tests that exercise the exclusion toggle render on a paid tier — FEAT-010 is Pro/Team
+ * (monetization.md), so the toggle only exists there. The Free-tier locked state has its own test.
+ */
+const PAID_TIER = SubscriptionTier.Team;
 
 function column(overrides: Partial<ConfirmationColumn> = {}): ConfirmationColumn {
   return {
@@ -69,7 +75,7 @@ describe("ColumnVisibilityTab", () => {
       column({ id: "col-1", name: "total", pii_flag: true, pii_pattern: "amount" }),
       column({ id: "col-2", name: "email", excluded_from_model: true }),
     ]);
-    render(<ColumnVisibilityTab workspaceId="ws-1" />);
+    render(<ColumnVisibilityTab workspaceId="ws-1" tier={PAID_TIER} />);
 
     await waitFor(() => expect(screen.getAllByText("total").length).toBeGreaterThan(0));
 
@@ -88,16 +94,34 @@ describe("ColumnVisibilityTab", () => {
     );
   });
 
+  it("locks the exclusion toggle behind the Upgrade Prompt on Free (FEAT-010, screens.md), routed to the plan screen", async () => {
+    mockGetByPath([column({ id: "col-1", name: "total" })]);
+    render(<ColumnVisibilityTab workspaceId="ws-1" tier={SubscriptionTier.Free} />);
+
+    await waitFor(() => expect(screen.getAllByText("total").length).toBeGreaterThan(0));
+
+    // The column and PII flag stay visible (PII flagging is on every tier); the exclusion control
+    // is a locked Upgrade Prompt, not a switch the server would reject with a 403.
+    expect(screen.queryByRole("switch")).not.toBeInTheDocument();
+    const upgradeLinks = screen.getAllByRole("link", { name: /Upgrade to Pro\/Team/ });
+    expect(upgradeLinks.length).toBeGreaterThan(0);
+    for (const link of upgradeLinks) {
+      expect(link).toHaveAttribute("href", "/settings");
+    }
+    // Never a fetch of the exclusion route for a locked tier.
+    expect(patchMock).not.toHaveBeenCalled();
+  });
+
   it("shows an honest empty state when no columns exist", async () => {
     mockGetByPath([]);
-    render(<ColumnVisibilityTab workspaceId="ws-1" />);
+    render(<ColumnVisibilityTab workspaceId="ws-1" tier={PAID_TIER} />);
 
     await waitFor(() => expect(screen.getByText("No columns yet")).toBeInTheDocument());
   });
 
   it("shows the shared error state with retry when the fetch fails", async () => {
     getMock.mockRejectedValue(new ApiError(500, "Something went wrong. Try again.", "internal_error"));
-    render(<ColumnVisibilityTab workspaceId="ws-1" />);
+    render(<ColumnVisibilityTab workspaceId="ws-1" tier={PAID_TIER} />);
 
     await waitFor(() => expect(screen.getByRole("button", { name: "Try Again" })).toBeInTheDocument());
   });
@@ -108,7 +132,7 @@ describe("ColumnVisibilityTab", () => {
       column: column({ id: "col-1", name: "salary", excluded_from_model: true }),
     });
     const user = userEvent.setup();
-    render(<ColumnVisibilityTab workspaceId="ws-1" />);
+    render(<ColumnVisibilityTab workspaceId="ws-1" tier={PAID_TIER} />);
 
     await waitFor(() => expect(screen.getAllByText("salary").length).toBeGreaterThan(0));
 
@@ -131,7 +155,7 @@ describe("ColumnVisibilityTab", () => {
     mockGetByPath([column({ id: "col-1", name: "salary" })]);
     patchMock.mockRejectedValue(new ApiError(500, "Something went wrong. Try again.", "internal_error"));
     const user = userEvent.setup();
-    render(<ColumnVisibilityTab workspaceId="ws-1" />);
+    render(<ColumnVisibilityTab workspaceId="ws-1" tier={PAID_TIER} />);
 
     await waitFor(() => expect(screen.getAllByText("salary").length).toBeGreaterThan(0));
 
@@ -162,7 +186,7 @@ describe("ColumnVisibilityTab", () => {
       column: column({ id: "col-1", name: "total", excluded_from_model: true }),
     });
     const user = userEvent.setup();
-    render(<ColumnVisibilityTab workspaceId="ws-1" />);
+    render(<ColumnVisibilityTab workspaceId="ws-1" tier={PAID_TIER} />);
 
     await waitFor(() => expect(screen.getAllByText("total").length).toBeGreaterThan(0));
 
@@ -194,7 +218,7 @@ describe("ColumnVisibilityTab", () => {
       column: column({ id: "col-1", name: "notes", excluded_from_model: true }),
     });
     const user = userEvent.setup();
-    render(<ColumnVisibilityTab workspaceId="ws-1" />);
+    render(<ColumnVisibilityTab workspaceId="ws-1" tier={PAID_TIER} />);
 
     await waitFor(() => expect(screen.getAllByText("notes").length).toBeGreaterThan(0));
 

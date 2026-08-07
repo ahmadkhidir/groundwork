@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import Link from "next/link";
 import { Link2, Lock, UserPlus, Users } from "lucide-react";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
@@ -96,6 +97,15 @@ function UpgradePromptCard({ feature, plans }: { feature: string; plans: string 
       <p className="text-body-small text-text-secondary">
         The authoritative gate is enforced server-side; this section is locked for your current plan.
       </p>
+      {/* screens.md's shared Upgrade Prompt pattern: lock icon + "Upgrade to Pro/Team" link to the
+          account plan screen at /settings (billing milestone Pass 3). */}
+      <Link
+        href={routes.accountSettings()}
+        className="mt-3 inline-flex items-center gap-1 text-body-small text-provenance hover:text-provenance"
+      >
+        <Lock size={12} aria-hidden="true" />
+        Upgrade to Pro/Team
+      </Link>
     </Card>
   );
 }

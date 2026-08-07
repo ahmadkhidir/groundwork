@@ -137,7 +137,7 @@ describe("ExportDialog", () => {
     const upgradeLink = within(csvRow as HTMLElement).getByRole("link", {
       name: /Upgrade to Pro\/Team/,
     });
-    expect(upgradeLink).toHaveAttribute("href", "/workspaces/ws-1/settings");
+    expect(upgradeLink).toHaveAttribute("href", "/settings");
 
     // Clicking the row itself must do nothing: Export stays disabled.
     await user.click(screen.getByText("Excel/CSV"));
@@ -260,7 +260,7 @@ describe("ExportDialog", () => {
     const upgradeLink = within(pptxRow as HTMLElement).getByRole("link", {
       name: /Upgrade to Pro\/Team/,
     });
-    expect(upgradeLink).toHaveAttribute("href", "/workspaces/ws-1/settings");
+    expect(upgradeLink).toHaveAttribute("href", "/settings");
     expect(screen.getAllByRole("radio")).toHaveLength(5);
   });
 

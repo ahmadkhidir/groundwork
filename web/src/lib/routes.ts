@@ -80,6 +80,16 @@ export const routes = {
 
   /* -- Account ----------------------------------------------------------------------------- */
   notifications: () => "/notifications",
+  /**
+   * The account-level plan & billing screen.
+   *
+   * MUST stay exactly `/settings` — the Go API builds Stripe Checkout's success/cancel redirect
+   * URLs from this path (`server/internal/api/billing.go`: `upgradeSuccessPath` /
+   * `upgradeCancelledPath`). Deliberately distinct from `settings(workspaceId)`:
+   * `/workspaces/:id/settings` is the per-workspace settings screen; this is the account's own.
+   * The plan screen reads the `upgrade=success|cancelled` query param Stripe's redirect carries.
+   */
+  accountSettings: () => "/settings",
 } as const;
 
 /**

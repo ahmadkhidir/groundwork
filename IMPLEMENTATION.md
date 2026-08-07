@@ -138,6 +138,7 @@ groundwork/
 | `/workspaces/:id/runs/:runId` | Run Viewer |
 | `/workspaces/:id/reports/:reportId` | Report View (`?claim=` drawer, `?export=` modal) |
 | `/workspaces/:id/settings` | Workspace Settings |
+| `/settings` | Account Plan & Billing (billing milestone Pass 3; `?upgrade=success\|cancelled` landing) |
 | `/workspaces/:id/audit-log` | Egress / Audit Log |
 | `/workspaces/:id/semantic-layer` | Semantic Layer / Corrections |
 | `/workspaces/:id/deleted` | Deletion Proof |
@@ -367,7 +368,7 @@ loaded via `next/font` and bound to `--font-display`, `--font-body`, `--font-mon
 > 2026-08-07). All five roadmap phases are delivered. Phase 5 is the last scheduled phase.
 >
 > **Billing milestone (post-roadmap, user-authorized 2026-08-07):** three passes — Pass 1 (Usage
-> Metering) and Pass 2 (Stripe integration) complete, Pass 3 (billing UI) pending. Decisions: Stripe
+> Metering), Pass 2 (Stripe integration), and Pass 3 (Billing UI) all complete. Decisions: Stripe
 > test-mode first; storage metering event-driven + daily reconciliation; overage metered but not
 > yet invoiced; Team plans included in the catalog. See the "Billing milestone" notes below.
 >
@@ -676,6 +677,34 @@ server `make vet` + `make test` (full suite, incl. new `internal/billing` + bill
   User doesn't model Stripe ids (migration adds them; `domain.User` deliberately unchanged);
   monetization.md never says WHICH workspace stays writable after a downgrade (most-recently-updated
   implemented, needs ratification).
+
+### Billing milestone — Pass 3: Billing UI (user-authorized 2026-08-07) — COMPLETE
+
+The final billing pass: the user-facing plan/upgrade screen plus retargeting every Upgrade Prompt to
+it. Web-only (no server changes). Verification: web `tsc --noEmit` + `eslint . --max-warnings=0` +
+`vitest run` 294/294 (36 files) + `next build` clean; `/settings` registered as a dynamic route.
+
+- **`/settings` account route (new)** — `routes.accountSettings()` → `/settings`, exactly the path the
+  Pass 2 server's success/cancel URLs point to (`?upgrade=success|cancelled`), distinct from
+  `/workspaces/:id/settings`. Registered automatically by the App Router; the proxy already treats it
+  as protected (no PUBLIC_ROUTE_PATTERNS change).
+- **`PlanScreen` (new, 10 tests)** — current plan card (name, price, status pill, period end),
+  Free/Pro/Team comparison transcribed from monetization.md's tier content, Upgrade/Switch action per
+  plan (POST `/v1/billing/checkout` → `window.location.assign(url)` — hosted Stripe Checkout, no
+  Elements), current plan shown as "Current plan" not a button, Free never offers an upgrade (no
+  Stripe price), honest `billing_not_configured` state, loading/error/retry. Success banner says
+  "Your plan is being updated" (the webhook tier change can lag the redirect — honest state), cancel
+  banner "Checkout was cancelled — your plan hasn't changed"; the `upgrade` param is cleaned after
+  read.
+- **Upgrade Prompt retargets** — ExportDialog locked rows, SharingTab's prompt card (which gained its
+  missing link), and ColumnVisibilityTab (Free tier now renders the shared Upgrade Prompt on
+  exclusion toggles instead of a control the server would 403; column list + PII flags stay visible,
+  never gated) all link to `routes.accountSettings()`. NotificationsScreen's "Manage your plan" CTA
+  retargeted in assembly.
+- **Server gap reported (not fabricated around):** no cancel/downgrade endpoint exists (Pass 2's
+  `RegisterBillingRoutes` is checkout + subscription-read only), so the plan screen renders the
+  monetization.md cancellation semantics as an honest note with no cancel button — a Stripe billing
+  portal endpoint is the follow-up if self-serve cancellation is wanted.
 
 ### Screen 13 — Workspace Settings: Phase-1 shell (`d8f1bdf`, 2026-08-07)
 

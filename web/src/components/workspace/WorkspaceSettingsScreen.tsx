@@ -207,7 +207,7 @@ export function WorkspaceSettingsScreen({ workspaceId, userTier, userId }: Works
           hidden={tab !== "column-visibility"}
           className="mt-6"
         >
-          <ColumnVisibilityTab workspaceId={workspaceId} />
+          <ColumnVisibilityTab workspaceId={workspaceId} tier={tier} />
         </div>
       )}
 

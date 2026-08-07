@@ -1,7 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { EyeOff, TableProperties } from "lucide-react";
+import Link from "next/link";
+import { EyeOff, Lock, TableProperties } from "lucide-react";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { StatusPill } from "@/components/ui/StatusPill";
@@ -9,16 +10,25 @@ import { EmptyState } from "@/components/shared/EmptyState";
 import { ErrorState } from "@/components/shared/ErrorState";
 import { SkeletonList } from "@/components/shared/Skeleton";
 import { api, ApiError } from "@/lib/api-client";
+import { routes } from "@/lib/routes";
+import { SubscriptionTier, type MetricDefinition } from "@/types/schema";
 import {
   datasetGroupLabel,
   groupColumnsByDataset,
   type ConfirmationColumn,
   type ListColumnsResponse,
 } from "@/components/confirmation/types";
-import type { MetricDefinition } from "@/types/schema";
 
 export interface ColumnVisibilityTabProps {
   workspaceId: string;
+  /**
+   * The user's tier for DISPLAY — column exclusion (FEAT-010) is Pro/Team per monetization.md.
+   * On Free, the exclusion toggle renders the shared Upgrade Prompt (screens.md) rather than a
+   * control the server would reject. Display-only: the authoritative gate is server-side via
+   * UserTierLookup. Defaults to Free (the most restrictive display), matching ExportDialog's
+   * convention — the caller threads the real tier.
+   */
+  tier?: SubscriptionTier;
 }
 
 interface ListMetricDefinitionsResponse {
@@ -72,7 +82,7 @@ function metricReferenceCount(metrics: MetricDefinition[], columnName: string): 
  * before confirming ("This column is used in 2 metric definitions — excluding it may affect future
  * answers"), never a silent block.
  */
-export function ColumnVisibilityTab({ workspaceId }: ColumnVisibilityTabProps) {
+export function ColumnVisibilityTab({ workspaceId, tier = SubscriptionTier.Free }: ColumnVisibilityTabProps) {
   const [state, setState] = useState<LoadState>({ status: "loading" });
   const [columns, setColumns] = useState<ConfirmationColumn[]>([]);
   const [metrics, setMetrics] = useState<MetricDefinition[]>([]);
@@ -80,6 +90,9 @@ export function ColumnVisibilityTab({ workspaceId }: ColumnVisibilityTabProps) {
   const [pendingExclusion, setPendingExclusion] = useState<PendingExclusion | null>(null);
   const [rowErrors, setRowErrors] = useState<RowErrors>({});
   const mounted = useRef(true);
+  // FEAT-010 is Pro/Team (monetization.md): on Free the exclusion toggle is a locked Upgrade
+  // Prompt. The PII flag and column list stay visible — PII flagging is on every tier.
+  const canExclude = tier !== SubscriptionTier.Free;
 
   useEffect(() => {
     mounted.current = true;
@@ -263,10 +276,11 @@ export function ColumnVisibilityTab({ workspaceId }: ColumnVisibilityTabProps) {
                     )}
                   </td>
                   <td className="px-2 py-2">
-                    <ExclusionToggle
+                    <ExclusionControl
                       column={col}
                       loading={savingIds.has(col.id)}
                       error={rowErrors[col.id]}
+                      locked={!canExclude}
                       onToggle={handleToggle}
                     />
                   </td>
@@ -295,10 +309,11 @@ export function ColumnVisibilityTab({ workspaceId }: ColumnVisibilityTabProps) {
                     )}
                   </div>
                   <p className="mb-2 text-body-small text-text-secondary">{col.inferred_type}</p>
-                  <ExclusionToggle
+                  <ExclusionControl
                     column={col}
                     loading={savingIds.has(col.id)}
                     error={rowErrors[col.id]}
+                    locked={!canExclude}
                     onToggle={handleToggle}
                   />
                 </li>
@@ -342,5 +357,41 @@ function ExclusionToggle({
       </button>
       {error && <span className="text-body-small text-error">{error}</span>}
     </div>
+  );
+}
+
+/**
+ * The exclusion cell for one column: the real toggle on Pro/Team, or — on Free, where FEAT-010 is
+ * locked — the shared Upgrade Prompt (screens.md): the option stays visible but reduced-emphasis
+ * with a lock icon and an "Upgrade to Pro/Team" link to the account plan screen. Never a control
+ * the server would reject with a 403.
+ */
+function ExclusionControl({
+  column,
+  loading,
+  error,
+  locked,
+  onToggle,
+}: {
+  column: ConfirmationColumn;
+  loading: boolean;
+  error?: string;
+  locked: boolean;
+  onToggle: (column: ConfirmationColumn, next: boolean) => void;
+}) {
+  if (locked) {
+    return (
+      <Link
+        href={routes.accountSettings()}
+        aria-label={`Upgrade to Pro/Team to exclude ${column.name} from model visibility`}
+        className="inline-flex items-center gap-1 rounded-sm border border-border px-2 py-1 text-body-small text-text-secondary hover:bg-surface-secondary"
+      >
+        <Lock size={12} aria-hidden="true" />
+        Upgrade to Pro/Team
+      </Link>
+    );
+  }
+  return (
+    <ExclusionToggle column={column} loading={loading} error={error} onToggle={onToggle} />
   );
 }

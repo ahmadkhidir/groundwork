@@ -165,7 +165,7 @@ export function NotificationsScreen() {
             when something finishes outside the current view.
           </p>
           <Link
-            href={routes.workspaces()}
+            href={routes.accountSettings()}
             className={buttonClassNames("primary", "mt-2")}
           >
             Manage your plan

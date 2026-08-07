@@ -314,7 +314,7 @@ function ExportDialogContent({
                         <span className="block font-medium text-text-primary">{option.name}</span>
                         <span className="block text-body-small text-text-secondary">{description}</span>
                         <Link
-                          href={routes.settings(workspaceId)}
+                          href={routes.accountSettings()}
                           className="mt-1 inline-flex items-center gap-1 text-body-small text-provenance hover:text-provenance"
                         >
                           <Lock size={12} aria-hidden="true" />
