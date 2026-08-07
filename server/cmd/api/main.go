@@ -17,6 +17,7 @@ import (
 	"github.com/ahmadkhidir/groundwork/server/internal/api"
 	"github.com/ahmadkhidir/groundwork/server/internal/audit"
 	"github.com/ahmadkhidir/groundwork/server/internal/auth"
+	"github.com/ahmadkhidir/groundwork/server/internal/billing"
 	"github.com/ahmadkhidir/groundwork/server/internal/config"
 	"github.com/ahmadkhidir/groundwork/server/internal/engine"
 	"github.com/ahmadkhidir/groundwork/server/internal/events"
@@ -149,6 +150,15 @@ func run(logger *slog.Logger) error {
 	// the same repository.
 	memberRepo := postgres.NewMemberRepository(pool)
 	shareRepo := postgres.NewReportShareRepository(pool)
+
+	// Billing milestone, pass 2 (Stripe integration). billingClient wraps the Stripe SDK; the event
+	// repository dedupes webhook deliveries by event id and records the durable billing-event trail.
+	billingClient := billing.NewClient(cfg.StripeSecretKey)
+	billingEventRepo := postgres.NewBillingEventRepository(pool)
+	if cfg.StripeSecretKey == "" || cfg.StripeWebhookSecret == "" {
+		logger.Warn("Stripe is not configured — checkout and webhook endpoints will fail honestly")
+	}
+
 	modelClient := model.NewClient(cfg.AnthropicAPIKey, auditWriter, logger).WithUsageRecorder(usageWriter)
 	if cfg.AnthropicAPIKey == "" {
 		logger.Warn("ANTHROPIC_API_KEY is not set — FEAT-013 runs will fail at the model step")
@@ -253,6 +263,12 @@ func run(logger *slog.Logger) error {
 		EngineWake:          engineProvider,
 		Notifications:       notificationRepo,
 		ExportNotifications: notificationRepo,
+
+		// Billing milestone, pass 2: userRepo is the only seam allowed to change users.tier;
+		// billingEventRepo dedupes/records webhook events; billingClient wraps the Stripe SDK.
+		BillingUsers:  userRepo,
+		BillingEvents: billingEventRepo,
+		BillingClient: billingClient,
 	}
 
 	server := &http.Server{

@@ -178,7 +178,7 @@ func handleExportReport(workspaces WorkspaceStore, members MemberLookupStore, re
 		}
 
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceMutationAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
+		if _, ok := requireWorkspaceMutationAccess(w, r, workspaces, members, users, claims.UserID, workspaceID); !ok {
 			return
 		}
 

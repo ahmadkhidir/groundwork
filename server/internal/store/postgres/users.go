@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -97,4 +98,123 @@ func (r *UserRepository) UpdatePasswordHash(ctx context.Context, userID, passwor
 func isUniqueViolation(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == uniqueViolationCode
+}
+
+// UserBilling is the Stripe-facing billing state of a user's row: the authoritative tier plus the
+// Stripe customer/subscription ids the webhook handlers and the subscription read endpoint need.
+//
+// It deliberately lives in the store rather than on domain.User because schema.md's User entity has
+// no Stripe fields — see migrations/00010_stripe_billing.sql for the schema addition the docs do not
+// model. Empty strings follow the codebase's empty-string-means-absent convention; a zero
+// StripeSubscriptionPeriodEnd means no current billing period is stored.
+type UserBilling struct {
+	UserID                      string
+	Email                       string
+	Tier                        domain.SubscriptionTier
+	StripeCustomerID            string
+	StripeSubscriptionID        string
+	StripeSubscriptionStatus    string
+	StripeSubscriptionPeriodEnd time.Time
+}
+
+// UpdateTier overwrites the user's authoritative subscription tier. The ONLY writer is the billing
+// webhook path (upgrade via checkout.session.completed, revert to free via
+// customer.subscription.deleted, per monetization.md's Billing Events) — no feature slice calls it.
+// Returns auth.ErrUserNotFound if the user no longer exists.
+func (r *UserRepository) UpdateTier(ctx context.Context, userID string, tier domain.SubscriptionTier) error {
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE users SET tier = $1 WHERE id = $2`,
+		string(tier), userID,
+	)
+	if err != nil {
+		return fmt.Errorf("updating user tier: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return auth.ErrUserNotFound
+	}
+	return nil
+}
+
+// SetStripeCustomer records the Stripe customer id Stripe assigned during checkout, so the webhook
+// handlers can reconcile subscription events (which carry a customer id, not a user id) back to the
+// account. Returns auth.ErrUserNotFound if the user no longer exists.
+func (r *UserRepository) SetStripeCustomer(ctx context.Context, userID, customerID string) error {
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE users SET stripe_customer_id = $1 WHERE id = $2`,
+		customerID, userID,
+	)
+	if err != nil {
+		return fmt.Errorf("setting stripe customer: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return auth.ErrUserNotFound
+	}
+	return nil
+}
+
+// SetStripeSubscription records the user's active Stripe subscription (id, status, and period end)
+// as of the latest webhook. An empty subscriptionID CLEARS the subscription state — cancellation or
+// final payment failure (customer.subscription.deleted) — and a zero periodEnd stores NULL (no
+// current period). Status is Stripe's own value ("active", "past_due", "trialing", ...), surfaced
+// verbatim by the subscription read endpoint. Returns auth.ErrUserNotFound if the user is gone.
+func (r *UserRepository) SetStripeSubscription(ctx context.Context, userID, subscriptionID, status string, periodEnd time.Time) error {
+	var periodEndArg any
+	if !periodEnd.IsZero() {
+		periodEndArg = periodEnd
+	}
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE users
+		 SET stripe_subscription_id = $1,
+		     stripe_subscription_status = $2,
+		     stripe_subscription_period_end = $3
+		 WHERE id = $4`,
+		subscriptionID, status, periodEndArg, userID,
+	)
+	if err != nil {
+		return fmt.Errorf("setting stripe subscription: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return auth.ErrUserNotFound
+	}
+	return nil
+}
+
+// GetBillingByID returns the user's billing state, or auth.ErrUserNotFound.
+func (r *UserRepository) GetBillingByID(ctx context.Context, userID string) (UserBilling, error) {
+	return r.findBilling(ctx, "id = $1", userID)
+}
+
+// GetBillingByStripeCustomerID finds the user who owns customerID, or auth.ErrUserNotFound. This is
+// how subscription-scoped webhook events (customer.subscription.deleted, ...) are reconciled back to
+// an account, since Stripe events carry the customer id and never a user id.
+func (r *UserRepository) GetBillingByStripeCustomerID(ctx context.Context, customerID string) (UserBilling, error) {
+	return r.findBilling(ctx, "stripe_customer_id = $1", customerID)
+}
+
+func (r *UserRepository) findBilling(ctx context.Context, whereClause, arg string) (UserBilling, error) {
+	var (
+		billing   UserBilling
+		tier      string
+		periodEnd *time.Time
+	)
+
+	err := r.pool.QueryRow(ctx,
+		`SELECT id, email, tier, stripe_customer_id, stripe_subscription_id, stripe_subscription_status,
+		        stripe_subscription_period_end
+		 FROM users WHERE `+whereClause,
+		arg,
+	).Scan(&billing.UserID, &billing.Email, &tier, &billing.StripeCustomerID, &billing.StripeSubscriptionID,
+		&billing.StripeSubscriptionStatus, &periodEnd)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return UserBilling{}, auth.ErrUserNotFound
+		}
+		return UserBilling{}, fmt.Errorf("querying user billing: %w", err)
+	}
+
+	billing.Tier = domain.SubscriptionTier(tier)
+	if periodEnd != nil {
+		billing.StripeSubscriptionPeriodEnd = *periodEnd
+	}
+	return billing, nil
 }

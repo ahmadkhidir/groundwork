@@ -355,7 +355,7 @@ func TestRequireWorkspaceMutationAccessAllowsOwner(t *testing.T) {
 	req := authedRequest(t, http.MethodPatch, "/v1/workspaces/ws-1", nil, "user-1", domain.TierFree)
 	rec := httptest.NewRecorder()
 
-	_, ok := requireWorkspaceMutationAccess(rec, req, workspaces, members, "user-1", "ws-1")
+	_, ok := requireWorkspaceMutationAccess(rec, req, workspaces, members, newFakeUserTierLookup(), "user-1", "ws-1")
 	if !ok {
 		t.Fatalf("owner denied mutation access; body = %s", rec.Body.String())
 	}
@@ -374,7 +374,7 @@ func TestRequireWorkspaceMutationAccessBlocksReadOnlyMember(t *testing.T) {
 	req := authedRequest(t, http.MethodPatch, "/v1/workspaces/ws-1", nil, "user-2", domain.TierFree)
 	rec := httptest.NewRecorder()
 
-	_, ok := requireWorkspaceMutationAccess(rec, req, workspaces, members, "user-2", "ws-1")
+	_, ok := requireWorkspaceMutationAccess(rec, req, workspaces, members, newFakeUserTierLookup(), "user-2", "ws-1")
 	if ok {
 		t.Fatal("read-only member granted mutation access")
 	}

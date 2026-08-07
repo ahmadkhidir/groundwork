@@ -49,8 +49,12 @@ var stepOrder = map[ingest.Step]int{
 }
 
 // RegisterIngestRoutes wires FEAT-004's endpoints onto r.
-func RegisterIngestRoutes(r chi.Router, workspaces WorkspaceStore, members MemberLookupStore, datasets IngestDatasetStore, pipeline IngestPipeline, tracker *ingest.Tracker, logger *slog.Logger) {
-	r.Post("/workspaces/{workspaceId}/ingest", handleStartIngest(workspaces, members, datasets, pipeline, logger))
+//
+// members backs the FEAT-045 access check (stream is a read, start-ingest is a mutation); users
+// backs the billing tier gate on the mutation (an over-limit downgraded owner's excess workspaces
+// are read-only — see billing_access.go).
+func RegisterIngestRoutes(r chi.Router, workspaces WorkspaceStore, members MemberLookupStore, users UserTierLookup, datasets IngestDatasetStore, pipeline IngestPipeline, tracker *ingest.Tracker, logger *slog.Logger) {
+	r.Post("/workspaces/{workspaceId}/ingest", handleStartIngest(workspaces, members, users, datasets, pipeline, logger))
 	r.Get("/workspaces/{workspaceId}/ingest/stream", handleIngestStream(workspaces, members, datasets, tracker, logger))
 }
 
@@ -88,7 +92,7 @@ type ingestStreamEvent struct {
 // "pending" — the batch File Upload just created. Returns immediately; ingest itself runs in the
 // background, decoupled from this request (see ingest.Pipeline.Start's doc comment on why that
 // matters for the "tab closed mid-ingest" edge case).
-func handleStartIngest(workspaces WorkspaceStore, members MemberLookupStore, datasets IngestDatasetStore, pipeline IngestPipeline, logger *slog.Logger) http.HandlerFunc {
+func handleStartIngest(workspaces WorkspaceStore, members MemberLookupStore, users UserTierLookup, datasets IngestDatasetStore, pipeline IngestPipeline, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
@@ -96,7 +100,7 @@ func handleStartIngest(workspaces WorkspaceStore, members MemberLookupStore, dat
 		}
 
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceMutationAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
+		if _, ok := requireWorkspaceMutationAccess(w, r, workspaces, members, users, claims.UserID, workspaceID); !ok {
 			return
 		}
 

@@ -35,8 +35,8 @@ const wakeAcquireTimeout = 45 * time.Second
 // RegisterEngineWakeRoute wires FEAT-012's wake endpoint onto r: POST /v1/workspaces/:id/engine/wake.
 // Mounted under the authenticated group by the caller (see api.go) — a wake must be attributable to
 // a member of the workspace, and the Ask panel that triggers it only exists on authenticated screens.
-func RegisterEngineWakeRoute(r chi.Router, workspaces WorkspaceStore, provider EngineWakeProvider, logger *slog.Logger) {
-	r.Post("/workspaces/{workspaceId}/engine/wake", handleWakeWorkspace(workspaces, provider, logger))
+func RegisterEngineWakeRoute(r chi.Router, workspaces WorkspaceStore, members MemberLookupStore, users UserTierLookup, provider EngineWakeProvider, logger *slog.Logger) {
+	r.Post("/workspaces/{workspaceId}/engine/wake", handleWakeWorkspace(workspaces, members, users, provider, logger))
 }
 
 // handleWakeWorkspace serves POST /v1/workspaces/:id/engine/wake — the server half of FEAT-012's
@@ -53,7 +53,7 @@ func RegisterEngineWakeRoute(r chi.Router, workspaces WorkspaceStore, provider E
 // The request is idempotent: waking an already-ready engine costs a fast acquire/release that re-arms
 // the idle clock, and waking an already-waking engine simply joins the in-flight provisioning. This
 // is what makes the client's fire-on-focus (without first checking status) safe.
-func handleWakeWorkspace(workspaces WorkspaceStore, provider EngineWakeProvider, logger *slog.Logger) http.HandlerFunc {
+func handleWakeWorkspace(workspaces WorkspaceStore, members MemberLookupStore, users UserTierLookup, provider EngineWakeProvider, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
@@ -61,7 +61,10 @@ func handleWakeWorkspace(workspaces WorkspaceStore, provider EngineWakeProvider,
 		}
 
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+		// Waking spends metered engine-seconds on the workspace, so it goes through the gated
+		// mutation check (billing milestone, pass 2): an owner whose excess workspace is read-only
+		// after a downgrade must not be able to spend compute on it.
+		if _, ok := requireWorkspaceMutationAccess(w, r, workspaces, members, users, claims.UserID, workspaceID); !ok {
 			return
 		}
 

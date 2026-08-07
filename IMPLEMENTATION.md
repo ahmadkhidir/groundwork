@@ -367,9 +367,9 @@ loaded via `next/font` and bound to `--font-display`, `--font-body`, `--font-mon
 > 2026-08-07). All five roadmap phases are delivered. Phase 5 is the last scheduled phase.
 >
 > **Billing milestone (post-roadmap, user-authorized 2026-08-07):** three passes — Pass 1 (Usage
-> Metering) complete, Passes 2–3 (Stripe integration, billing UI) planned. Decisions: Stripe
+> Metering) and Pass 2 (Stripe integration) complete, Pass 3 (billing UI) pending. Decisions: Stripe
 > test-mode first; storage metering event-driven + daily reconciliation; overage metered but not
-> yet invoiced; Team plans included in the catalog. See the "Billing milestone" note below.
+> yet invoiced; Team plans included in the catalog. See the "Billing milestone" notes below.
 >
 > **FEAT-019 (Semantic Layer Storage) landed in Phase 2's Wave 1**, as a solo pass (no parallel
 > dispatch) — see the "FEAT-019 — Semantic Layer Storage" note below for what shipped and what it
@@ -633,6 +633,49 @@ to bill against. No Stripe, no UI change in this pass. Verification: server `mak
 - **Testing gap (documented, not hidden):** the exact `ON CONFLICT` SQL is not DB-tested (no
   store-test infrastructure exists); the accumulate/replace contract is pinned by a SQL-mirroring
   fake in `metering_test.go` and documented in `usage.go`.
+
+### Billing milestone — Pass 2: Stripe Integration (user-authorized 2026-08-07) — COMPLETE
+
+The second billing pass: server-side Stripe wiring. Stripe **test-mode** — products/prices created
+via API (Pro 29 USD/mo, Team 79 USD/mo recurring), keys + webhook secret in the gitignored
+`server/.env` (never committed). Overage is metered (Pass 1) but NOT invoiced this pass. Verification:
+server `make vet` + `make test` (full suite, incl. new `internal/billing` + billing tests) +
+`gofmt -l` + `make build` clean; migration 00010 applied (DB at v10).
+
+- **`internal/billing/` (new, 11 tests)** — Stripe SDK wrapper (`stripe-go/v86` v86.2.0, latest
+  stable): plan↔price mapping, per-instance key (never mutates the global `stripe.Key`), webhook
+  signature verification + typed event parsing, checkout param/snapshot builders.
+- **`api/billing.go` (21 tests)** — `POST /v1/billing/checkout` (plan → Checkout Session, returns
+  session id + URL; 400 validation / 500 `billing_not_configured` / 502 provider error),
+  `GET /v1/billing/subscription` (plan + Stripe subscription status/period end), and the PUBLIC
+  `POST /v1/billing/webhook` (signature-verified with `STRIPE_WEBHOOK_SECRET`; 400
+  `invalid_signature` without one). Events: `checkout.session.completed` (price/metadata → tier,
+  sets user tier immediately — Stripe handles proration), `customer.subscription.deleted` (revert
+  to Free — covers end-of-period cancellation AND final failed payment), `invoice.payment_failed` /
+  `invoice.payment_succeeded` (record-only), `customer.subscription.updated` (keep stored state
+  fresh). Idempotent via `billing_events.event_id` PK (process-then-record, so a crash between
+  apply and record is safely retried).
+- **Downgrade enforcement (billing_access.go, 6 tests)** — monetization.md's "excess workspaces
+  become read-only": `ownerMutationAllowedByTier` (403 `workspace_read_only_downgraded`) gates
+  owner mutations when the tier's workspace ceiling is exceeded; the most recently updated
+  workspace stays writable (matches the list sort). Inserted into `requireWorkspaceMutationAccess`
+  in assembly; `users` (UserTierLookup) threaded through the 16 mutation call sites +
+  Register(Confirmation/Dataset/Ingest/Semantic/Upload/EngineWake)Routes. Reads stay open; workspace
+  DELETION stays owner-only (the documented escape hatch); engine-wake swapped to the gated check
+  (waking spends metered engine-seconds).
+- **`users` billing columns + `billing_events` (migration 00010)** — Stripe customer/subscription
+  ids/status/period-end on `users` (empty-string-means-absent, partial unique index on
+  `stripe_customer_id`); `billing_events` (event_id PK = idempotency guard + durable record).
+  `UserRepository` gained `UpdateTier`/`SetStripeCustomer`/`SetStripeSubscription`/`GetBilling*`.
+- **Pass 3 web contract (documented):** checkout POST returns `{checkout:{session_id,url}}`;
+  subscription GET returns `{subscription:{plan, stripe_subscription_exists, status, period_end}}`;
+  success/cancel URLs are `{origin}/settings?upgrade=success|cancelled`.
+- **Doc tensions routed to product-shaper:** schema.md AuditLogEntry has no billing action type
+  (`billing_events` is the documented-in-code alternative; decision needed on whether billing should
+  surface in the FEAT-042 log, which is workspace-scoped while billing is account-scoped); schema.md
+  User doesn't model Stripe ids (migration adds them; `domain.User` deliberately unchanged);
+  monetization.md never says WHICH workspace stays writable after a downgrade (most-recently-updated
+  implemented, needs ratification).
 
 ### Screen 13 — Workspace Settings: Phase-1 shell (`d8f1bdf`, 2026-08-07)
 

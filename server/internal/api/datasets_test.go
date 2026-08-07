@@ -153,7 +153,7 @@ func newTestDatasetsRouter(
 	r := chi.NewRouter()
 	r.Route("/v1", func(r chi.Router) {
 		r.Use(authsession.RequireAuth(testAuthSecret))
-		RegisterDatasetRoutes(r, workspaces, newFakeMemberLookupStore(), datasets, columns, relationships, objects, auditWriter, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		RegisterDatasetRoutes(r, workspaces, newFakeMemberLookupStore(), newFakeUserTierLookup(), datasets, columns, relationships, objects, auditWriter, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	})
 	return r
 }

@@ -78,11 +78,13 @@ const uniqueCardinalityThreshold = relationships.UniqueCardinalityThreshold
 // members backs the FEAT-045 access check: the columns LIST is a read (requireWorkspaceAccess, so a
 // read-only member may view the confirmation surface), while the column/candidate-join PATCHes are
 // mutations (requireWorkspaceMutationAccess — a read-only member must not override types, PII flags,
-// exclusions, or join status).
+// exclusions, or join status). users backs the billing tier gate on those mutations (an over-limit
+// downgraded owner's excess workspaces are read-only — see billing_access.go).
 func RegisterConfirmationRoutes(
 	r chi.Router,
 	workspaces WorkspaceStore,
 	members MemberLookupStore,
+	users UserTierLookup,
 	datasets ConfirmationDatasetStore,
 	columns ConfirmationColumnStore,
 	joins ConfirmationCandidateJoinStore,
@@ -91,14 +93,14 @@ func RegisterConfirmationRoutes(
 	logger *slog.Logger,
 ) {
 	r.Get("/workspaces/{workspaceId}/columns", handleListWorkspaceColumns(workspaces, members, datasets, columns, logger))
-	r.Patch("/workspaces/{workspaceId}/columns/{columnId}", handleUpdateColumn(workspaces, members, columns, auditWriter, logger))
+	r.Patch("/workspaces/{workspaceId}/columns/{columnId}", handleUpdateColumn(workspaces, members, users, columns, auditWriter, logger))
 	// FEAT-010's exclusion toggle (screens/13's Column exclusion toggle component names this exact
 	// route as its data source). It reuses the SAME handler as the general column PATCH — the request
 	// body is identical ({ "excluded_from_model": true }) and the handler applies only the fields the
 	// request actually carries — so one code path serves both the review-screen override and the
 	// settings-tab toggle instead of drifting into two behaviors.
-	r.Patch("/workspaces/{workspaceId}/columns/{columnId}/exclusion", handleUpdateColumn(workspaces, members, columns, auditWriter, logger))
-	r.Patch("/workspaces/{workspaceId}/candidate-joins/{joinId}", handleUpdateCandidateJoin(workspaces, members, columns, datasets, joins, relationshipStore, logger))
+	r.Patch("/workspaces/{workspaceId}/columns/{columnId}/exclusion", handleUpdateColumn(workspaces, members, users, columns, auditWriter, logger))
+	r.Patch("/workspaces/{workspaceId}/candidate-joins/{joinId}", handleUpdateCandidateJoin(workspaces, members, users, columns, datasets, joins, relationshipStore, logger))
 }
 
 // publicRelationship is a confirmed relationship as returned when a candidate join is accepted.
@@ -250,7 +252,7 @@ type updateColumnRequest struct {
 // override, FEAT-007's PII-flag override, and FEAT-010's model-exclusion override, all landing on
 // the same column resource since screens/07 reviews the first two as tabs/steps over the same
 // underlying rows and screens/13 manages the third.
-func handleUpdateColumn(workspaces WorkspaceStore, members MemberLookupStore, columns ConfirmationColumnStore, auditWriter ConfirmationAuditWriter, logger *slog.Logger) http.HandlerFunc {
+func handleUpdateColumn(workspaces WorkspaceStore, members MemberLookupStore, users UserTierLookup, columns ConfirmationColumnStore, auditWriter ConfirmationAuditWriter, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
@@ -258,7 +260,7 @@ func handleUpdateColumn(workspaces WorkspaceStore, members MemberLookupStore, co
 		}
 
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceMutationAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
+		if _, ok := requireWorkspaceMutationAccess(w, r, workspaces, members, users, claims.UserID, workspaceID); !ok {
 			return
 		}
 
@@ -417,6 +419,7 @@ type updateCandidateJoinRequest struct {
 func handleUpdateCandidateJoin(
 	workspaces WorkspaceStore,
 	members MemberLookupStore,
+	users UserTierLookup,
 	columns ConfirmationColumnStore,
 	datasets ConfirmationDatasetStore,
 	joins ConfirmationCandidateJoinStore,
@@ -430,7 +433,7 @@ func handleUpdateCandidateJoin(
 		}
 
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceMutationAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
+		if _, ok := requireWorkspaceMutationAccess(w, r, workspaces, members, users, claims.UserID, workspaceID); !ok {
 			return
 		}
 

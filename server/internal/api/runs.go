@@ -94,12 +94,12 @@ type RunExecutor interface {
 func RegisterRunRoutes(r chi.Router, workspaces WorkspaceStore, members MemberLookupStore, runs RunStore, steps RunStepStore, reports ReportStore, users UserTierLookup, corrections SemanticCorrectionStore, executor RunExecutor, hub *events.Hub, logger *slog.Logger) {
 	r.Post("/workspaces/{workspaceId}/runs", handleCreateRun(workspaces, members, runs, reports, users, corrections, executor, logger))
 	r.Get("/workspaces/{workspaceId}/runs/{runId}", handleGetRun(workspaces, members, runs, steps, reports, logger))
-	r.Post("/workspaces/{workspaceId}/runs/{runId}/clarify", handleClarifyRun(workspaces, members, runs, steps, corrections, executor, logger))
+	r.Post("/workspaces/{workspaceId}/runs/{runId}/clarify", handleClarifyRun(workspaces, members, users, runs, steps, corrections, executor, logger))
 	if hub != nil {
 		r.Get("/workspaces/{workspaceId}/runs/{runId}/stream", handleStreamRun(workspaces, members, runs, hub, logger))
-		r.Post("/workspaces/{workspaceId}/runs/{runId}/resume", handleResumeRun(workspaces, members, runs, executor, logger))
-		r.Post("/workspaces/{workspaceId}/runs/{runId}/halt", handleHaltRun(workspaces, members, runs, executor, logger))
-		r.Post("/workspaces/{workspaceId}/runs/{runId}/amend", handleAmendRun(workspaces, members, runs, executor, logger))
+		r.Post("/workspaces/{workspaceId}/runs/{runId}/resume", handleResumeRun(workspaces, members, users, runs, executor, logger))
+		r.Post("/workspaces/{workspaceId}/runs/{runId}/halt", handleHaltRun(workspaces, members, users, runs, executor, logger))
+		r.Post("/workspaces/{workspaceId}/runs/{runId}/amend", handleAmendRun(workspaces, members, users, runs, executor, logger))
 	}
 }
 
@@ -150,7 +150,7 @@ func handleCreateRun(workspaces WorkspaceStore, members MemberLookupStore, runs 
 		}
 
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceMutationAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
+		if _, ok := requireWorkspaceMutationAccess(w, r, workspaces, members, users, claims.UserID, workspaceID); !ok {
 			return
 		}
 
@@ -516,7 +516,7 @@ func writeSSE(w io.Writer, flusher http.Flusher, ev events.Event) {
 // idempotency+skip guarantees make this safe: completed steps are replayed, the first non-completed
 // one is reclaimed, and a run already being executed concurrently is rejected with 409 rather than
 // double-driven. A truly completed run is also rejected — there is nothing honest to resume.
-func handleResumeRun(workspaces WorkspaceStore, members MemberLookupStore, runs RunStore, executor RunExecutor, logger *slog.Logger) http.HandlerFunc {
+func handleResumeRun(workspaces WorkspaceStore, members MemberLookupStore, users UserTierLookup, runs RunStore, executor RunExecutor, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
@@ -524,7 +524,7 @@ func handleResumeRun(workspaces WorkspaceStore, members MemberLookupStore, runs 
 		}
 
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceMutationAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
+		if _, ok := requireWorkspaceMutationAccess(w, r, workspaces, members, users, claims.UserID, workspaceID); !ok {
 			return
 		}
 
@@ -559,7 +559,7 @@ func handleResumeRun(workspaces WorkspaceStore, members MemberLookupStore, runs 
 // the current step's model/engine work) and marks the run halted so the viewer pivots to the
 // halted/editable state. A terminal run has nothing to halt; the endpoint still acknowledges the
 // request (idempotent), mirroring how resume treats a no-op resume.
-func handleHaltRun(workspaces WorkspaceStore, members MemberLookupStore, runs RunStore, executor RunExecutor, logger *slog.Logger) http.HandlerFunc {
+func handleHaltRun(workspaces WorkspaceStore, members MemberLookupStore, users UserTierLookup, runs RunStore, executor RunExecutor, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
@@ -567,7 +567,7 @@ func handleHaltRun(workspaces WorkspaceStore, members MemberLookupStore, runs Ru
 		}
 
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceMutationAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
+		if _, ok := requireWorkspaceMutationAccess(w, r, workspaces, members, users, claims.UserID, workspaceID); !ok {
 			return
 		}
 
@@ -601,7 +601,7 @@ type amendRunRequest struct {
 // for re-execution and resumes the run from that step forward — earlier completed steps are never
 // re-run (AC3). The request is validated for the fields the executor consumes; a blank step or a
 // blank input is a client bug, not a model request.
-func handleAmendRun(workspaces WorkspaceStore, members MemberLookupStore, runs RunStore, executor RunExecutor, logger *slog.Logger) http.HandlerFunc {
+func handleAmendRun(workspaces WorkspaceStore, members MemberLookupStore, users UserTierLookup, runs RunStore, executor RunExecutor, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
@@ -609,7 +609,7 @@ func handleAmendRun(workspaces WorkspaceStore, members MemberLookupStore, runs R
 		}
 
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceMutationAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
+		if _, ok := requireWorkspaceMutationAccess(w, r, workspaces, members, users, claims.UserID, workspaceID); !ok {
 			return
 		}
 
@@ -667,7 +667,7 @@ type clarifyRunRequest struct {
 // user halted manually has nothing to clarify, and answering it would be a fabricated resolution.
 // The executor re-verifies the same guards; the handler's checks are the HTTP-layer control that
 // turns a misdirected POST into a 409 rather than a silent no-op.
-func handleClarifyRun(workspaces WorkspaceStore, members MemberLookupStore, runs RunStore, steps RunStepStore, corrections SemanticCorrectionStore, executor RunExecutor, logger *slog.Logger) http.HandlerFunc {
+func handleClarifyRun(workspaces WorkspaceStore, members MemberLookupStore, users UserTierLookup, runs RunStore, steps RunStepStore, corrections SemanticCorrectionStore, executor RunExecutor, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
@@ -675,7 +675,7 @@ func handleClarifyRun(workspaces WorkspaceStore, members MemberLookupStore, runs
 		}
 
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceMutationAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
+		if _, ok := requireWorkspaceMutationAccess(w, r, workspaces, members, users, claims.UserID, workspaceID); !ok {
 			return
 		}
 

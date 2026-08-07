@@ -332,21 +332,26 @@ func requireWorkspaceAccess(w http.ResponseWriter, r *http.Request, workspaces W
 // every mutating request per architecture.md's Authentication & Authorization section ("a read-only
 // session cannot mutate the semantic layer or trigger new runs regardless of what the client sends").
 //
-// An owner passes. A read_only member gets 403 with code "read_only_member" — they ARE authenticated
-// and granted access, just not write access, and a distinct 403 (rather than the non-owner 404) lets
-// the client show the honest "You have read-only access to this workspace" treatment. A caller with
-// no membership gets the same 404 as a nonexistent workspace (non-enumeration).
+// An owner passes — but only when the tier gate (billing milestone, pass 2) also allows it: an owner
+// whose tier's workspace ceiling is below the number of workspaces they own may only mutate the most
+// recently updated workspace; excess workspaces are read-only until upgrade or deletion (see
+// ownerMutationAllowedByTier in billing_access.go). A read_only member gets 403 with code
+// "read_only_member" — they ARE authenticated and granted access, just not write access, and a
+// distinct 403 (rather than the non-owner 404) lets the client show the honest "You have read-only
+// access to this workspace" treatment. A caller with no membership gets the same 404 as a
+// nonexistent workspace (non-enumeration).
 //
-// Mutating handlers today call requireWorkspaceOwnership; the orchestrator swaps those calls to this
-// helper during assembly so the guard covers uploads, ingests, column/candidate-join overrides,
-// semantic-layer writes, run creation, exports, dataset deletion, and workspace deletion. The helper
-// itself is defined here, in this wave's owned file, so the swap is a one-line change per handler.
-func requireWorkspaceMutationAccess(w http.ResponseWriter, r *http.Request, workspaces WorkspaceStore, members MemberLookupStore, userID, workspaceID string) (domain.Workspace, bool) {
+// tierLookup is the authoritative UserTierLookup (the same instance the routes already receive); it
+// may be nil in minimal test servers, in which case the ownership check is the whole gate.
+func requireWorkspaceMutationAccess(w http.ResponseWriter, r *http.Request, workspaces WorkspaceStore, members MemberLookupStore, tierLookup UserTierLookup, userID, workspaceID string) (domain.Workspace, bool) {
 	ws, role, ok := requireWorkspaceAccess(w, r, workspaces, members, userID, workspaceID)
 	if !ok {
 		return domain.Workspace{}, false
 	}
 	if role == domain.RoleOwner {
+		if !ownerMutationAllowedByTier(w, r, workspaces, tierLookup, ws, userID) {
+			return domain.Workspace{}, false
+		}
 		return ws, true
 	}
 	respondJSON(w, http.StatusForbidden, map[string]string{

@@ -191,6 +191,15 @@ type Dependencies struct {
 	// Deliberately separate from Notifications so a read/acknowledge-only store can never be
 	// confused with the event-source write.
 	ExportNotifications NotificationCreator
+
+	// Billing (billing milestone, pass 2 — Stripe integration). BillingUsers is the ONLY seam
+	// allowed to change users.tier (satisfied by postgres.UserRepository); BillingEvents records
+	// Stripe webhook events durably and dedupes by event id (satisfied by
+	// postgres.BillingEventRepository); BillingClient wraps the Stripe SDK (satisfied by
+	// *billing.Client).
+	BillingUsers  BillingUserStore
+	BillingEvents BillingEventStore
+	BillingClient StripeClient
 }
 
 // Server wires configuration and dependencies into an http.Handler.
@@ -259,6 +268,15 @@ func (s *Server) routes() {
 			RegisterPublicShareRoutes(r, s.deps.Reports, s.deps.ShareLookup, s.deps.Provenance, s.deps.RunSteps, s.logger)
 		}
 
+		// Billing milestone, pass 2: Stripe's UNAUTHENTICATED webhook delivery. Stripe has no
+		// Auth.js session cookie — the endpoint self-authenticates by verifying the Stripe-Signature
+		// header with STRIPE_WEBHOOK_SECRET (RegisterStripeWebhookRoute's handler rejects
+		// unsigned/invalid signatures with 400). Registered on the public /v1 group for that reason.
+		if s.deps.BillingUsers != nil && s.deps.BillingEvents != nil && s.deps.BillingClient != nil {
+			RegisterStripeWebhookRoute(r, s.deps.BillingUsers, s.deps.BillingEvents, s.deps.BillingClient,
+				s.cfg.StripeWebhookSecret, s.cfg.StripePricePro, s.cfg.StripePriceTeam, s.logger)
+		}
+
 		// Everything below requires an authenticated session — see internal/authsession's package
 		// doc for why this middleware, not web/src/proxy.ts's redirect, is the actual authorization
 		// boundary. Guarded on deps.Workspaces being wired so a test server built with a zero-value
@@ -272,7 +290,7 @@ func (s *Server) routes() {
 
 				// FEAT-003: file upload.
 				if s.deps.Datasets != nil && s.deps.Objects != nil {
-					RegisterUploadRoutes(r, s.deps.Workspaces, s.deps.MemberLookup, s.deps.Datasets, s.deps.Objects, s.cfg.MaxUploadBytes, s.logger)
+					RegisterUploadRoutes(r, s.deps.Workspaces, s.deps.MemberLookup, s.deps.Users, s.deps.Datasets, s.deps.Objects, s.cfg.MaxUploadBytes, s.logger)
 				}
 
 				// FEAT-049: pre-upload duplicate-filename check. screens/05-file-upload.md.
@@ -283,7 +301,7 @@ func (s *Server) routes() {
 				// FEAT-048: single-dataset deletion. screens/04-workspace-home.md's Datasets panel.
 				if s.deps.DatasetsList != nil && s.deps.DatasetColumns != nil &&
 					s.deps.DatasetRelationships != nil && s.deps.DatasetObjects != nil && s.deps.DatasetDeletionAudit != nil {
-					RegisterDatasetRoutes(r, s.deps.Workspaces, s.deps.MemberLookup, s.deps.DatasetsList, s.deps.DatasetColumns,
+					RegisterDatasetRoutes(r, s.deps.Workspaces, s.deps.MemberLookup, s.deps.Users, s.deps.DatasetsList, s.deps.DatasetColumns,
 						s.deps.DatasetRelationships, s.deps.DatasetObjects, s.deps.DatasetDeletionAudit, s.deps.DatasetStorageReconciler, s.logger)
 				}
 
@@ -294,7 +312,7 @@ func (s *Server) routes() {
 
 				// FEAT-004: session-scoped engine provisioning and ingest.
 				if s.deps.IngestDatasets != nil && s.deps.IngestPipeline != nil && s.deps.IngestTracker != nil {
-					RegisterIngestRoutes(r, s.deps.Workspaces, s.deps.MemberLookup, s.deps.IngestDatasets, s.deps.IngestPipeline, s.deps.IngestTracker, s.logger)
+					RegisterIngestRoutes(r, s.deps.Workspaces, s.deps.MemberLookup, s.deps.Users, s.deps.IngestDatasets, s.deps.IngestPipeline, s.deps.IngestTracker, s.logger)
 				}
 
 				// FEAT-005 / FEAT-008: profiling statistics and inferred candidate joins.
@@ -307,7 +325,7 @@ func (s *Server) routes() {
 				if s.deps.ConfirmationDatasets != nil && s.deps.ConfirmationColumns != nil &&
 					s.deps.ConfirmationCandidateJoins != nil && s.deps.Relationships != nil &&
 					s.deps.ConfirmationAudit != nil {
-					RegisterConfirmationRoutes(r, s.deps.Workspaces, s.deps.MemberLookup, s.deps.ConfirmationDatasets,
+					RegisterConfirmationRoutes(r, s.deps.Workspaces, s.deps.MemberLookup, s.deps.Users, s.deps.ConfirmationDatasets,
 						s.deps.ConfirmationColumns, s.deps.ConfirmationCandidateJoins, s.deps.Relationships,
 						s.deps.ConfirmationAudit, s.logger)
 				}
@@ -322,7 +340,7 @@ func (s *Server) routes() {
 				// screens/15-semantic-layer.md, screens/04-workspace-home.md.
 				if s.deps.SemanticRelationships != nil && s.deps.SemanticMetrics != nil &&
 					s.deps.SemanticCorrections != nil && s.deps.SemanticSummary != nil {
-					RegisterSemanticRoutes(r, s.deps.Workspaces, s.deps.MemberLookup, s.deps.SemanticRelationships,
+					RegisterSemanticRoutes(r, s.deps.Workspaces, s.deps.MemberLookup, s.deps.Users, s.deps.SemanticRelationships,
 						s.deps.SemanticMetrics, s.deps.SemanticCorrections, s.deps.SemanticSummary, s.logger)
 				}
 
@@ -370,7 +388,7 @@ func (s *Server) routes() {
 
 				// FEAT-012: wake-on-intent — POST /v1/workspaces/:id/engine/wake. screens/04.
 				if s.deps.EngineWake != nil {
-					RegisterEngineWakeRoute(r, s.deps.Workspaces, s.deps.EngineWake, s.logger)
+					RegisterEngineWakeRoute(r, s.deps.Workspaces, s.deps.MemberLookup, s.deps.Users, s.deps.EngineWake, s.logger)
 				}
 
 				// FEAT-026: durable notifications. screens/16-notifications.md. users enforces the
@@ -386,6 +404,14 @@ func (s *Server) routes() {
 					RegisterWorkspaceDeleteRoute(r, s.deps.Workspaces, s.deps.WorkspaceCascadeObjects,
 						s.deps.WorkspaceEngineDropper, s.deps.WorkspaceDeletionCascade,
 						s.deps.WorkspaceDeletionProofs, s.deps.WorkspaceDeletionAudit, s.logger)
+				}
+
+				// Billing milestone, pass 2: authenticated billing endpoints — Checkout Session
+				// creation and the subscription/plan read. The webhook lives on the public group
+				// above; these need the session. AllowedOrigin builds the Stripe success/cancel URLs.
+				if s.deps.BillingUsers != nil && s.deps.BillingClient != nil {
+					RegisterBillingRoutes(r, s.deps.BillingUsers, s.deps.BillingClient,
+						s.cfg.StripePricePro, s.cfg.StripePriceTeam, s.cfg.AllowedOrigin, s.logger)
 				}
 			})
 		}

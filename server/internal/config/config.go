@@ -99,6 +99,16 @@ type Config struct {
 	// to boot in a development environment that has no key. cmd/api/main.go logs a warning when it
 	// is unset so the gap is visible, not silent.
 	AnthropicAPIKey string
+
+	// Stripe configuration (billing milestone, pass 2 — test-mode first). All four are optional in
+	// the same sense as AnthropicAPIKey: a service without them still boots and serves everything
+	// except billing, and the checkout/webhook endpoints fail honestly with
+	// `billing_not_configured` / `invalid_signature` rather than panicking. cmd/api/main.go logs a
+	// warning when the pair it needs is missing.
+	StripeSecretKey     string // authenticates Stripe API calls (test-mode first)
+	StripeWebhookSecret string // verifies Stripe-Signature on POST /v1/billing/webhook
+	StripePricePro      string // recurring monthly Price ID for Pro
+	StripePriceTeam     string // recurring monthly Price ID for Team
 }
 
 // StorageConfig describes the S3-compatible object store holding uploaded and normalized datasets.
@@ -166,6 +176,12 @@ func Load() (Config, error) {
 
 	// Optional by design — see the field's doc comment. Model calls (FEAT-013) are the only consumer.
 	cfg.AnthropicAPIKey = os.Getenv("ANTHROPIC_API_KEY")
+
+	// Optional by design — see the fields' doc comment. Consumed by the billing endpoints only.
+	cfg.StripeSecretKey = os.Getenv("STRIPE_SECRET_KEY")
+	cfg.StripeWebhookSecret = os.Getenv("STRIPE_WEBHOOK_SECRET")
+	cfg.StripePricePro = os.Getenv("STRIPE_PRICE_PRO")
+	cfg.StripePriceTeam = os.Getenv("STRIPE_PRICE_TEAM")
 
 	cfg.Storage = StorageConfig{
 		Endpoint:        os.Getenv("S3_ENDPOINT"),

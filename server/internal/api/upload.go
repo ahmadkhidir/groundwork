@@ -53,17 +53,18 @@ type DuplicateCheckStore interface {
 //
 // members backs the FEAT-045 access check: uploading is a mutation (requireWorkspaceMutationAccess —
 // a read-only member must not upload files per FEAT-045 AC2), while the duplicate-filename check is
-// a read (requireWorkspaceAccess).
+// a read (requireWorkspaceAccess). users backs the billing tier gate on the mutation.
 func RegisterUploadRoutes(
 	r chi.Router,
 	workspaces WorkspaceStore,
 	members MemberLookupStore,
+	users UserTierLookup,
 	datasets DatasetStore,
 	objects ObjectStore,
 	maxUploadBytes int64,
 	logger *slog.Logger,
 ) {
-	r.Post("/workspaces/{workspaceId}/files", handleUploadFiles(workspaces, members, datasets, objects, maxUploadBytes, logger))
+	r.Post("/workspaces/{workspaceId}/files", handleUploadFiles(workspaces, members, users, datasets, objects, maxUploadBytes, logger))
 }
 
 // RegisterDuplicateCheckRoute wires FEAT-049's GET /v1/workspaces/:id/files?filename= onto r.
@@ -177,6 +178,7 @@ func toPublicDataset(ds domain.Dataset) *publicDataset {
 func handleUploadFiles(
 	workspaces WorkspaceStore,
 	members MemberLookupStore,
+	users UserTierLookup,
 	datasets DatasetStore,
 	objects ObjectStore,
 	maxUploadBytes int64,
@@ -189,7 +191,7 @@ func handleUploadFiles(
 		}
 
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceMutationAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
+		if _, ok := requireWorkspaceMutationAccess(w, r, workspaces, members, users, claims.UserID, workspaceID); !ok {
 			return
 		}
 

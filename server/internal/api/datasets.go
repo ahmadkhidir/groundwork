@@ -82,6 +82,7 @@ func RegisterDatasetRoutes(
 	r chi.Router,
 	workspaces WorkspaceStore,
 	members MemberLookupStore,
+	users UserTierLookup,
 	datasets DatasetsStore,
 	columns DatasetColumnsStore,
 	relationships DatasetRelationshipsStore,
@@ -94,7 +95,7 @@ func RegisterDatasetRoutes(
 	r.Get("/workspaces/{workspaceId}/datasets/{datasetId}/deletion-impact",
 		handleDatasetDeletionImpact(workspaces, members, datasets, columns, relationships, logger))
 	r.Delete("/workspaces/{workspaceId}/datasets/{datasetId}",
-		handleDeleteDataset(workspaces, members, datasets, objects, auditWriter, reconciler, logger))
+		handleDeleteDataset(workspaces, members, users, datasets, objects, auditWriter, reconciler, logger))
 }
 
 // publicDatasetSummary is one row of screens/04-workspace-home.md's Datasets panel.
@@ -268,6 +269,7 @@ func handleDatasetDeletionImpact(
 func handleDeleteDataset(
 	workspaces WorkspaceStore,
 	members MemberLookupStore,
+	users UserTierLookup,
 	datasets DatasetsStore,
 	objects DatasetObjectDeleter,
 	auditWriter DatasetDeletionAuditWriter,
@@ -280,7 +282,7 @@ func handleDeleteDataset(
 			return
 		}
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceMutationAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
+		if _, ok := requireWorkspaceMutationAccess(w, r, workspaces, members, users, claims.UserID, workspaceID); !ok {
 			return
 		}
 

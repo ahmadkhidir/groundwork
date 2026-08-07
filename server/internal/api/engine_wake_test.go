@@ -57,7 +57,7 @@ func newTestWakeRouter(workspaces WorkspaceStore, provider EngineWakeProvider) h
 	r := chi.NewRouter()
 	r.Route("/v1", func(r chi.Router) {
 		r.Use(authsession.RequireAuth(testAuthSecret))
-		RegisterEngineWakeRoute(r, workspaces, provider, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		RegisterEngineWakeRoute(r, workspaces, newFakeMemberLookupStore(), newFakeUserTierLookup(), provider, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	})
 	return r
 }

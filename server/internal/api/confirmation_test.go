@@ -169,7 +169,7 @@ func newTestConfirmationRouterWithAudit(
 	r := chi.NewRouter()
 	r.Route("/v1", func(r chi.Router) {
 		r.Use(authsession.RequireAuth(testAuthSecret))
-		RegisterConfirmationRoutes(r, workspaces, newFakeMemberLookupStore(), datasets, columns, joins, relationshipStore, auditWriter,
+		RegisterConfirmationRoutes(r, workspaces, newFakeMemberLookupStore(), newFakeUserTierLookup(), datasets, columns, joins, relationshipStore, auditWriter,
 			slog.New(slog.NewTextHandler(io.Discard, nil)))
 	})
 	return r
