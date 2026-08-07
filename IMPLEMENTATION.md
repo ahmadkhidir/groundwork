@@ -301,7 +301,7 @@ loaded via `next/font` and bound to `--font-display`, `--font-body`, `--font-mon
     |---|---|---|
     | Upload size ceiling, per file | **500 MB** | Product owner, confirmed 2026-08-05. `features.md` FEAT-004 says only "a stated size ceiling" |
     | Engine idle teardown | ~10 min | `architecture.md` §107 |
-    | Reconciliation exclusion threshold | *pending* | FEAT-029, Phase 3 |
+    | Reconciliation exclusion threshold | `config.ReconcileExclusionShareThreshold` (0.31) in `server/internal/config/config.go`; enforced in `server/internal/run/reconcile.go` | FEAT-029, Phase 3 |
 
     The upload ceiling applies **per file, across all tiers** — `monetization.md` gates usage
     allotments (engine-seconds, storage, tokens), not per-file size. It is enforced **twice**:
@@ -357,7 +357,7 @@ loaded via `next/font` and bound to `--font-display`, `--font-body`, `--font-mon
 | **A — Foundation** | Scaffold, theme tokens, schema entities, auth, routing skeleton, docker-compose | **Complete** |
 | **1 — Foundation: Workspace, Ingest & Trust** | FEAT-001 ✅ 002 ✅ 003 ✅ 004 ✅ 005 ✅ 006 ✅ 007 ✅ 008 ✅ 009 ✅ 011 ✅ 042 ✅ 044 ✅ 048 ✅ 049 ✅ | **Complete** — reopened for FEAT-048/049 by docs `ff8d5b2` (2026-08-06) and closed by this wave; see below |
 | **2 — Core Grounded Answer Loop** | FEAT-013 ✅, 014 ✅, 015 ✅, 016 ✅, 017 ✅, 018 ✅, 019 ✅, 020 ✅ | **Complete** — Waves 1–5 landed (FEAT-020 in Wave 5) |
-| **3 — Trust & Observability** | FEAT-022 ✅ 023 ✅ 024 ✅ 027 ✅ 028 ✅ — 029, 030 remaining | **In progress** — Pass 1 (FEAT-022/023/027) landed in `01d7c34`+`2c2e08a`, Pass 2 (FEAT-024/028) landed in `f408a40`; Pass 3 (FEAT-029/030) next |
+| **3 — Trust & Observability** | FEAT-022 ✅ 023 ✅ 024 ✅ 027 ✅ 028 ✅ 029 ✅ 030 ✅ | **Complete** — Pass 1 (FEAT-022/023/027) in `01d7c34`+`2c2e08a`, Pass 2 (FEAT-024/028) in `f408a40`, Pass 3 (FEAT-029/030) in `6611de2` |
 | **4 — Reports & Delivery** | FEAT-034, 035, 036, 041, 043 | Not started |
 | **5 — Polish & Expansion** | FEAT-010, 012, 021, 025, 026, 031, 032, 033, 037, 038, 039, 040, 045, 046, 047 | Not started |
 
@@ -425,6 +425,40 @@ loaded via `next/font` and bound to `--font-display`, `--font-body`, `--font-mon
 >   `parent/source_run_id` (or explicit semantic-layer-entry FK) would reconcile the two.
 > - FEAT-020 AC1's "same edit twice → corrected by default on the third occurrence" is only served at
 >   capture + grounding-occlusion today; the re-apply engine beyond that is intentionally not built.
+
+### Phase 3 — Trust & Observability (FEAT-022/023/024/027/028/029/030), user-authorized 2026-08-07 — CLOSED
+
+Three sequential passes landed the full authorized Phase 3 scope; each ended with a green suite:
+
+- **Pass 1 (`01d7c34` + `2c2e08a`)** — FEAT-022 resumable DAG executor (per-run cancellable
+  runcontexts, durable step rows, `resume` on restart), FEAT-023 live SSE stream (`/runs/:id/events`),
+  FEAT-027 determinism cache (replay-safe results, invalidated on data change).
+- **Pass 2 (`f408a40`)** — FEAT-024 run halt/amend + FEAT-028 static SQL analysis
+  (`internal/run/static_check.go`: join-fanout, cartesian join, hardcoded date window, null-dropping
+  filters; advisories in the Run Viewer, never blocking).
+- **Pass 3 (`6611de2`)** — FEAT-029 post-execution reconciliation + FEAT-030 claim-level provenance.
+  `internal/run/reconcile.go` computes unprompted exclusion warnings from measured rows_in/rows_out
+  (share ≥ `ReconcileExclusionShareThreshold` 0.31, never for group/aggregate queries, plus
+  null-drop promotion from the static analysis) and binds the model's `narrative claims` to actual
+  executed cells — a claim persists only if its column exists in the result AND its values reached
+  the model (PII/excluded columns are ineligible) AND its row index is in range; `StatedValue` is
+  the REAL cell value, not the model's restated figure. Links persist via
+  `store/postgres/provenance.go` + migration `00009` (adds `source_column`); the report read endpoint
+  expands `provenance_links` from ids to claim objects, and the new
+  `GET /workspaces/:id/reports/:reportId/provenance/:claimId` endpoint reconstructs the backing rows
+  from the persisted execute step (honest `available=false` when gone). Web: the Report View
+  narrative renders every traceable figure as a Provenance-Linked Number (`ProvenanceLinkedClaim.tsx`),
+  and clicking opens the Provenance Panel drawer (`ProvenancePanel.tsx`, screens/10, `?claim=` URL
+  state): stated figure, read-only source SQL, and the highlighted backing cell
+  (`bg-provenance-light`), with distinct loading/error/source-unavailable states.
+  Pass 3 was implemented directly by the orchestrator: the scheduled subagent dispatch returned empty
+  results three times in this session, so the fallback in the plan ("implement as orchestrator when a
+  slice fails to dispatch") applied.
+  Verification: server `go vet` + fresh `go test ./...` + `gofmt -l` clean; web `tsc --noEmit` +
+  `eslint . --max-warnings=0` + `vitest run` 187/187 green.
+
+Docs pointer: bumped to `3c6af5b` in `6611de2` (already pushed to origin/main before the parent
+referenced it, per the submodule protocol).
 
 ### Phase 1 reopened for FEAT-048 / FEAT-049 (docs `ff8d5b2`, user-approved 2026-08-06) — CLOSED
 
