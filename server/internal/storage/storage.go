@@ -175,3 +175,35 @@ func (c *Client) DeleteObjectsByPrefix(ctx context.Context, prefix string) error
 func NormalizedDatasetKey(workspaceID, datasetID string) string {
 	return fmt.Sprintf("workspaces/%s/datasets/%s/normalized/data.parquet", workspaceID, datasetID)
 }
+
+// SumBytesByPrefix returns the total size in bytes of every object whose key starts with prefix —
+// the read side of the metering storage snapshot (usage_records.storage_bytes): the reconciliation
+// sums a workspace's objects under its key prefix, per schema.md's "as of period_end" snapshot.
+//
+// Listing is paginated (ListObjectsV2) so a large workspace does not require one request per file,
+// mirroring DeleteObjectsByPrefix. A prefix with no objects is not an error: it returns 0, nil, so
+// an empty workspace reconciles to an honest zero snapshot.
+func (c *Client) SumBytesByPrefix(ctx context.Context, prefix string) (int64, error) {
+	var total int64
+	var continuationToken *string
+	for {
+		listOut, err := c.s3.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(c.bucket),
+			Prefix:            aws.String(prefix),
+			ContinuationToken: continuationToken,
+		})
+		if err != nil {
+			return 0, fmt.Errorf("storage: listing objects under %q: %w", prefix, err)
+		}
+		for _, obj := range listOut.Contents {
+			if obj.Size != nil {
+				total += *obj.Size
+			}
+		}
+		if !aws.ToBool(listOut.IsTruncated) || listOut.NextContinuationToken == nil {
+			break
+		}
+		continuationToken = listOut.NextContinuationToken
+	}
+	return total, nil
+}

@@ -17,6 +17,8 @@ import (
 	// IMPLEMENTATION.md §2/§8 for the build requirements this brings (CGO_ENABLED=1, a C compiler,
 	// and on Windows the dynamic-link build tag the Makefile applies).
 	_ "github.com/duckdb/duckdb-go/v2"
+
+	"github.com/ahmadkhidir/groundwork/server/internal/metering"
 )
 
 // provisioningDeadline bounds how long Acquire waits for another caller in the same workspace to
@@ -184,6 +186,25 @@ func WithStatusChangeHook(fn StatusChangeFunc) Option {
 	}
 }
 
+// UsageHookFunc is notified with the metered engine-seconds for a workspace each time a leased
+// engine is released (the lease duration from AcquiredAt to Release).
+//
+// Best-effort contract, exactly like StatusChangeFunc: a slow or failing hook must never fail the
+// engine lifecycle. Metering is accounting — unlike the audit/egress log (evidence), a missed usage
+// write degrades billing accuracy, never trust — so the hook is invoked after the release has
+// succeeded and its error is logged and swallowed.
+type UsageHookFunc func(workspaceID string, seconds float64) error
+
+// WithUsageHook registers fn to receive engine-seconds metering on every successful Release.
+//
+// Additive Option, same convention as WithStatusChangeHook: NewLocalProvider's existing positional
+// parameters and every existing call site compile unchanged.
+func WithUsageHook(fn UsageHookFunc) Option {
+	return func(p *LocalProvider) {
+		p.onUsage = fn
+	}
+}
+
 // LocalProvider is a Provider backed by one in-process DuckDB connection per workspace.
 //
 // Safe for concurrent use across many workspaces: the top-level map is guarded by its own mutex, and
@@ -197,6 +218,8 @@ type LocalProvider struct {
 	// onStatusChange is nil unless WithStatusChangeHook was supplied; notifyStatus below is a no-op
 	// in that case.
 	onStatusChange StatusChangeFunc
+	// onUsage is nil unless WithUsageHook was supplied; Release skips metering in that case.
+	onUsage UsageHookFunc
 }
 
 // NewLocalProvider constructs a LocalProvider. idleTimeout is config.Config.EngineIdleTimeout —
@@ -287,12 +310,31 @@ func (p *LocalProvider) Release(handle Handle) error {
 		return fmt.Errorf("engine: handle was not acquired from LocalProvider")
 	}
 
+	// Capture the lease duration before the semaphore is returned: once the slot is free a
+	// concurrent Acquire may overwrite session.acquiredAt, and metering must measure the lease
+	// being released, not whatever lease comes next.
+	acquiredAt := h.AcquiredAt()
+	releasedAt := time.Now()
+
 	h.session.armIdleTimer(p.idleTimeout, p.logger)
 
 	select {
 	case <-h.session.sem:
 	default:
 		return fmt.Errorf("engine: handle for workspace %s was already released", h.session.workspaceID)
+	}
+
+	// Metering event source: engine-seconds = lease duration (AcquiredAt → now). Best-effort by
+	// design — a metering failure must never fail an engine release (metering is accounting, not
+	// evidence; the fail-closed contract belongs to the audit/egress log). Log-and-swallow.
+	if p.onUsage != nil {
+		seconds := metering.EngineSeconds(acquiredAt, releasedAt)
+		if err := p.onUsage(h.session.workspaceID, seconds); err != nil {
+			p.logger.Error("engine: recording engine-seconds usage",
+				slog.String("workspace_id", h.session.workspaceID),
+				slog.Float64("seconds", seconds),
+				slog.String("error", err.Error()))
+		}
 	}
 	return nil
 }

@@ -121,6 +121,10 @@ type Pipeline struct {
 	// so the notification can be addressed to the right account.
 	notifications   NotificationCreator
 	workspaceOwners WorkspaceOwnerLookup
+
+	// storageReconciler, when set, refreshes the workspace's storage_bytes metering snapshot after
+	// a successful ingest (best-effort — see WithStorageReconciler).
+	storageReconciler StorageReconciler
 }
 
 // NotificationCreator is the narrow FEAT-026 event-source seam the pipeline uses to record an
@@ -136,6 +140,21 @@ type NotificationCreator interface {
 // owner.
 type WorkspaceOwnerLookup interface {
 	GetByID(ctx context.Context, id string) (domain.Workspace, error)
+}
+
+// StorageReconciler is the narrow metering seam the pipeline calls after a successful ingest so the
+// workspace's storage_bytes snapshot reflects the newly stored dataset (the original upload and the
+// normalized Parquet). Best-effort by contract: a metering failure must never fail an ingest — the
+// persisted dataset + Parquet are the primary record, and a missed snapshot is corrected by the
+// next event or the daily reconciliation.
+type StorageReconciler interface {
+	Reconcile(ctx context.Context, workspaceID string) error
+}
+
+// WithStorageReconciler wires the metering storage snapshot into a Pipeline. Optional: without it
+// (nil), a successful ingest completes exactly as before, unmetered.
+func WithStorageReconciler(reconciler StorageReconciler) func(*Pipeline) {
+	return func(p *Pipeline) { p.storageReconciler = reconciler }
 }
 
 // WithNotifications wires FEAT-026's ingest-failure notifications into a Pipeline. Optional:
@@ -377,6 +396,17 @@ func (p *Pipeline) inferRelationshipsAndComplete(ctx context.Context, handle eng
 
 	if err := p.datasets.CompleteIngest(ctx, ds.ID); err != nil {
 		return errors.New("ingest finished but could not be recorded. Try again.")
+	}
+
+	// Metering event source: storage_bytes snapshot refresh after a successful ingest (the
+	// workspace now holds this dataset's objects). Best-effort by design — metering is accounting,
+	// and a missed snapshot is corrected by the next event or the daily reconciliation.
+	if p.storageReconciler != nil {
+		if rerr := p.storageReconciler.Reconcile(ctx, ds.WorkspaceID); rerr != nil {
+			p.logger.Error("ingest: reconciling storage usage",
+				slog.String("workspace_id", ds.WorkspaceID),
+				slog.String("error", rerr.Error()))
+		}
 	}
 	return nil
 }

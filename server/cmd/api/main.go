@@ -21,6 +21,7 @@ import (
 	"github.com/ahmadkhidir/groundwork/server/internal/engine"
 	"github.com/ahmadkhidir/groundwork/server/internal/events"
 	"github.com/ahmadkhidir/groundwork/server/internal/ingest"
+	"github.com/ahmadkhidir/groundwork/server/internal/metering"
 	"github.com/ahmadkhidir/groundwork/server/internal/model"
 	runpkg "github.com/ahmadkhidir/groundwork/server/internal/run"
 	"github.com/ahmadkhidir/groundwork/server/internal/storage"
@@ -81,13 +82,28 @@ func run(logger *slog.Logger) error {
 	// Machine (see engine/local_provider.go's doc comment).
 	workspaceRepo := postgres.NewWorkspaceRepository(pool)
 
+	// Billing milestone, pass 1 (usage metering). usageWriter is the single write path into
+	// usage_records (accumulate for engine-seconds/tokens, replace for storage_bytes); the storage
+	// reconciler recomputes a workspace's storage snapshot from object storage. Both are consumed by
+	// the engine hook, the ingest pipeline, the model client, and the dataset-delete handler below.
+	usageRepo := postgres.NewUsageRepository(pool)
+	usageWriter := metering.NewUsageWriter(usageRepo)
+	storageReconciler := metering.NewStorageReconciler(objectStore, usageWriter)
+
 	// The status-change hook persists sleeping/waking/ready to workspaces.engine_status as the
 	// lifecycle actually transitions (FEAT-011). Screens listing many workspaces can then read the
 	// stored value instead of asking the Provider per row — which matters because engine.Provider's
 	// contract forbids Status from provoking a wake: merely looking at a workspace must never bill
 	// engine-seconds.
+	//
+	// The usage hook meters engine-seconds on every Release (best-effort — see engine.UsageHookFunc).
 	engineProvider := engine.NewLocalProvider(cfg.EngineIdleTimeout, logger,
-		engine.WithStatusChangeHook(workspaceRepo.EngineStatusHook(logger)))
+		engine.WithStatusChangeHook(workspaceRepo.EngineStatusHook(logger)),
+		engine.WithUsageHook(func(workspaceID string, seconds float64) error {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			return usageWriter.Record(ctx, workspaceID, seconds, 0)
+		}))
 
 	datasetRepo := postgres.NewDatasetRepository(pool)
 	columnRepo := postgres.NewColumnRepository(pool)
@@ -108,7 +124,10 @@ func run(logger *slog.Logger) error {
 	ingestPipeline := ingest.NewPipeline(
 		datasetRepo, objectStore, engineProvider, columnRepo, candidateJoinRepo, ingestTracker, logger,
 		// FEAT-026: write an `ingest_failed` durable notification when an upload fails (best-effort).
-		ingest.WithNotifications(notificationRepo, workspaceRepo))
+		ingest.WithNotifications(notificationRepo, workspaceRepo),
+		// Billing milestone, pass 1: refresh the workspace's storage_bytes snapshot after a
+		// successful ingest (best-effort).
+		ingest.WithStorageReconciler(storageReconciler))
 
 	// FEAT-013 (Phase 2). The run executor is the only consumer of the Anthropic key; the model
 	// client is constructible without it (Complete fails honestly per-call), so a keyless dev
@@ -125,13 +144,12 @@ func run(logger *slog.Logger) error {
 	// workspace is gone (screens/14's follow-up proof GET).
 	deletionRecordRepo := postgres.NewDeletionRecordRepository(pool)
 
-	// FEAT-045 (workspace_members), FEAT-046 (report_shares), FEAT-047 (usage_records), and
-	// FEAT-026 (notifications) — Phase 5. All four tables ship in migration 00001; these
-	// repositories are the read/write side of the new endpoints.
+	// FEAT-045 (workspace_members), FEAT-046 (report_shares), and FEAT-026 (notifications) — Phase 5.
+	// usageRepo was constructed above for the billing metering writer; FEAT-047's read endpoint uses
+	// the same repository.
 	memberRepo := postgres.NewMemberRepository(pool)
 	shareRepo := postgres.NewReportShareRepository(pool)
-	usageRepo := postgres.NewUsageRepository(pool)
-	modelClient := model.NewClient(cfg.AnthropicAPIKey, auditWriter, logger)
+	modelClient := model.NewClient(cfg.AnthropicAPIKey, auditWriter, logger).WithUsageRecorder(usageWriter)
 	if cfg.AnthropicAPIKey == "" {
 		logger.Warn("ANTHROPIC_API_KEY is not set — FEAT-013 runs will fail at the model step")
 	}
@@ -189,7 +207,9 @@ func run(logger *slog.Logger) error {
 		DatasetRelationships: relationshipRepo,
 		DatasetObjects:       objectStore,
 		DatasetDeletionAudit: auditWriter,
-		DuplicateCheck:       datasetRepo,
+		// Billing milestone, pass 1: refresh the workspace's storage snapshot after a dataset delete.
+		DatasetStorageReconciler: storageReconciler,
+		DuplicateCheck:           datasetRepo,
 
 		// FEAT-013: question → run lifecycle. Same repositories as the seams above, satisfying the
 		// further narrow interfaces runs.go declares (see Dependencies' doc comment).
@@ -250,12 +270,20 @@ func run(logger *slog.Logger) error {
 	// Buffered so a signal arriving before the receive is not dropped.
 	shutdownErr := make(chan error, 1)
 
+	// Billing milestone, pass 1: daily storage-bytes reconciliation — a background loop, not an
+	// endpoint. Metering is infrastructure and must not depend on a client noticing to call it.
+	// Runs once at startup, then on cfg.UsageReconcileInterval; cancelled on shutdown.
+	meteringCtx, cancelMetering := context.WithCancel(context.Background())
+	defer cancelMetering()
+	go runStorageReconciliation(meteringCtx, cfg, storageReconciler, workspaceRepo, logger)
+
 	go func() {
 		quit := make(chan os.Signal, 1)
 		signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 		<-quit
 
 		logger.Info("shutdown started")
+		cancelMetering()
 
 		// Graceful shutdown matters more here than in a typical CRUD service: an in-flight run is
 		// resumable only if its current step is persisted, so in-flight requests get time to reach
@@ -283,4 +311,43 @@ func run(logger *slog.Logger) error {
 
 	logger.Info("shutdown complete")
 	return nil
+}
+
+// runStorageReconciliation drives metering.ReconcileStorage for every workspace on the configured
+// interval until ctx is cancelled — the daily backstop that keeps usage_records' storage_bytes
+// snapshots truthful even when an event-driven snapshot was missed.
+//
+// Best-effort per workspace: a failing workspace (transient storage/DB error) is logged and
+// skipped; the sweep continues. Runs once immediately at startup so a fresh deployment does not
+// wait a full interval for its first snapshot.
+func runStorageReconciliation(ctx context.Context, cfg config.Config, reconciler metering.Reconciler, workspaces *postgres.WorkspaceRepository, logger *slog.Logger) {
+	reconcileAllWorkspaces(ctx, reconciler, workspaces, logger)
+	ticker := time.NewTicker(cfg.UsageReconcileInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			reconcileAllWorkspaces(ctx, reconciler, workspaces, logger)
+		}
+	}
+}
+
+// reconcileAllWorkspaces runs one reconciliation pass over every workspace, with a per-workspace
+// timeout so a hanging object-store listing for one workspace cannot stall the sweep.
+func reconcileAllWorkspaces(ctx context.Context, reconciler metering.Reconciler, workspaces *postgres.WorkspaceRepository, logger *slog.Logger) {
+	all, err := workspaces.ListAll(ctx)
+	if err != nil {
+		logger.Error("metering: listing workspaces for storage reconciliation", slog.String("error", err.Error()))
+		return
+	}
+	for _, ws := range all {
+		wctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		err := reconciler.Reconcile(wctx, ws.ID)
+		cancel()
+		if err != nil {
+			logger.Error("metering: reconciling storage usage", slog.String("workspace_id", ws.ID), slog.String("error", err.Error()))
+		}
+	}
 }

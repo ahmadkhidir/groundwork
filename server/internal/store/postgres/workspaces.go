@@ -88,6 +88,31 @@ func (r *WorkspaceRepository) CountByOwner(ctx context.Context, ownerID string) 
 	return count, nil
 }
 
+// ListAll returns every workspace in the system, for the metering reconciliation loop: the daily
+// storage snapshot sweep refreshes ALL workspaces' storage_bytes, not just recently-active ones, so
+// billing never depends on an event having been observed.
+func (r *WorkspaceRepository) ListAll(ctx context.Context) ([]domain.Workspace, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT id, name, owner_id, engine_status, created_at, updated_at FROM workspaces`)
+	if err != nil {
+		return nil, fmt.Errorf("listing all workspaces: %w", err)
+	}
+	defer rows.Close()
+
+	var out []domain.Workspace
+	for rows.Next() {
+		ws, err := scanWorkspace(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scanning workspace: %w", err)
+		}
+		out = append(out, ws)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating workspaces: %w", err)
+	}
+	return out, nil
+}
+
 // GetByID returns the workspace with id, or ErrWorkspaceNotFound.
 func (r *WorkspaceRepository) GetByID(ctx context.Context, id string) (domain.Workspace, error) {
 	row := r.pool.QueryRow(ctx,

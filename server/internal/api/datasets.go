@@ -59,6 +59,14 @@ type DatasetDeletionAuditWriter interface {
 	WriteDeletion(ctx context.Context, workspaceID, userID string) error
 }
 
+// DatasetStorageReconciler is the metering seam the dataset-delete handler calls after a successful
+// deletion so the workspace's storage_bytes snapshot reflects the removed objects. Best-effort by
+// contract — a metering failure must never fail the delete (the objects are already gone and the
+// row already deleted; the snapshot is corrected by the next event or the daily reconciliation).
+type DatasetStorageReconciler interface {
+	Reconcile(ctx context.Context, workspaceID string) error
+}
+
 // RegisterDatasetRoutes wires FEAT-048's endpoints onto r: listing a workspace's datasets (the
 // Datasets panel's data source), reading a dataset's deletion impact (what the Delete Confirmation
 // Modal discloses), and deleting a dataset.
@@ -67,6 +75,9 @@ type DatasetDeletionAuditWriter interface {
 // requireWorkspaceAccess (owner OR read-only member — a read-only member may view the datasets
 // panel and its impact disclosure), while the DELETE uses requireWorkspaceMutationAccess (only the
 // owner may delete).
+//
+// reconciler, when non-nil, refreshes the workspace's storage_bytes metering snapshot after a
+// successful delete (best-effort).
 func RegisterDatasetRoutes(
 	r chi.Router,
 	workspaces WorkspaceStore,
@@ -76,13 +87,14 @@ func RegisterDatasetRoutes(
 	relationships DatasetRelationshipsStore,
 	objects DatasetObjectDeleter,
 	auditWriter DatasetDeletionAuditWriter,
+	reconciler DatasetStorageReconciler,
 	logger *slog.Logger,
 ) {
 	r.Get("/workspaces/{workspaceId}/datasets", handleListDatasets(workspaces, members, datasets, logger))
 	r.Get("/workspaces/{workspaceId}/datasets/{datasetId}/deletion-impact",
 		handleDatasetDeletionImpact(workspaces, members, datasets, columns, relationships, logger))
 	r.Delete("/workspaces/{workspaceId}/datasets/{datasetId}",
-		handleDeleteDataset(workspaces, members, datasets, objects, auditWriter, logger))
+		handleDeleteDataset(workspaces, members, datasets, objects, auditWriter, reconciler, logger))
 }
 
 // publicDatasetSummary is one row of screens/04-workspace-home.md's Datasets panel.
@@ -259,6 +271,7 @@ func handleDeleteDataset(
 	datasets DatasetsStore,
 	objects DatasetObjectDeleter,
 	auditWriter DatasetDeletionAuditWriter,
+	reconciler DatasetStorageReconciler,
 	logger *slog.Logger,
 ) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -284,6 +297,17 @@ func handleDeleteDataset(
 				"code":  "internal_error",
 			})
 			return
+		}
+
+		// Metering event source: after a dataset delete, the workspace's storage snapshot is
+		// recomputed (objects were removed; storage_bytes is point-in-time). Best-effort — a
+		// metering failure is logged and the delete still succeeded.
+		if reconciler != nil {
+			if rerr := reconciler.Reconcile(r.Context(), workspaceID); rerr != nil {
+				logger.Error("deleting dataset: reconciling storage usage",
+					slog.String("workspace_id", workspaceID),
+					slog.String("error", rerr.Error()))
+			}
 		}
 
 		respondJSON(w, http.StatusOK, map[string]string{"id": datasetID})

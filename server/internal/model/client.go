@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
@@ -31,6 +32,13 @@ type AuditWriter interface {
 	WriteModelCall(ctx context.Context, workspaceID, userID, payload string) error
 }
 
+// UsageRecorder is the metering seam Client calls after each successful model call, satisfied by
+// metering.UsageWriter (Record with engineSeconds 0). Deliberately narrow: the model package must
+// only ever report the tokens it consumed, never read usage.
+type UsageRecorder interface {
+	Record(ctx context.Context, workspaceID string, engineSeconds float64, modelTokens int64) error
+}
+
 // Client is the single outbound path to the Anthropic API.
 //
 // Client.Complete is the seam payload.go's package doc names as the type-level enforcement of
@@ -43,6 +51,8 @@ type Client struct {
 	audit     AuditWriter
 	logger    *slog.Logger
 	maxTokens int64
+	// usage is nil unless WithUsageRecorder was supplied; Complete skips metering in that case.
+	usage UsageRecorder
 }
 
 // NewClient constructs a Client for the given API key, writing egress entries through audit and
@@ -61,6 +71,17 @@ func NewClient(apiKey string, audit AuditWriter, logger *slog.Logger, opts ...op
 		logger:    logger,
 		maxTokens: DefaultMaxTokens,
 	}
+}
+
+// WithUsageRecorder wires the metering seam into c and returns c for chaining. Optional: a Client
+// without a recorder completes model calls as before, unmetered.
+//
+// A chainable setter rather than a constructor parameter because NewClient's variadic is the SDK's
+// own option.RequestOption — adding a second variadic would be ambiguous. The setter keeps every
+// existing call site and test compiling unchanged.
+func (c *Client) WithUsageRecorder(u UsageRecorder) *Client {
+	c.usage = u
+	return c
 }
 
 // Complete sends payload to the model under the framing instructions system and returns the model's
@@ -98,6 +119,23 @@ func (c *Client) Complete(ctx context.Context, workspaceID, userID, system strin
 	})
 	if err != nil {
 		return "", fmt.Errorf("model: completing: %w", err)
+	}
+
+	// Metering event source: model tokens (input + output) consumed by this call. Best-effort by
+	// design — a metering failure must NEVER fail a model call (metering is accounting, not the
+	// fail-closed egress evidence above; a model call that succeeded must succeed regardless). A
+	// background context with timeout (not the request ctx) maximizes the chance the write lands
+	// after the client has disconnected, mirroring EngineStatusHook's best-effort side-effect pattern.
+	if c.usage != nil {
+		tokens := msg.Usage.InputTokens + msg.Usage.OutputTokens
+		mctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := c.usage.Record(mctx, workspaceID, 0, tokens); err != nil {
+			c.logger.Error("model: recording token usage",
+				slog.String("workspace_id", workspaceID),
+				slog.Int64("tokens", tokens),
+				slog.String("error", err.Error()))
+		}
 	}
 
 	var text strings.Builder

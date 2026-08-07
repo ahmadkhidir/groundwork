@@ -49,6 +49,12 @@ const ReconcileExclusionShareThreshold = 0.31
 // so tearing down an idle engine is cheap to reverse and saves metered engine-seconds.
 const EngineIdleTimeoutDefault = 10 * time.Minute
 
+// UsageReconcileIntervalDefault is how often the background metering reconciliation recomputes
+// every workspace's storage_bytes snapshot. Daily: storage is the slowest-moving meter, and the
+// daily sweep is a backstop on top of the event-driven snapshots (ingest completion, dataset
+// deletion) — not the primary recording path.
+const UsageReconcileIntervalDefault = 24 * time.Hour
+
 // Config is the fully resolved service configuration.
 type Config struct {
 	// Port the HTTP server listens on.
@@ -66,6 +72,10 @@ type Config struct {
 
 	// EngineIdleTimeout is how long an engine may idle before teardown.
 	EngineIdleTimeout time.Duration
+
+	// UsageReconcileInterval is how often the background metering reconciliation refreshes every
+	// workspace's storage_bytes snapshot.
+	UsageReconcileInterval time.Duration
 
 	// Environment is "development", "staging", or "production". Controls error verbosity.
 	Environment string
@@ -113,12 +123,13 @@ func (c Config) IsProduction() bool {
 // that refuses to start.
 func Load() (Config, error) {
 	cfg := Config{
-		Port:              envOrDefault("PORT", "8080"),
-		DatabaseURL:       os.Getenv("DATABASE_URL"),
-		AllowedOrigin:     envOrDefault("ALLOWED_ORIGIN", "http://localhost:3000"),
-		MaxUploadBytes:    MaxUploadBytesDefault,
-		EngineIdleTimeout: EngineIdleTimeoutDefault,
-		Environment:       envOrDefault("ENVIRONMENT", "development"),
+		Port:                   envOrDefault("PORT", "8080"),
+		DatabaseURL:            os.Getenv("DATABASE_URL"),
+		AllowedOrigin:          envOrDefault("ALLOWED_ORIGIN", "http://localhost:3000"),
+		MaxUploadBytes:         MaxUploadBytesDefault,
+		EngineIdleTimeout:      EngineIdleTimeoutDefault,
+		UsageReconcileInterval: UsageReconcileIntervalDefault,
+		Environment:            envOrDefault("ENVIRONMENT", "development"),
 	}
 
 	if raw := os.Getenv("MAX_UPLOAD_BYTES"); raw != "" {
@@ -138,6 +149,17 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("parsing ENGINE_IDLE_TIMEOUT: %w", err)
 		}
 		cfg.EngineIdleTimeout = parsed
+	}
+
+	if raw := os.Getenv("USAGE_RECONCILE_INTERVAL"); raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("parsing USAGE_RECONCILE_INTERVAL: %w", err)
+		}
+		if parsed <= 0 {
+			return Config{}, errors.New("USAGE_RECONCILE_INTERVAL must be positive")
+		}
+		cfg.UsageReconcileInterval = parsed
 	}
 
 	cfg.AuthSecret = os.Getenv("AUTH_SECRET")

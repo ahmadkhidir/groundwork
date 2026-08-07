@@ -107,6 +107,10 @@ type Dependencies struct {
 	DatasetObjects       DatasetObjectDeleter
 	DatasetDeletionAudit DatasetDeletionAuditWriter
 	DuplicateCheck       DuplicateCheckStore
+	// DatasetStorageReconciler refreshes a workspace's storage_bytes metering snapshot after a
+	// dataset delete (billing milestone, pass 1 — best-effort). Satisfied by
+	// metering.NewStorageReconciler.
+	DatasetStorageReconciler DatasetStorageReconciler
 
 	// Runs, RunSteps, and RunExecutor back FEAT-013 (Natural-Language Question → SQL Generation) —
 	// screens/04-workspace-home.md's Ask panel and screens/08-run-viewer.md's live run. Runs is the
@@ -280,7 +284,7 @@ func (s *Server) routes() {
 				if s.deps.DatasetsList != nil && s.deps.DatasetColumns != nil &&
 					s.deps.DatasetRelationships != nil && s.deps.DatasetObjects != nil && s.deps.DatasetDeletionAudit != nil {
 					RegisterDatasetRoutes(r, s.deps.Workspaces, s.deps.MemberLookup, s.deps.DatasetsList, s.deps.DatasetColumns,
-						s.deps.DatasetRelationships, s.deps.DatasetObjects, s.deps.DatasetDeletionAudit, s.logger)
+						s.deps.DatasetRelationships, s.deps.DatasetObjects, s.deps.DatasetDeletionAudit, s.deps.DatasetStorageReconciler, s.logger)
 				}
 
 				// FEAT-042: visible model-egress / audit log.

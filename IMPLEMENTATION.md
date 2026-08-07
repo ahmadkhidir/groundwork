@@ -366,6 +366,11 @@ loaded via `next/font` and bound to `--font-display`, `--font-body`, `--font-mon
 > 3 user-authorized 2026-08-07; Phase 4 user-authorized 2026-08-07; Phase 5 user-authorized
 > 2026-08-07). All five roadmap phases are delivered. Phase 5 is the last scheduled phase.
 >
+> **Billing milestone (post-roadmap, user-authorized 2026-08-07):** three passes — Pass 1 (Usage
+> Metering) complete, Passes 2–3 (Stripe integration, billing UI) planned. Decisions: Stripe
+> test-mode first; storage metering event-driven + daily reconciliation; overage metered but not
+> yet invoiced; Team plans included in the catalog. See the "Billing milestone" note below.
+>
 > **FEAT-019 (Semantic Layer Storage) landed in Phase 2's Wave 1**, as a solo pass (no parallel
 > dispatch) — see the "FEAT-019 — Semantic Layer Storage" note below for what shipped and what it
 > deliberately left for FEAT-013/FEAT-020.
@@ -593,6 +598,41 @@ roadmap phase.
   exclusion-change action type (none invented); FEAT-040/035 "current theme" for file artifacts is
   served as canonical light mode (dark mode is a screen concern); the "Upgrade to Pro/Team" label
   isn't precise for a Team-only row.
+
+### Billing milestone — Pass 1: Usage Metering (user-authorized 2026-08-07) — COMPLETE
+
+The first of three billing passes: makes `usage_records` actually get written from the three real
+metering sources so FEAT-047's Usage view shows real numbers and the later Stripe passes have data
+to bill against. No Stripe, no UI change in this pass. Verification: server `make vet` + `make test`
+(full suite, incl. the new `internal/metering` package) + `gofmt -l` clean.
+
+- **`internal/metering/` (new)** — the metering seam: `UsageWriter` with the accumulate-vs-replace
+  split encoded at the type level (`Record` ACCUMULATES engine-seconds/model-tokens via `ON
+  CONFLICT ... DO UPDATE SET x = x + EXCLUDED.x`; `SetStorageBytes` REPLACES the point-in-time
+  storage snapshot), `PeriodFor` (UTC calendar month, half-open), `EngineSeconds` (lease duration),
+  `NewStorageReconciler`/`ReconcileStorage` (sums a workspace's objects, idempotent, empty →
+  honest zero). 22 tests.
+- **`postgres/usage.go`** — added `Upsert` (accumulate) + `SetStorageBytes` (replace) honoring the
+  `UNIQUE (workspace_id, period_start)` constraint; `ListByWorkspace` preserved.
+- **Event sources (wired in assembly):** engine-seconds at `engine.Provider.Release` via new
+  `WithUsageHook` (lease duration captured before the semaphore is returned); model tokens in
+  `model.Client.Complete` via `WithUsageRecorder` (`msg.Usage.InputTokens + OutputTokens`); storage
+  snapshots after ingest completion (`ingest.WithStorageReconciler`) and dataset delete
+  (`DatasetStorageReconciler` seam on the delete handler); daily background reconciliation loop in
+  `main.go` (`runStorageReconciliation`, once at startup then `cfg.UsageReconcileInterval`,
+  default 24h, cancelled on shutdown).
+- **Supporting additions:** `storage.Client.SumBytesByPrefix`, `WorkspaceRepository.ListAll`,
+  `config.UsageReconcileIntervalDefault` + `USAGE_RECONCILE_INTERVAL` env, `.env.example` entry.
+- **Metering writes are best-effort everywhere** (log-and-swallow, 5s background-timeout context):
+  a metering failure must never fail a model call, engine release, ingest, or delete — metering is
+  accounting, not the fail-closed egress evidence.
+- **Assumptions:** period = UTC calendar month; storage_bytes is point-in-time (replace semantics)
+  so events and the daily sweep self-correct; a never-uploaded workspace gains one honest 0-row per
+  month; no reconciliation-trigger endpoint (a client-triggerable object-store sweep is a DoS
+  surface with no product value).
+- **Testing gap (documented, not hidden):** the exact `ON CONFLICT` SQL is not DB-tested (no
+  store-test infrastructure exists); the accumulate/replace contract is pinned by a SQL-mirroring
+  fake in `metering_test.go` and documented in `usage.go`.
 
 ### Screen 13 — Workspace Settings: Phase-1 shell (`d8f1bdf`, 2026-08-07)
 
