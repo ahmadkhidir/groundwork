@@ -359,12 +359,12 @@ loaded via `next/font` and bound to `--font-display`, `--font-body`, `--font-mon
 | **2 — Core Grounded Answer Loop** | FEAT-013 ✅, 014 ✅, 015 ✅, 016 ✅, 017 ✅, 018 ✅, 019 ✅, 020 ✅ | **Complete** — Waves 1–5 landed (FEAT-020 in Wave 5) |
 | **3 — Trust & Observability** | FEAT-022 ✅ 023 ✅ 024 ✅ 027 ✅ 028 ✅ 029 ✅ 030 ✅ | **Complete** — Pass 1 (FEAT-022/023/027) in `01d7c34`+`2c2e08a`, Pass 2 (FEAT-024/028) in `f408a40`, Pass 3 (FEAT-029/030) in `6611de2` |
 | **4 — Reports & Delivery** | FEAT-034 ✅ 035 ✅ 036 ✅ 041 ✅ 043 ✅ | **Complete** — see "Phase 4" note below |
-| **5 — Polish & Expansion** | FEAT-010, 012, 021, 025, 026, 031, 032, 033, 037, 038, 039, 040, 045, 046, 047 | Not started |
+| **5 — Polish & Expansion** | FEAT-010 ✅ 012 ✅ 021 ✅ 025 ✅ 026 ✅ 031 ✅ 032 ✅ 033 ✅ 037 ✅ 038 ✅ 039 ✅ 040 ✅ 045 ✅ 046 ✅ 047 ✅ | **Complete** — see "Phase 5" note below |
 
-> **Current authorized scope: Foundation + Phases 1, 2, 3 and 4** (Phases 1–2 user-approved 2026-08-05,
+> **Current authorized scope: Foundation + Phases 1, 2, 3, 4 and 5** (Phases 1–2 user-approved 2026-08-05,
 > with the four phase-boundary assumptions recorded under "Phase 2 boundary assumptions" below; Phase
-> 3 user-authorized 2026-08-07; Phase 4 user-authorized 2026-08-07). Phase 5 is documented but not
-> authorized. Do not begin a later phase without explicit approval.
+> 3 user-authorized 2026-08-07; Phase 4 user-authorized 2026-08-07; Phase 5 user-authorized
+> 2026-08-07). All five roadmap phases are delivered. Phase 5 is the last scheduled phase.
 >
 > **FEAT-019 (Semantic Layer Storage) landed in Phase 2's Wave 1**, as a solo pass (no parallel
 > dispatch) — see the "FEAT-019 — Semantic Layer Storage" note below for what shipped and what it
@@ -521,6 +521,78 @@ the orchestrator. Server `make vet` + `make test` + `gofmt -l` clean; web `tsc -
 - **Doc tensions routed to product-shaper (not fixed):** none blocking. The `deletion` audit entry
   itself is destroyed with the workspace's log rows (its surviving proof is `deletion_records`), which
   screens/17's "audit log destroyed in the deletion cascade" documents.
+
+### Phase 5 — Polish & Expansion (FEAT-010/012/021/025/026/031/032/033/037/038/039/040/045/046/047), user-authorized 2026-08-07 — CLOSED
+
+Phase 5 shipped in one parallel dispatch of four Worker-Mode subagents, assembled and verified by the
+orchestrator. Server `make vet` + `make test` + `gofmt -l` clean; web `tsc --noEmit` +
+`eslint . --max-warnings=0` + `vitest run` 283/283 + `next build` all green. This is the final
+roadmap phase.
+
+- **FEAT-010 — Column-Level Exclusion.** `excluded_from_model` write path (PATCH column + the
+  `.../columns/:id/exclusion` route screens/13 names), workspace-wide Column Visibility tab (grouped
+  by dataset, optimistic toggle with rollback, metric-definition reference warning), and exclusion
+  surfaced in ingest review (`PIIReviewStep` pill) and the semantic layer (`RelationshipsTab` label).
+  The engine-queryable/model-invisible behavior was already enforced in `model.BuildPayload`.
+- **FEAT-012 — Wake-on-Intent.** `POST /v1/workspaces/:id/engine/wake` (Acquire→Release, honest 503,
+  idempotent) + the Ask panel fires it on input focus; unused-wake failures swallowed; pill kept in
+  sync via `engineStatus`/`onEngineStatusChange` props.
+- **FEAT-021 — Compositional Follow-Up.** Report View's "Ask a follow-up" is report-scoped: the run
+  creation request carries `parent_report_id`, validated non-enumerating + Pro/Team tier-gated, and
+  the materialized report records `parent_report_id` (resolved from the parent run). No engine
+  session needed (FEAT-021 AC3).
+- **FEAT-025 — Fork-on-Amendment.** Editing a run's SQL posts `parent_run_id` (new run, original
+  intact); GET run returns `forked_runs` via new `ListByParentRun`; Run Viewer shows "Forked from run
+  …" + a "Forked runs" branch list.
+- **FEAT-026 — Durable Notifications.** Notifications repo + API (list unread-first, acknowledge,
+  read-all, unread count; Pro/Team gate via `UserTierLookup`), the full `/notifications` screen
+  (screens/16 states incl. 403 upgrade state), standalone `NotificationsBell` (mounted in the
+  Workspace Home nav until a Navigation Shell exists), and three event-source call sites wired in
+  assembly: `export_ready` (export handler, after a served export), `engine_slept` (engine status
+  hook, best-effort), `ingest_failed` (ingest pipeline via a new `WithNotifications` option).
+- **FEAT-031 — Shadow Queries.** Deterministic engine-only cross-check of SUM/COUNT aggregates
+  (recompute over the source table, 1e-6 tolerance); disagreement surfaced with warning styling,
+  never discarded; unparseable shapes record `skipped_reason` honestly; no extra model call.
+- **FEAT-032 — Adversarial Second-Pass Review.** The only extra model call; payload is question +
+  SQL only (never results — pinned by a wire test that "facts" is absent). `blocking` mismatch fails
+  the run before results; `warning` completes and is flagged. Egress log records the call.
+- **FEAT-033 — Honest Uncertainty.** Ambiguous plan output pauses the run (screen 12 card) with a
+  specific clarifying question; answering POSTs `/runs/:id/clarify`, persists a durable Correction
+  (so the same ambiguity isn't re-asked in the workspace), and resumes from generate_sql with the
+  clarification as prior context.
+- **FEAT-037/038/039/040 — Export formats.** PPTX (hand-rolled OOXML, zero deps, Team), Markdown/HTML
+  (structure preserved + inline SVG/data-URI chart), JSON (documented schema v1: report + expanded
+  provenance + execute output), Single Chart Image (server SVG mirroring ChartRenderer). All tier-gated
+  in the export handler + ExportDialog rows (locked rows never hidden).
+- **FEAT-045 — Read-Only Workspace Sharing.** Member repo + invite/list/revoke endpoints (Team gate,
+  invite-by-email with non-enumeration 404, owner-invite rejected, re-invite upsert), Sharing tab, and
+  SERVER-SIDE enforcement: every mutating handler now uses `requireWorkspaceMutationAccess` (403
+  `read_only_member`) and every read handler uses `requireWorkspaceAccess` (owner OR member) — the
+  orchestrator applied the swaps across upload/ingest/confirmation/profiling/datasets/semantic/
+  runs/engine/reports/export during assembly. Workspace deletion and audit-log reads stay owner-only.
+- **FEAT-046 — Read-Only Report Sharing by ID.** Share create/list/revoke endpoints + unauthenticated
+  `GET /v1/shared/reports/:token` (token possession = access, registered OUTSIDE the auth group; the
+  public payload omits workspace/run/parent ids) + real `/shared/[shareToken]` screen with the
+  screens/09 read-only state ("Sign in to interact" replaces Export/Ask).
+- **FEAT-047 — User-Facing Usage View.** Usage repo + read endpoint (owner OR read-only member) +
+  Usage tab; Free = totals only, Pro/Team = detailed breakdown (presentation over the same data).
+- **Assembly (orchestrator-applied):** `api.go` Dependencies + wiring (members/shares/usage/wake/
+  notifications seams, `ShareLookup`/`MemberUsers`/`ExportNotifications` narrow fields, public share
+  route outside auth); `main.go` (memberRepo/shareRepo/usageRepo/notificationRepo + ingest
+  `WithNotifications`); the FEAT-045 enforcement swaps (42 ownership checks re-routed); the three
+  notification event-source call sites; web (AskPanel props, exclusion indicators, bell mount, and
+  the `WorkspaceHomeScreen` test mock dispatch for the bell's unread-count fetch).
+- **Assumptions recorded:** FEAT-047's Team "per-member" breakdown is not representable (`usage_records`
+  has no `user_id` in schema.md) — Team renders the detailed breakdown; no code writes usage_records
+  yet, so the tab honestly shows zeros until metering lands; PPTX Upgrade label stays "Upgrade to
+  Pro/Team" even for a Team-only row (product-shaper flagged); "same context" for FEAT-033 = workspace
+  (corrections scope); cached runs replay already-verified outputs with an honest "not freshly
+  computed" banner.
+- **Doc tensions routed to product-shaper (not fixed):** `usage_records` has no `user_id` so
+  monetization's per-member usage breakdown needs a schema decision; the audit enum has no
+  exclusion-change action type (none invented); FEAT-040/035 "current theme" for file artifacts is
+  served as canonical light mode (dark mode is a screen concern); the "Upgrade to Pro/Team" label
+  isn't precise for a Team-only row.
 
 ### Screen 13 — Workspace Settings: Phase-1 shell (`d8f1bdf`, 2026-08-07)
 

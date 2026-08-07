@@ -149,6 +149,29 @@ func (r *WorkspaceRepository) EngineStatusHook(logger *slog.Logger) engine.Statu
 				slog.String("error", err.Error()),
 			)
 		}
+
+		// FEAT-026 event source: `engine_slept` durable notification, written when the engine
+		// actually idles out. Best-effort by design — a notification-write failure is a missed
+		// convenience and must never block or fail the engine lifecycle itself (the same
+		// log-and-swallow contract as the status mirror above).
+		if status == engine.StatusSleeping {
+			ws, err := r.GetByID(ctx, workspaceID)
+			if err != nil {
+				return
+			}
+			if err := NewNotificationRepository(r.pool).Create(ctx, domain.Notification{
+				UserID:            ws.OwnerID,
+				Type:              domain.NotifyEngineSlept,
+				Message:           fmt.Sprintf("The engine for %q went to sleep after being idle.", ws.Name),
+				RelatedEntityType: domain.RelatedWorkspace,
+				RelatedEntityID:   ws.ID,
+			}); err != nil {
+				logger.Error("creating engine_slept notification",
+					slog.String("workspace_id", workspaceID),
+					slog.String("error", err.Error()),
+				)
+			}
+		}
 	}
 }
 

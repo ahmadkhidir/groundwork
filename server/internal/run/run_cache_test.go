@@ -92,7 +92,8 @@ func TestCacheMissFallsThroughToNormalExecution(t *testing.T) {
 
 	modelClient.enqueue(
 		`{"answerable":true,"reason":"","approach":"group by region"}`,
-		`{"sql":"SELECT region FROM dataset_sales_data_q3_d5f3e2a1 GROUP BY region"}`,
+		`{"sql":"SELECT region FROM dataset_sales_data_q3_csv_d5f3e2a1 GROUP BY region"}`,
+		`{"matches":true,"verdict":"ok","severity":"ok"}`,
 		`{"chart_type":"table","x_axis_column":"region","y_axis_column":"","series_column":"","title":"x"}`,
 		`{"narrative":"North leads."}`,
 	)
@@ -103,9 +104,9 @@ func TestCacheMissFallsThroughToNormalExecution(t *testing.T) {
 	if got := runs.current().Status; got != domain.RunComplete {
 		t.Fatalf("run status = %s, want complete on a cache miss", got)
 	}
-	// The miss still executes normally: plan/generate/chart/narrate each hit the model.
-	if got := modelClient.callCount(); got != 4 {
-		t.Fatalf("model calls = %d, want 4 (normal execution on miss)", got)
+	// The miss still executes normally: plan/generate/adversarial/chart/narrate each hit the model.
+	if got := modelClient.callCount(); got != 5 {
+		t.Fatalf("model calls = %d, want 5 (normal execution on miss, adversarial review included)", got)
 	}
 	if got := len(reports.created()); got != 1 {
 		t.Fatalf("reports = %d, want 1 on normal execution", got)

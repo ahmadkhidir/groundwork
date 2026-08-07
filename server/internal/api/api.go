@@ -150,6 +150,43 @@ type Dependencies struct {
 	WorkspaceDeletionCascade WorkspaceDeletionStore
 	WorkspaceDeletionProofs  DeletionProofStore
 	WorkspaceDeletionAudit   WorkspaceDeletionAuditWriter
+
+	// FEAT-045 (Read-Only Workspace Sharing) — screens/13-workspace-settings.md. Members manages
+	// the workspace_members table (satisfied by postgres.MemberRepository); MemberLookup is the same
+	// repository narrowed to the access-check read (owner OR member) every handler uses; MemberUsers
+	// resolves an invite target by email (satisfied by postgres.UserRepository.FindByEmail — the
+	// invite flow needs the users table, and only the user store may answer "does this email exist?").
+	Members      MemberStore
+	MemberLookup MemberLookupStore
+	MemberUsers  UserByEmailStore
+
+	// Shares backs FEAT-046 (Read-Only Report Sharing by ID): the owner-side create/list/revoke
+	// endpoints and the UNAUTHENTICATED public read resolved by token possession. Satisfied by
+	// postgres.ReportShareRepository. ShareLookup is the same repository narrowed to the public
+	// token-resolving read only — the unauthenticated handler must not be able to create or revoke
+	// anything.
+	Shares      ReportShareStore
+	ShareLookup ShareLookupStore
+
+	// Usage backs FEAT-047 (User-Facing Usage View) — the Usage tab on Workspace Settings.
+	// Satisfied by postgres.UsageRepository (read-only over usage_records).
+	Usage UsageStore
+
+	// EngineWake backs FEAT-012 (Wake-on-Intent Trigger): a POST endpoint that acquires then
+	// releases the workspace engine so focusing the question input can pre-wake it. Satisfied by
+	// engine.Provider (the same instance behind EngineProvider).
+	EngineWake EngineWakeProvider
+
+	// Notifications backs FEAT-026 (Durable Notifications) — screens/16-notifications.md.
+	// Satisfied by postgres.NotificationRepository. The API read is tier-gated (Pro/Team, per
+	// monetization.md); the event sources that CREATE notifications live in other packages and are
+	// wired in assembly.
+	Notifications NotificationStore
+	// ExportNotifications is the narrow Create-only seam the export handler (FEAT-035..040) uses to
+	// write `export_ready` notifications, satisfied by the same postgres.NotificationRepository.
+	// Deliberately separate from Notifications so a read/acknowledge-only store can never be
+	// confused with the event-source write.
+	ExportNotifications NotificationCreator
 }
 
 // Server wires configuration and dependencies into an http.Handler.
@@ -209,6 +246,15 @@ func (s *Server) routes() {
 			RegisterAuthRoutes(r, s.authService, s.logger)
 		}
 
+		// FEAT-046's UNAUTHENTICATED shared-report read: GET /v1/shared/reports/:shareToken.
+		// Deliberately registered on the public /v1 group, OUTSIDE authsession.RequireAuth — access
+		// is scoped to possession of the share token, not account identity (user_flow.md's
+		// Authentication Gate). The handler only reads through the narrow ShareLookupStore seam and
+		// never leaks the workspace id.
+		if s.deps.Reports != nil && s.deps.ShareLookup != nil && s.deps.Provenance != nil && s.deps.RunSteps != nil {
+			RegisterPublicShareRoutes(r, s.deps.Reports, s.deps.ShareLookup, s.deps.Provenance, s.deps.RunSteps, s.logger)
+		}
+
 		// Everything below requires an authenticated session — see internal/authsession's package
 		// doc for why this middleware, not web/src/proxy.ts's redirect, is the actual authorization
 		// boundary. Guarded on deps.Workspaces being wired so a test server built with a zero-value
@@ -222,18 +268,18 @@ func (s *Server) routes() {
 
 				// FEAT-003: file upload.
 				if s.deps.Datasets != nil && s.deps.Objects != nil {
-					RegisterUploadRoutes(r, s.deps.Workspaces, s.deps.Datasets, s.deps.Objects, s.cfg.MaxUploadBytes, s.logger)
+					RegisterUploadRoutes(r, s.deps.Workspaces, s.deps.MemberLookup, s.deps.Datasets, s.deps.Objects, s.cfg.MaxUploadBytes, s.logger)
 				}
 
 				// FEAT-049: pre-upload duplicate-filename check. screens/05-file-upload.md.
 				if s.deps.DuplicateCheck != nil {
-					RegisterDuplicateCheckRoute(r, s.deps.Workspaces, s.deps.DuplicateCheck, s.logger)
+					RegisterDuplicateCheckRoute(r, s.deps.Workspaces, s.deps.MemberLookup, s.deps.DuplicateCheck, s.logger)
 				}
 
 				// FEAT-048: single-dataset deletion. screens/04-workspace-home.md's Datasets panel.
 				if s.deps.DatasetsList != nil && s.deps.DatasetColumns != nil &&
 					s.deps.DatasetRelationships != nil && s.deps.DatasetObjects != nil && s.deps.DatasetDeletionAudit != nil {
-					RegisterDatasetRoutes(r, s.deps.Workspaces, s.deps.DatasetsList, s.deps.DatasetColumns,
+					RegisterDatasetRoutes(r, s.deps.Workspaces, s.deps.MemberLookup, s.deps.DatasetsList, s.deps.DatasetColumns,
 						s.deps.DatasetRelationships, s.deps.DatasetObjects, s.deps.DatasetDeletionAudit, s.logger)
 				}
 
@@ -244,12 +290,12 @@ func (s *Server) routes() {
 
 				// FEAT-004: session-scoped engine provisioning and ingest.
 				if s.deps.IngestDatasets != nil && s.deps.IngestPipeline != nil && s.deps.IngestTracker != nil {
-					RegisterIngestRoutes(r, s.deps.Workspaces, s.deps.IngestDatasets, s.deps.IngestPipeline, s.deps.IngestTracker, s.logger)
+					RegisterIngestRoutes(r, s.deps.Workspaces, s.deps.MemberLookup, s.deps.IngestDatasets, s.deps.IngestPipeline, s.deps.IngestTracker, s.logger)
 				}
 
 				// FEAT-005 / FEAT-008: profiling statistics and inferred candidate joins.
 				if s.deps.ProfilingDatasets != nil && s.deps.Columns != nil && s.deps.CandidateJoins != nil {
-					RegisterProfilingRoutes(r, s.deps.Workspaces, s.deps.ProfilingDatasets, s.deps.Columns, s.deps.CandidateJoins, s.logger)
+					RegisterProfilingRoutes(r, s.deps.Workspaces, s.deps.MemberLookup, s.deps.ProfilingDatasets, s.deps.Columns, s.deps.CandidateJoins, s.logger)
 				}
 
 				// FEAT-006 / FEAT-007 / FEAT-009: ingest confirmation — type review, PII flag review,
@@ -257,14 +303,14 @@ func (s *Server) routes() {
 				if s.deps.ConfirmationDatasets != nil && s.deps.ConfirmationColumns != nil &&
 					s.deps.ConfirmationCandidateJoins != nil && s.deps.Relationships != nil &&
 					s.deps.ConfirmationAudit != nil {
-					RegisterConfirmationRoutes(r, s.deps.Workspaces, s.deps.ConfirmationDatasets,
+					RegisterConfirmationRoutes(r, s.deps.Workspaces, s.deps.MemberLookup, s.deps.ConfirmationDatasets,
 						s.deps.ConfirmationColumns, s.deps.ConfirmationCandidateJoins, s.deps.Relationships,
 						s.deps.ConfirmationAudit, s.logger)
 				}
 
 				// FEAT-011: engine sleep/wake lifecycle and honest status.
 				if s.deps.EngineProvider != nil && s.deps.EngineDatasets != nil {
-					RegisterEngineRoutes(r, s.deps.Workspaces, s.deps.EngineProvider, s.deps.EngineDatasets, s.logger)
+					RegisterEngineRoutes(r, s.deps.Workspaces, s.deps.MemberLookup, s.deps.EngineProvider, s.deps.EngineDatasets, s.logger)
 				}
 
 				// FEAT-019: semantic layer storage — relationships read/edit, metric definition CRUD,
@@ -272,28 +318,61 @@ func (s *Server) routes() {
 				// screens/15-semantic-layer.md, screens/04-workspace-home.md.
 				if s.deps.SemanticRelationships != nil && s.deps.SemanticMetrics != nil &&
 					s.deps.SemanticCorrections != nil && s.deps.SemanticSummary != nil {
-					RegisterSemanticRoutes(r, s.deps.Workspaces, s.deps.SemanticRelationships,
+					RegisterSemanticRoutes(r, s.deps.Workspaces, s.deps.MemberLookup, s.deps.SemanticRelationships,
 						s.deps.SemanticMetrics, s.deps.SemanticCorrections, s.deps.SemanticSummary, s.logger)
 				}
 
 				// FEAT-013: ask-a-question run lifecycle — create a run and watch it execute.
 				// screens/04-workspace-home.md, screens/08-run-viewer.md.
+				// users backs FEAT-021/FEAT-025's Pro/Team tier gate on follow-up/fork run creation.
 				if s.deps.Runs != nil && s.deps.RunSteps != nil && s.deps.RunExecutor != nil {
-					RegisterRunRoutes(r, s.deps.Workspaces, s.deps.Runs, s.deps.RunSteps, s.deps.Reports, s.deps.SemanticCorrections, s.deps.RunExecutor, s.deps.RunEvents, s.logger)
+					RegisterRunRoutes(r, s.deps.Workspaces, s.deps.MemberLookup, s.deps.Runs, s.deps.RunSteps, s.deps.Reports, s.deps.Users, s.deps.SemanticCorrections, s.deps.RunExecutor, s.deps.RunEvents, s.logger)
 				}
 
 				// FEAT-014/FEAT-030: read a completed run's materialized Report (and, with the
 				// provenance seam wired, expand its claim-level provenance links and serve the
 				// provenance-panel detail endpoint) — screens/09-report-view.md, screens/10.
 				if s.deps.Reports != nil {
-					RegisterReportRoutes(r, s.deps.Workspaces, s.deps.Reports, s.deps.Provenance, s.deps.RunSteps, s.logger)
+					RegisterReportRoutes(r, s.deps.Workspaces, s.deps.MemberLookup, s.deps.Reports, s.deps.Provenance, s.deps.RunSteps, s.logger)
 				}
 
-				// FEAT-035/FEAT-036: report export (PDF, Excel/CSV) — screens/11-export-dialog.md.
-				// Every collaborator is required: the tier gate must never be skippable, so the
-				// routes only register when all of them are wired.
+				// FEAT-035..040: report export (PDF, Excel/CSV, PowerPoint, Markdown/HTML, JSON,
+				// image) — screens/11-export-dialog.md. Every collaborator is required: the tier gate
+				// must never be skippable, so the routes only register when all of them are wired.
+				// Provenance supplies the expanded claim objects JSON export embeds (FEAT-039).
 				if s.deps.Reports != nil && s.deps.RunSteps != nil && s.deps.Users != nil && s.deps.ExportAudit != nil {
-					RegisterExportRoutes(r, s.deps.Workspaces, s.deps.Reports, s.deps.RunSteps, s.deps.Users, s.deps.ExportAudit, s.logger)
+					RegisterExportRoutes(r, s.deps.Workspaces, s.deps.MemberLookup, s.deps.Reports, s.deps.RunSteps, s.deps.Users, s.deps.ExportAudit, s.deps.Provenance, s.deps.ExportNotifications, s.logger)
+				}
+
+				// FEAT-045: read-only workspace sharing — invite/list/revoke.
+				// screens/13-workspace-settings.md. MemberUsers resolves invite targets by email;
+				// Users supplies the authoritative tier lookup for the Team gate.
+				if s.deps.Members != nil && s.deps.MemberUsers != nil && s.deps.Users != nil {
+					RegisterMemberRoutes(r, s.deps.Workspaces, s.deps.Members, s.deps.MemberUsers, s.deps.Users, s.logger)
+				}
+
+				// FEAT-046: read-only report sharing by ID — owner-side create/list/revoke.
+				// screens/13-workspace-settings.md.
+				if s.deps.Reports != nil && s.deps.Shares != nil && s.deps.Users != nil {
+					RegisterReportShareRoutes(r, s.deps.Workspaces, s.deps.Reports, s.deps.Shares, s.deps.Users, s.logger)
+				}
+
+				// FEAT-047: user-facing usage view. screens/13-workspace-settings.md. Unlike the
+				// other settings tabs, usage is visible to read-only members too (screens/13), so the
+				// handler authorizes with requireWorkspaceAccess (owner OR member).
+				if s.deps.MemberLookup != nil && s.deps.Usage != nil {
+					RegisterUsageRoutes(r, s.deps.Workspaces, s.deps.MemberLookup, s.deps.Usage, s.logger)
+				}
+
+				// FEAT-012: wake-on-intent — POST /v1/workspaces/:id/engine/wake. screens/04.
+				if s.deps.EngineWake != nil {
+					RegisterEngineWakeRoute(r, s.deps.Workspaces, s.deps.EngineWake, s.logger)
+				}
+
+				// FEAT-026: durable notifications. screens/16-notifications.md. users enforces the
+				// monetization.md row 109 Pro/Team gate.
+				if s.deps.Notifications != nil && s.deps.Users != nil {
+					RegisterNotificationRoutes(r, s.deps.Notifications, s.deps.Users, s.logger)
 				}
 
 				// FEAT-043: one-workspace-one-delete cascade + deletion proof read —

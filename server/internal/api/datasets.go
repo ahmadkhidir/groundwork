@@ -62,9 +62,15 @@ type DatasetDeletionAuditWriter interface {
 // RegisterDatasetRoutes wires FEAT-048's endpoints onto r: listing a workspace's datasets (the
 // Datasets panel's data source), reading a dataset's deletion impact (what the Delete Confirmation
 // Modal discloses), and deleting a dataset.
+//
+// members backs the FEAT-045 access check: the list and deletion-impact reads use
+// requireWorkspaceAccess (owner OR read-only member — a read-only member may view the datasets
+// panel and its impact disclosure), while the DELETE uses requireWorkspaceMutationAccess (only the
+// owner may delete).
 func RegisterDatasetRoutes(
 	r chi.Router,
 	workspaces WorkspaceStore,
+	members MemberLookupStore,
 	datasets DatasetsStore,
 	columns DatasetColumnsStore,
 	relationships DatasetRelationshipsStore,
@@ -72,11 +78,11 @@ func RegisterDatasetRoutes(
 	auditWriter DatasetDeletionAuditWriter,
 	logger *slog.Logger,
 ) {
-	r.Get("/workspaces/{workspaceId}/datasets", handleListDatasets(workspaces, datasets, logger))
+	r.Get("/workspaces/{workspaceId}/datasets", handleListDatasets(workspaces, members, datasets, logger))
 	r.Get("/workspaces/{workspaceId}/datasets/{datasetId}/deletion-impact",
-		handleDatasetDeletionImpact(workspaces, datasets, columns, relationships, logger))
+		handleDatasetDeletionImpact(workspaces, members, datasets, columns, relationships, logger))
 	r.Delete("/workspaces/{workspaceId}/datasets/{datasetId}",
-		handleDeleteDataset(workspaces, datasets, objects, auditWriter, logger))
+		handleDeleteDataset(workspaces, members, datasets, objects, auditWriter, logger))
 }
 
 // publicDatasetSummary is one row of screens/04-workspace-home.md's Datasets panel.
@@ -102,17 +108,17 @@ func toPublicDatasetSummary(ds domain.Dataset) publicDatasetSummary {
 // panel data source. Two datasets sharing an original_filename (FEAT-049's "Keep both" outcome) are
 // left in created_at order (most recent first, matching DatasetRepository.ListByWorkspace) so the
 // panel can disambiguate them by upload time, per that screen's spec.
-func handleListDatasets(workspaces WorkspaceStore, datasets DatasetsStore, logger *slog.Logger) http.HandlerFunc {
+func handleListDatasets(workspaces WorkspaceStore, members MemberLookupStore, datasets DatasetsStore, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
 			return
 		}
+
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+		if _, _, ok := requireWorkspaceAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
 			return
 		}
-
 		found, err := datasets.ListByWorkspace(r.Context(), workspaceID)
 		if err != nil {
 			logger.Error("listing datasets", slog.String("error", err.Error()))
@@ -176,6 +182,7 @@ type datasetDeletionImpact struct {
 // FEAT-049's Replace, can be confirmed.
 func handleDatasetDeletionImpact(
 	workspaces WorkspaceStore,
+	members MemberLookupStore,
 	datasets DatasetsStore,
 	columns DatasetColumnsStore,
 	relationships DatasetRelationshipsStore,
@@ -187,7 +194,7 @@ func handleDatasetDeletionImpact(
 			return
 		}
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+		if _, _, ok := requireWorkspaceAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
 			return
 		}
 
@@ -248,6 +255,7 @@ func handleDatasetDeletionImpact(
 // path in upload.go.
 func handleDeleteDataset(
 	workspaces WorkspaceStore,
+	members MemberLookupStore,
 	datasets DatasetsStore,
 	objects DatasetObjectDeleter,
 	auditWriter DatasetDeletionAuditWriter,
@@ -259,7 +267,7 @@ func handleDeleteDataset(
 			return
 		}
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+		if _, ok := requireWorkspaceMutationAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
 			return
 		}
 

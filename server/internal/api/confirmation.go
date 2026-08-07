@@ -31,12 +31,13 @@ type ConfirmationDatasetStore interface {
 }
 
 // ConfirmationColumnStore is the persistence seam for reviewing and overriding profiled columns
-// (FEAT-006/FEAT-007), satisfied by internal/store/postgres.ColumnRepository.
+// (FEAT-006/FEAT-007/FEAT-010), satisfied by internal/store/postgres.ColumnRepository.
 type ConfirmationColumnStore interface {
 	ListByWorkspace(ctx context.Context, workspaceID string) ([]domain.Column, error)
 	GetByIDForWorkspace(ctx context.Context, id, workspaceID string) (domain.Column, error)
 	UpdateInferredType(ctx context.Context, id string, t domain.InferredType) error
 	UpdatePII(ctx context.Context, id string, flag bool, pattern string, reviewedAt time.Time) error
+	UpdateExclusion(ctx context.Context, id string, excluded bool) error
 }
 
 // ConfirmationAuditWriter is the seam the PII override handler uses to record FEAT-007's explicit
@@ -73,9 +74,15 @@ const uniqueCardinalityThreshold = relationships.UniqueCardinalityThreshold
 
 // RegisterConfirmationRoutes wires FEAT-006/FEAT-007/FEAT-009's write endpoints onto r, for
 // screens/07-ingest-confirmation.md.
+//
+// members backs the FEAT-045 access check: the columns LIST is a read (requireWorkspaceAccess, so a
+// read-only member may view the confirmation surface), while the column/candidate-join PATCHes are
+// mutations (requireWorkspaceMutationAccess — a read-only member must not override types, PII flags,
+// exclusions, or join status).
 func RegisterConfirmationRoutes(
 	r chi.Router,
 	workspaces WorkspaceStore,
+	members MemberLookupStore,
 	datasets ConfirmationDatasetStore,
 	columns ConfirmationColumnStore,
 	joins ConfirmationCandidateJoinStore,
@@ -83,9 +90,15 @@ func RegisterConfirmationRoutes(
 	auditWriter ConfirmationAuditWriter,
 	logger *slog.Logger,
 ) {
-	r.Get("/workspaces/{workspaceId}/columns", handleListWorkspaceColumns(workspaces, datasets, columns, logger))
-	r.Patch("/workspaces/{workspaceId}/columns/{columnId}", handleUpdateColumn(workspaces, columns, auditWriter, logger))
-	r.Patch("/workspaces/{workspaceId}/candidate-joins/{joinId}", handleUpdateCandidateJoin(workspaces, columns, datasets, joins, relationshipStore, logger))
+	r.Get("/workspaces/{workspaceId}/columns", handleListWorkspaceColumns(workspaces, members, datasets, columns, logger))
+	r.Patch("/workspaces/{workspaceId}/columns/{columnId}", handleUpdateColumn(workspaces, members, columns, auditWriter, logger))
+	// FEAT-010's exclusion toggle (screens/13's Column exclusion toggle component names this exact
+	// route as its data source). It reuses the SAME handler as the general column PATCH — the request
+	// body is identical ({ "excluded_from_model": true }) and the handler applies only the fields the
+	// request actually carries — so one code path serves both the review-screen override and the
+	// settings-tab toggle instead of drifting into two behaviors.
+	r.Patch("/workspaces/{workspaceId}/columns/{columnId}/exclusion", handleUpdateColumn(workspaces, members, columns, auditWriter, logger))
+	r.Patch("/workspaces/{workspaceId}/candidate-joins/{joinId}", handleUpdateCandidateJoin(workspaces, members, columns, datasets, joins, relationshipStore, logger))
 }
 
 // publicRelationship is a confirmed relationship as returned when a candidate join is accepted.
@@ -145,7 +158,7 @@ type publicConfirmationColumn struct {
 // every dataset in the workspace, labelled with its owning file's name. This is the "types" and
 // "pii-flags" data source for screens/07-ingest-confirmation.md, which reviews an entire upload batch
 // (potentially several files) as one screen rather than one dataset at a time.
-func handleListWorkspaceColumns(workspaces WorkspaceStore, datasets ConfirmationDatasetStore, columns ConfirmationColumnStore, logger *slog.Logger) http.HandlerFunc {
+func handleListWorkspaceColumns(workspaces WorkspaceStore, members MemberLookupStore, datasets ConfirmationDatasetStore, columns ConfirmationColumnStore, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
@@ -153,7 +166,7 @@ func handleListWorkspaceColumns(workspaces WorkspaceStore, datasets Confirmation
 		}
 
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+		if _, _, ok := requireWorkspaceAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
 			return
 		}
 
@@ -217,22 +230,27 @@ var validInferredTypes = map[string]domain.InferredType{
 	"timestamp": domain.TypeTimestamp,
 }
 
-// updateColumnRequest is the PATCH body for overriding a column's reviewed type and/or PII flag.
-// Both fields are pointers so the handler can tell "not supplied" (nil) apart from an explicit
-// false/zero-value — a request overriding only the PII flag must not accidentally reset the type,
-// and vice versa.
+// updateColumnRequest is the PATCH body for overriding a column's reviewed type, PII flag, and/or
+// model exclusion. Every field is a pointer so the handler can tell "not supplied" (nil) apart from
+// an explicit false/zero-value — a request overriding only the PII flag must not accidentally reset
+// the type or the exclusion, and vice versa.
 type updateColumnRequest struct {
 	InferredType *string `json:"inferred_type"`
 	PIIFlag      *bool   `json:"pii_flag"`
 	// PIIPattern is only consulted when PIIFlag is true; if omitted, "manual" is recorded — this is a
 	// user-initiated flag, not one DetectAll proposed, per pii.PatternManual's doc comment.
 	PIIPattern *string `json:"pii_pattern"`
+	// ExcludedFromModel is FEAT-010's user-controlled override on top of automatic PII flagging: the
+	// column stays queryable by the engine but its name/values never reach the model. Written by
+	// Workspace Settings' Column Visibility tab (screens/13) and visible on ingest review (screens/07).
+	ExcludedFromModel *bool `json:"excluded_from_model"`
 }
 
 // handleUpdateColumn serves PATCH /v1/workspaces/:id/columns/:columnId — FEAT-006's type-review
-// override and FEAT-007's PII-flag override, both landing on the same column resource since
-// screens/07 reviews them as two tabs/steps over the same underlying rows.
-func handleUpdateColumn(workspaces WorkspaceStore, columns ConfirmationColumnStore, auditWriter ConfirmationAuditWriter, logger *slog.Logger) http.HandlerFunc {
+// override, FEAT-007's PII-flag override, and FEAT-010's model-exclusion override, all landing on
+// the same column resource since screens/07 reviews the first two as tabs/steps over the same
+// underlying rows and screens/13 manages the third.
+func handleUpdateColumn(workspaces WorkspaceStore, members MemberLookupStore, columns ConfirmationColumnStore, auditWriter ConfirmationAuditWriter, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
@@ -240,7 +258,7 @@ func handleUpdateColumn(workspaces WorkspaceStore, columns ConfirmationColumnSto
 		}
 
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+		if _, ok := requireWorkspaceMutationAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
 			return
 		}
 
@@ -248,9 +266,9 @@ func handleUpdateColumn(workspaces WorkspaceStore, columns ConfirmationColumnSto
 		if !decodeJSON(w, r, &req) {
 			return
 		}
-		if req.InferredType == nil && req.PIIFlag == nil {
+		if req.InferredType == nil && req.PIIFlag == nil && req.ExcludedFromModel == nil {
 			respondJSON(w, http.StatusBadRequest, map[string]string{
-				"error": "Provide inferred_type and/or pii_flag to update.",
+				"error": "Provide inferred_type, pii_flag, and/or excluded_from_model to update.",
 				"code":  "validation_error",
 			})
 			return
@@ -350,6 +368,18 @@ func handleUpdateColumn(workspaces WorkspaceStore, columns ConfirmationColumnSto
 			}
 		}
 
+		if req.ExcludedFromModel != nil {
+			if err := columns.UpdateExclusion(r.Context(), columnID, *req.ExcludedFromModel); err != nil {
+				logger.Error("updating column model exclusion", slog.String("error", err.Error()))
+				respondJSON(w, http.StatusInternalServerError, map[string]string{
+					"error": "Something went wrong. Try again.",
+					"code":  "internal_error",
+				})
+				return
+			}
+			col.ExcludedFromModel = *req.ExcludedFromModel
+		}
+
 		respondJSON(w, http.StatusOK, map[string]any{"column": toPublicColumn(col)})
 	}
 }
@@ -386,6 +416,7 @@ type updateCandidateJoinRequest struct {
 // authorized this wave; this handler performs only the single write FEAT-009 itself requires.
 func handleUpdateCandidateJoin(
 	workspaces WorkspaceStore,
+	members MemberLookupStore,
 	columns ConfirmationColumnStore,
 	datasets ConfirmationDatasetStore,
 	joins ConfirmationCandidateJoinStore,
@@ -399,7 +430,7 @@ func handleUpdateCandidateJoin(
 		}
 
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+		if _, ok := requireWorkspaceMutationAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
 			return
 		}
 

@@ -10,11 +10,12 @@ vi.mock("@/lib/api-client", async () => {
     await vi.importActual<typeof import("@/lib/api-client")>("@/lib/api-client");
   return {
     ...actual,
-    api: { ...actual.api, get: vi.fn() },
+    api: { ...actual.api, get: vi.fn(), post: vi.fn() },
   };
 });
 
 const getMock = vi.mocked(api.get);
+const postMock = vi.mocked(api.post);
 
 const { pushMock, replaceMock, searchParamsState } = vi.hoisted(() => ({
   pushMock: vi.fn(),
@@ -78,6 +79,7 @@ async function renderLoadedScreen(props?: Partial<React.ComponentProps<typeof Re
 describe("ReportViewScreen", () => {
   beforeEach(() => {
     getMock.mockReset();
+    postMock.mockReset();
     pushMock.mockReset();
     replaceMock.mockReset();
     searchParamsState.current = new URLSearchParams();
@@ -218,5 +220,49 @@ describe("ReportViewScreen", () => {
     searchParamsState.current = new URLSearchParams("export=1");
     await renderLoadedScreen({ userTier: SubscriptionTier.Pro });
     expect(screen.getByRole("radio", { name: /Excel\/CSV/ })).toBeInTheDocument();
+  });
+
+  it("submits a report-scoped follow-up question as a run linked to this report (FEAT-021)", async () => {
+    postMock.mockResolvedValue({ run: { id: "run-followup" } });
+    await renderLoadedScreen();
+
+    // The web side panel's "Ask a follow-up" opens the report-scoped input. Both the web panel and
+    // the mobile bar render in jsdom, so the submit button is scoped to the panel.
+    const panel = screen.getByTestId("report-action-panel");
+    await userEvent.click(within(panel).getByRole("button", { name: "Ask a follow-up" }));
+    const input = await screen.findByTestId("followup-input-web");
+    await userEvent.type(input, "break this down by month");
+    await userEvent.click(within(panel).getByRole("button", { name: "Ask" }));
+
+    await vi.waitFor(() => {
+      // The run is created with this report as its parent — the answer will be a NEW linked report.
+      expect(postMock).toHaveBeenCalledWith("/v1/workspaces/ws-1/runs", {
+        question_text: "break this down by month",
+        parent_report_id: "report-1",
+      });
+      expect(pushMock).toHaveBeenCalledWith("/workspaces/ws-1/runs/run-followup");
+    });
+  });
+
+  it("keeps the follow-up input disabled until a question is typed", async () => {
+    await renderLoadedScreen();
+    const panel = screen.getByTestId("report-action-panel");
+    await userEvent.click(within(panel).getByRole("button", { name: "Ask a follow-up" }));
+    const input = await screen.findByTestId("followup-input-web");
+
+    const ask = within(panel).getByRole("button", { name: "Ask" });
+    expect(ask).toBeDisabled();
+    await userEvent.type(input, "  ");
+    expect(ask).toBeDisabled();
+    await userEvent.type(input, "break it down");
+    expect(ask).not.toBeDisabled();
+  });
+
+  it("locks the follow-up affordance for the Free tier (display-only; the server is authoritative)", async () => {
+    await renderLoadedScreen({ userTier: SubscriptionTier.Free });
+    const panel = screen.getByTestId("report-action-panel");
+    // The button reads "(Pro)" and cannot be opened — the server returns 403 upgrade_required
+    // regardless, this is the honest UI treatment.
+    expect(within(panel).getByRole("button", { name: "Ask a follow-up (Pro)" })).toBeDisabled();
   });
 });

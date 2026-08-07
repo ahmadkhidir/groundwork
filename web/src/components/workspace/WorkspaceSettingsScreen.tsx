@@ -1,21 +1,34 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { ArrowLeft, Trash2 } from "lucide-react";
+import { ArrowLeft, Lock, Trash2 } from "lucide-react";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { Button, buttonClassNames } from "@/components/ui/Button";
 import { Skeleton } from "@/components/shared/Skeleton";
 import { ErrorState } from "@/components/shared/ErrorState";
 import { api } from "@/lib/api-client";
 import { routes } from "@/lib/routes";
-import type { DeletionRecord, Workspace } from "@/types/schema";
+import { SubscriptionTier, type DeletionRecord, type Workspace } from "@/types/schema";
+import { ColumnVisibilityTab } from "./ColumnVisibilityTab";
+import { SharingTab } from "./SharingTab";
+import { UsageTab } from "./UsageTab";
 import { WorkspaceDeleteModal } from "./WorkspaceDeleteModal";
 import { storeDeletionProof } from "./DeletedProofScreen";
 
 export interface WorkspaceSettingsScreenProps {
   workspaceId: string;
+  /**
+   * The user's tier for DISPLAY (which settings surfaces are unlocked). Display-only — the
+   * authoritative tier gate is server-side via UserTierLookup, never a client-claimed tier.
+   */
+  userTier?: SubscriptionTier;
+  /**
+   * The signed-in user's id, used to decide owner vs read-only member treatment. When absent, the
+   * screen assumes ownership (the pre-FEAT-045 behavior, where only owners could reach the route).
+   */
+  userId?: string;
 }
 
 type SettingsTab =
@@ -25,7 +38,7 @@ type SettingsTab =
   | "audit-log"
   | "danger-zone";
 
-const TABS: { id: SettingsTab; label: string }[] = [
+const ALL_TABS: { id: SettingsTab; label: string }[] = [
   { id: "column-visibility", label: "Column Visibility" },
   { id: "sharing", label: "Sharing" },
   { id: "usage", label: "Usage" },
@@ -33,28 +46,7 @@ const TABS: { id: SettingsTab; label: string }[] = [
   { id: "danger-zone", label: "Danger Zone" },
 ];
 
-/** What a later-phase tab will contain, so a Phase-1 user sees an honest boundary rather than a
- * broken-looking empty tab. Styled from the same tokens as the screen; never a fabricated control. */
-function LaterPhaseCard({
-  feature,
-  description,
-  phase,
-}: {
-  feature: string;
-  description: string;
-  phase: string;
-}) {
-  return (
-    <Card elevation="none">
-      <CardHeader title={feature} description={description} />
-      <p className="mt-2 text-body-small text-text-secondary">
-        Available in a later phase ({phase}).
-      </p>
-    </Card>
-  );
-}
-
-/** The single-workspace GET's payload shape; only the name is needed here for the confirm-by-typing gate. */
+/** The single-workspace GET's payload shape. */
 interface GetWorkspaceResponse {
   workspace: Workspace;
 }
@@ -64,6 +56,11 @@ interface DeleteWorkspaceResponse {
   deletion: DeletionRecord;
 }
 
+type AccessState =
+  | { status: "loading" }
+  | { status: "loaded"; isOwner: boolean; name: string }
+  | { status: "error"; message: string };
+
 type DangerZoneState =
   | { status: "loading" }
   | { status: "loaded"; name: string }
@@ -72,47 +69,53 @@ type DangerZoneState =
 /**
  * Screen 13: Workspace Settings (screens/13-workspace-settings.md).
  *
- * The Audit Log tab is functional (FEAT-042 — a short explanatory line plus a button navigating to
- * the full Egress / Audit Log screen, kept as its own route per the screen spec). The Danger Zone
- * tab is the real FEAT-043 delete flow: it loads the workspace name (the confirm-by-typing gate's
- * match value), and "Delete Workspace" opens the screens/14 confirmation modal — explicit scope,
- * type-the-name-to-confirm, honest Executing state, and navigation to the Deletion Proof page on
- * success. The remaining tabs (Column Visibility FEAT-010, Sharing FEAT-045/FEAT-046, Usage
- * FEAT-047) are Phase 5 features and render an explicit later-phase state instead of a fake or
- * half-wired control.
+ * Five tabs: Column Visibility (FEAT-010, real), Sharing (FEAT-045/FEAT-046, real), Usage
+ * (FEAT-047, real), Audit Log (FEAT-042 — link out to the full Egress / Audit Log screen), and
+ * Danger Zone (FEAT-043 — the real delete flow with WorkspaceDeleteModal).
  *
- * Read-only shared members never see the Danger Zone at all — that hiding (FEAT-045, Phase 5) is
- * enforced by the API's owner-only 404 in any case; this screen is only reachable by owners today.
+ * Read-only shared members (FEAT-045): per screens/13, they see Usage and their own access level
+ * only — Column Visibility, Sharing management, Audit Log, and Danger Zone are hidden entirely, not
+ * just disabled. The screen compares the workspace's owner_id against the signed-in user's id; the
+ * server remains authoritative (a read-only member's mutation requests 403/404 regardless).
  */
-export function WorkspaceSettingsScreen({ workspaceId }: WorkspaceSettingsScreenProps) {
+export function WorkspaceSettingsScreen({ workspaceId, userTier, userId }: WorkspaceSettingsScreenProps) {
   const router = useRouter();
   const [tab, setTab] = useState<SettingsTab>("audit-log");
+  const [access, setAccess] = useState<AccessState>({ status: "loading" });
   const [dangerZone, setDangerZone] = useState<DangerZoneState>({ status: "loading" });
   const [deleteModalOpen, setDeleteModalOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
 
-  // Lazy per tab, matching screens/13's Data Flow ("each tab's data loads independently... to avoid
-  // fetching sharing/usage data before the user opens those tabs"): the workspace name is only
-  // fetched when the Danger Zone is opened, from the click handler rather than an effect.
-  const loadWorkspaceName = useCallback(async () => {
-    setDangerZone({ status: "loading" });
+  const loadWorkspace = useCallback(async () => {
     try {
       const res = await api.get<GetWorkspaceResponse>(`/v1/workspaces/${workspaceId}`);
+      const isOwner = userId === undefined || res.workspace.owner_id === userId;
+      setAccess({ status: "loaded", isOwner, name: res.workspace.name });
       setDangerZone({ status: "loaded", name: res.workspace.name });
+      // A read-only member's only settings surface is Usage (screens/13); land them there.
+      if (!isOwner) setTab("usage");
     } catch (error) {
-      setDangerZone({
-        status: "error",
-        message:
-          error instanceof Error ? error.message : "Something went wrong. Try again.",
-      });
+      const message =
+        error instanceof Error ? error.message : "Something went wrong. Try again.";
+      setAccess({ status: "error", message });
+      setDangerZone({ status: "error", message });
     }
-  }, [workspaceId]);
+  }, [workspaceId, userId]);
+
+  useEffect(() => {
+    // Mount-triggered async fetch; see WorkspaceHomeScreen.tsx for why this eslint rule is
+    // suppressed here.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void loadWorkspace();
+  }, [loadWorkspace]);
 
   const selectTab = (next: SettingsTab) => {
     setTab(next);
     if (next === "danger-zone" && dangerZone.status === "loading") {
-      void loadWorkspaceName();
+      // The Danger Zone needs the workspace name for the confirm-by-typing gate; if the mount fetch
+      // has not resolved yet, fetch it on demand.
+      void loadWorkspace();
     }
   };
 
@@ -121,22 +124,23 @@ export function WorkspaceSettingsScreen({ workspaceId }: WorkspaceSettingsScreen
     setDeleting(true);
     setDeleteError(null);
     try {
-      const res = await api.delete<DeleteWorkspaceResponse>(
-        `/v1/workspaces/${workspaceId}`,
-      );
+      const res = await api.delete<DeleteWorkspaceResponse>(`/v1/workspaces/${workspaceId}`);
       // Carry the proof to the Deletion Proof page; survives a refresh of that page in this tab.
       storeDeletionProof(workspaceId, res.deletion);
       router.push(routes.deletionProof(workspaceId));
     } catch (error) {
       // Flow 5 Alternate Path B: no false success. The modal stays open with the server's message
-      // (which names the failed category) and the confirm-by-typing state intact, so the user can
-      // retry — the workspace was not deleted.
+      // and the confirm-by-typing state intact, so the user can retry.
       setDeleting(false);
       setDeleteError(
         error instanceof Error ? error.message : "Something went wrong. Try again.",
       );
     }
   }, [workspaceId, dangerZone, router]);
+
+  const isOwner = access.status === "loaded" ? access.isOwner : true;
+  const tabs = isOwner ? ALL_TABS : ALL_TABS.filter((t) => t.id === "usage");
+  const tier = userTier ?? SubscriptionTier.Free;
 
   return (
     <main id="main-content" className="mx-auto w-full max-w-3xl p-8">
@@ -157,7 +161,7 @@ export function WorkspaceSettingsScreen({ workspaceId }: WorkspaceSettingsScreen
         aria-label="Workspace settings"
         className="mt-6 flex flex-wrap gap-1 border-b border-border"
       >
-        {TABS.map(({ id, label }) => (
+        {tabs.map(({ id, label }) => (
           <button
             key={id}
             role="tab"
@@ -176,56 +180,48 @@ export function WorkspaceSettingsScreen({ workspaceId }: WorkspaceSettingsScreen
         ))}
       </div>
 
-      <div
-        role="tabpanel"
-        id="settings-panel-audit-log"
-        aria-labelledby="settings-tab-audit-log"
-        hidden={tab !== "audit-log"}
-        className="mt-6"
-      >
-        <Card>
+      {access.status === "error" && (
+        <div className="mt-6">
+          <ErrorState description={access.message} onRetry={() => void loadWorkspace()} />
+        </div>
+      )}
+
+      {access.status === "loaded" && !access.isOwner && (
+        <Card className="mt-6">
           <CardHeader
-            title="Audit log"
-            description="Every model-egress event from this workspace — what data was sent to the model, when, and for which run."
+            title="Read-only access"
+            description="You can view this workspace's reports and usage, but you cannot change its data, semantic layer, or sharing."
           />
-          <div className="mt-4">
-            <Link
-              href={routes.auditLog(workspaceId)}
-              className={buttonClassNames("outline")}
-            >
-              View the full audit log
-            </Link>
-          </div>
+          <p className="flex items-center gap-2 text-body-small text-text-secondary">
+            <Lock size={14} aria-hidden="true" />
+            {access.name}
+          </p>
         </Card>
-      </div>
+      )}
 
-      <div
-        role="tabpanel"
-        id="settings-panel-column-visibility"
-        aria-labelledby="settings-tab-column-visibility"
-        hidden={tab !== "column-visibility"}
-        className="mt-6"
-      >
-        <LaterPhaseCard
-          feature="Column visibility"
-          description="Lists every ingested column workspace-wide with per-column exclusion toggles and the automatic PII flag (FEAT-010)."
-          phase="Phase 5"
-        />
-      </div>
+      {isOwner && (
+        <div
+          role="tabpanel"
+          id="settings-panel-column-visibility"
+          aria-labelledby="settings-tab-column-visibility"
+          hidden={tab !== "column-visibility"}
+          className="mt-6"
+        >
+          <ColumnVisibilityTab workspaceId={workspaceId} />
+        </div>
+      )}
 
-      <div
-        role="tabpanel"
-        id="settings-panel-sharing"
-        aria-labelledby="settings-tab-sharing"
-        hidden={tab !== "sharing"}
-        className="mt-6"
-      >
-        <LaterPhaseCard
-          feature="Sharing"
-          description="Workspace members (Team tier) and active report share links with revoke actions (FEAT-045, FEAT-046)."
-          phase="Phase 5"
-        />
-      </div>
+      {isOwner && (
+        <div
+          role="tabpanel"
+          id="settings-panel-sharing"
+          aria-labelledby="settings-tab-sharing"
+          hidden={tab !== "sharing"}
+          className="mt-6"
+        >
+          <SharingTab workspaceId={workspaceId} tier={tier} />
+        </div>
+      )}
 
       <div
         role="tabpanel"
@@ -234,60 +230,83 @@ export function WorkspaceSettingsScreen({ workspaceId }: WorkspaceSettingsScreen
         hidden={tab !== "usage"}
         className="mt-6"
       >
-        <LaterPhaseCard
-          feature="Usage"
-          description="Current-period engine-seconds, storage, and model-token usage (FEAT-047)."
-          phase="Phase 5"
-        />
+        <UsageTab workspaceId={workspaceId} tier={tier} />
       </div>
 
-      <div
-        role="tabpanel"
-        id="settings-panel-danger-zone"
-        aria-labelledby="settings-tab-danger-zone"
-        hidden={tab !== "danger-zone"}
-        className="mt-6"
-      >
-        <Card>
-          <CardHeader
-            title="Danger zone"
-            description="Permanently delete this workspace and every piece of derived state it owns — provably, with confirmation and a proof record (FEAT-043)."
-          />
-          {dangerZone.status === "loading" ? (
-            <Skeleton className="h-10 w-48" />
-          ) : dangerZone.status === "error" ? (
-            <ErrorState onRetry={() => void loadWorkspaceName()} />
-          ) : (
-            <div className="mt-4 flex flex-col items-start justify-between gap-4 sm:flex-row sm:items-center">
-              <p className="max-w-md text-body-small text-text-secondary">
-                Deleting is irreversible: object store contents, the semantic layer, reports and
-                conversation history, query caches, and logs are all destroyed in one cascade.
-              </p>
-              <Button
-                variant="destructive"
-                onClick={() => {
-                  setDeleteError(null);
-                  setDeleteModalOpen(true);
-                }}
+      {isOwner && (
+        <div
+          role="tabpanel"
+          id="settings-panel-audit-log"
+          aria-labelledby="settings-tab-audit-log"
+          hidden={tab !== "audit-log"}
+          className="mt-6"
+        >
+          <Card>
+            <CardHeader
+              title="Audit log"
+              description="Every model-egress event from this workspace — what data was sent to the model, when, and for which run."
+            />
+            <div className="mt-4">
+              <Link
+                href={routes.auditLog(workspaceId)}
+                className={buttonClassNames("outline")}
               >
-                <Trash2 size={16} aria-hidden="true" />
-                Delete Workspace
-              </Button>
+                View the full audit log
+              </Link>
             </div>
-          )}
-        </Card>
+          </Card>
+        </div>
+      )}
 
-        {dangerZone.status === "loaded" && (
-          <WorkspaceDeleteModal
-            open={deleteModalOpen}
-            workspaceName={dangerZone.name}
-            onCancel={() => setDeleteModalOpen(false)}
-            onConfirm={() => void handleDelete()}
-            loading={deleting}
-            error={deleteError ?? undefined}
-          />
-        )}
-      </div>
+      {isOwner && (
+        <div
+          role="tabpanel"
+          id="settings-panel-danger-zone"
+          aria-labelledby="settings-tab-danger-zone"
+          hidden={tab !== "danger-zone"}
+          className="mt-6"
+        >
+          <Card>
+            <CardHeader
+              title="Danger zone"
+              description="Permanently delete this workspace and every piece of derived state it owns — provably, with confirmation and a proof record (FEAT-043)."
+            />
+            {dangerZone.status === "loading" ? (
+              <Skeleton className="h-10 w-48" />
+            ) : dangerZone.status === "error" ? (
+              <ErrorState onRetry={() => void loadWorkspace()} />
+            ) : (
+              <div className="mt-4 flex flex-col items-start justify-between gap-4 sm:flex-row sm:items-center">
+                <p className="max-w-md text-body-small text-text-secondary">
+                  Deleting is irreversible: object store contents, the semantic layer, reports and
+                  conversation history, query caches, and logs are all destroyed in one cascade.
+                </p>
+                <Button
+                  variant="destructive"
+                  onClick={() => {
+                    setDeleteError(null);
+                    setDeleteModalOpen(true);
+                  }}
+                >
+                  <Trash2 size={16} aria-hidden="true" />
+                  Delete Workspace
+                </Button>
+              </div>
+            )}
+          </Card>
+
+          {dangerZone.status === "loaded" && (
+            <WorkspaceDeleteModal
+              open={deleteModalOpen}
+              workspaceName={dangerZone.name}
+              onCancel={() => setDeleteModalOpen(false)}
+              onConfirm={() => void handleDelete()}
+              loading={deleting}
+              error={deleteError ?? undefined}
+            />
+          )}
+        </div>
+      )}
     </main>
   );
 }

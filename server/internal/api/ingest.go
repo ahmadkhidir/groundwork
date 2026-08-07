@@ -49,9 +49,9 @@ var stepOrder = map[ingest.Step]int{
 }
 
 // RegisterIngestRoutes wires FEAT-004's endpoints onto r.
-func RegisterIngestRoutes(r chi.Router, workspaces WorkspaceStore, datasets IngestDatasetStore, pipeline IngestPipeline, tracker *ingest.Tracker, logger *slog.Logger) {
-	r.Post("/workspaces/{workspaceId}/ingest", handleStartIngest(workspaces, datasets, pipeline, logger))
-	r.Get("/workspaces/{workspaceId}/ingest/stream", handleIngestStream(workspaces, datasets, tracker, logger))
+func RegisterIngestRoutes(r chi.Router, workspaces WorkspaceStore, members MemberLookupStore, datasets IngestDatasetStore, pipeline IngestPipeline, tracker *ingest.Tracker, logger *slog.Logger) {
+	r.Post("/workspaces/{workspaceId}/ingest", handleStartIngest(workspaces, members, datasets, pipeline, logger))
+	r.Get("/workspaces/{workspaceId}/ingest/stream", handleIngestStream(workspaces, members, datasets, tracker, logger))
 }
 
 // publicIngestDataset is one dataset's live ingest state, as sent to the client.
@@ -88,7 +88,7 @@ type ingestStreamEvent struct {
 // "pending" — the batch File Upload just created. Returns immediately; ingest itself runs in the
 // background, decoupled from this request (see ingest.Pipeline.Start's doc comment on why that
 // matters for the "tab closed mid-ingest" edge case).
-func handleStartIngest(workspaces WorkspaceStore, datasets IngestDatasetStore, pipeline IngestPipeline, logger *slog.Logger) http.HandlerFunc {
+func handleStartIngest(workspaces WorkspaceStore, members MemberLookupStore, datasets IngestDatasetStore, pipeline IngestPipeline, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
@@ -96,7 +96,7 @@ func handleStartIngest(workspaces WorkspaceStore, datasets IngestDatasetStore, p
 		}
 
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+		if _, ok := requireWorkspaceMutationAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
 			return
 		}
 
@@ -131,7 +131,7 @@ func handleStartIngest(workspaces WorkspaceStore, datasets IngestDatasetStore, p
 // having the Ingest Pipeline push directly into this connection, specifically so a client that
 // disconnects and reconnects (screens/06's tab-close edge case) sees accurate current state on
 // reconnect instead of a stream that only makes sense to whichever request started it.
-func handleIngestStream(workspaces WorkspaceStore, datasets IngestDatasetStore, tracker *ingest.Tracker, logger *slog.Logger) http.HandlerFunc {
+func handleIngestStream(workspaces WorkspaceStore, members MemberLookupStore, datasets IngestDatasetStore, tracker *ingest.Tracker, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
@@ -139,7 +139,7 @@ func handleIngestStream(workspaces WorkspaceStore, datasets IngestDatasetStore, 
 		}
 
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+		if _, _, ok := requireWorkspaceAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
 			return
 		}
 

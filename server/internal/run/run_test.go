@@ -261,10 +261,14 @@ type fakeHandle struct {
 	execStatements []string
 	queried        []string
 	rows           engine.Rows
-	// countRows, when set, is returned for SELECT count(*) queries (reconciliation measurement),
-	// so the fake can produce a distinct row count without exhausting rows. Kept as data, not an
-	// engine.Rows, so each count query gets a fresh cursor (fakeRows is stateful).
+	// countRows, when set, is returned for SELECT count(*) queries (reconciliation measurement and
+	// FEAT-031's count shadow), so the fake can produce a distinct row count without exhausting
+	// rows. Kept as data, not an engine.Rows, so each count query gets a fresh cursor (fakeRows is
+	// stateful).
 	countRows [][]any
+	// sumRows, when set, is returned for SELECT SUM(...) shadow queries (FEAT-031), so the shadow
+	// check gets a proper single-column numeric result instead of the main result shape.
+	sumRows [][]any
 }
 
 func (f *fakeHandle) WorkspaceID() string { return "ws-1" }
@@ -276,6 +280,9 @@ func (f *fakeHandle) Query(_ context.Context, sql string, _ ...any) (engine.Rows
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.queried = append(f.queried, sql)
+	if f.sumRows != nil && strings.HasPrefix(sql, "SELECT sum(") {
+		return &fakeRows{cols: []string{"sum"}, rows: f.sumRows}, nil
+	}
 	if f.countRows != nil && strings.HasPrefix(sql, "SELECT count(*)") {
 		return &fakeRows{cols: []string{"count"}, rows: f.countRows}, nil
 	}
@@ -388,6 +395,7 @@ func (f *fakeAudit) queryCount() int {
 type fakeReportStore struct {
 	mu             sync.Mutex
 	createdReports []domain.Report
+	byRunID        map[string]domain.Report
 	err            error
 }
 
@@ -398,7 +406,23 @@ func (f *fakeReportStore) Create(_ context.Context, report domain.Report) error 
 		return f.err
 	}
 	f.createdReports = append(f.createdReports, report)
+	if f.byRunID == nil {
+		f.byRunID = make(map[string]domain.Report)
+	}
+	f.byRunID[report.RunID] = report
 	return nil
+}
+
+// GetByRunID mirrors ReportRepository.GetByRunID: it returns the report a run materialized, or an
+// error when none exists yet.
+func (f *fakeReportStore) GetByRunID(_ context.Context, _ string, runID string) (domain.Report, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	report, ok := f.byRunID[runID]
+	if !ok {
+		return domain.Report{}, errors.New("report not found")
+	}
+	return report, nil
 }
 
 func (f *fakeReportStore) created() []domain.Report {
@@ -431,7 +455,14 @@ func (f *fakeCorrectionLister) ListByWorkspace(_ context.Context, _ string) ([]d
 func newTestExecutor() (*Executor, *fakeRunStore, *fakeStepStore, *fakeHandle, *fakeModelClient, *fakeAudit, *fakeReportStore) {
 	runs := &fakeRunStore{}
 	steps := &fakeStepStore{}
-	handle := &fakeHandle{rows: &fakeRows{cols: []string{"region", "cnt"}, rows: [][]any{{"North", int64(10)}}}}
+	// count/sum defaults of 0 keep FEAT-031's shadow queries (which run for every aggregate query)
+	// returning a valid single-column numeric result instead of the main result shape; individual
+	// tests override them to assert a specific shadow outcome.
+	handle := &fakeHandle{
+		rows:      &fakeRows{cols: []string{"region", "cnt"}, rows: [][]any{{"North", int64(10)}}},
+		countRows: [][]any{{int64(0)}},
+		sumRows:   [][]any{{int64(0)}},
+	}
 	modelClient := &fakeModelClient{}
 	audit := &fakeAudit{}
 	reports := &fakeReportStore{}
@@ -487,9 +518,14 @@ func TestExecutorHappyPath(t *testing.T) {
 		},
 	}}
 
+	// The count shadow (FEAT-031) recomputes COUNT over the source table; returning the same total
+	// as the primary result makes the happy-path check a clean match.
+	handle.countRows = [][]any{{int64(10)}}
+
 	modelClient.enqueue(
 		`{"answerable":true,"reason":"","approach":"group by region"}`,
 		`{"sql":"SELECT region, COUNT(*) AS cnt FROM dataset_sales_data_q3_csv_d5f3e2a1 GROUP BY region"}`,
+		`{"matches":true,"verdict":"The SQL counts customers per region as asked.","severity":"ok"}`,
 		`{"chart_type":"bar","x_axis_column":"region","y_axis_column":"cnt","title":"Customers by region"}`,
 		`{"narrative":"The dataset has sales across regions; North leads the count."}`,
 	)
@@ -512,10 +548,10 @@ func TestExecutorHappyPath(t *testing.T) {
 	}
 
 	all := steps.all()
-	if len(all) != 6 {
-		t.Fatalf("steps = %d, want 6", len(all))
+	if len(all) != 8 {
+		t.Fatalf("steps = %d, want 8", len(all))
 	}
-	wantNames := []domain.StepName{domain.StepPlan, domain.StepGenerateSQL, domain.StepStaticCheck, domain.StepExecute, domain.StepChartSpec, domain.StepNarrate}
+	wantNames := []domain.StepName{domain.StepPlan, domain.StepGenerateSQL, domain.StepStaticCheck, domain.StepExecute, domain.StepShadowCheck, domain.StepAdversarialReview, domain.StepChartSpec, domain.StepNarrate}
 	for i, name := range wantNames {
 		if all[i].StepName != name {
 			t.Errorf("step[%d] name = %s, want %s", i, all[i].StepName, name)
@@ -529,8 +565,8 @@ func TestExecutorHappyPath(t *testing.T) {
 	}
 
 	// Input chaining: the first model step gets no prior context, later steps get the previous
-	// step's JSON-encoded output verbatim — static_check and execute both consume the generate_sql
-	// output; chart_spec and narrate both consume the execute output.
+	// step's JSON-encoded output verbatim — static_check, execute, and adversarial_review consume
+	// the generate_sql output; shadow_check, chart_spec, and narrate consume the execute output.
 	if all[0].Input != "" {
 		t.Errorf("plan input = %q, want empty", all[0].Input)
 	}
@@ -544,10 +580,16 @@ func TestExecutorHappyPath(t *testing.T) {
 		t.Errorf("execute input = %q, want the generate_sql output %q", all[3].Input, all[1].Output)
 	}
 	if all[4].Input != all[3].Output {
-		t.Errorf("chart_spec input = %q, want the execute output %q", all[4].Input, all[3].Output)
+		t.Errorf("shadow_check input = %q, want the execute output %q", all[4].Input, all[3].Output)
 	}
-	if all[5].Input != all[3].Output {
-		t.Errorf("narrate input = %q, want the execute output %q", all[5].Input, all[3].Output)
+	if all[5].Input != all[1].Output {
+		t.Errorf("adversarial_review input = %q, want the generate_sql output %q", all[5].Input, all[1].Output)
+	}
+	if all[6].Input != all[3].Output {
+		t.Errorf("chart_spec input = %q, want the execute output %q", all[6].Input, all[3].Output)
+	}
+	if all[7].Input != all[3].Output {
+		t.Errorf("narrate input = %q, want the execute output %q", all[7].Input, all[3].Output)
 	}
 
 	var plan domain.PlanStepOutput
@@ -565,6 +607,30 @@ func TestExecutorHappyPath(t *testing.T) {
 	}
 	if len(scOut.Warnings) != 0 {
 		t.Errorf("static_check warnings = %+v, want none", scOut.Warnings)
+	}
+
+	// FEAT-031 shadow_check output must parse, and the count shadow matches the primary total.
+	var shadowOut ShadowCheckStepOutput
+	if err := json.Unmarshal([]byte(all[4].Output), &shadowOut); err != nil {
+		t.Fatalf("shadow_check output not parseable: %v", err)
+	}
+	if len(shadowOut.Checks) != 1 {
+		t.Fatalf("shadow_check checks = %+v, want one count check", shadowOut.Checks)
+	}
+	if shadowOut.Checks[0].Column != "cnt" || !shadowOut.Checks[0].Matched {
+		t.Errorf("shadow_check check = %+v, want the cnt column matched", shadowOut.Checks[0])
+	}
+	if shadowOut.Checks[0].PrimaryValue != 10 || shadowOut.Checks[0].ShadowValue != 10 {
+		t.Errorf("shadow_check values = %v/%v, want 10/10", shadowOut.Checks[0].PrimaryValue, shadowOut.Checks[0].ShadowValue)
+	}
+
+	// FEAT-032 adversarial_review output must parse, and the happy path's review passed.
+	var advOut AdversarialReviewStepOutput
+	if err := json.Unmarshal([]byte(all[5].Output), &advOut); err != nil {
+		t.Fatalf("adversarial_review output not parseable: %v", err)
+	}
+	if !advOut.Matches {
+		t.Errorf("adversarial_review = %+v, want a pass on the happy path", advOut)
 	}
 
 	var out domain.ExecuteStepOutput
@@ -585,32 +651,35 @@ func TestExecutorHappyPath(t *testing.T) {
 
 	// chart_spec (FEAT-016) output must parse as a ChartSpec.
 	var chartOut domain.ChartSpecStepOutput
-	if err := json.Unmarshal([]byte(all[4].Output), &chartOut); err != nil {
+	if err := json.Unmarshal([]byte(all[6].Output), &chartOut); err != nil {
 		t.Fatalf("chart_spec output not parseable: %v", err)
 	}
 	if chartOut.ChartSpec.ChartType != domain.ChartBar || chartOut.ChartSpec.XAxisColumn != "region" || chartOut.ChartSpec.YAxisColumn != "cnt" {
 		t.Errorf("chart_spec = %+v", chartOut.ChartSpec)
 	}
 
-	// The engine view is attached under the exact canonical table name before the query runs.
+	// The engine view is attached under the exact canonical table name before the query runs. The
+	// shadow check (FEAT-031) re-attaches the same view idempotently, so two statements exist and
+	// the first one is the execute step's attachment.
 	stmts := handle.statements()
-	if len(stmts) != 1 {
-		t.Fatalf("exec statements = %d, want 1: %v", len(stmts), stmts)
+	if len(stmts) < 1 {
+		t.Fatalf("exec statements = %d, want at least 1: %v", len(stmts), stmts)
 	}
 	wantPrefix := "CREATE OR REPLACE VIEW dataset_sales_data_q3_csv_d5f3e2a1 AS SELECT * FROM read_parquet('"
 	if !strings.HasPrefix(stmts[0], wantPrefix) || !strings.HasSuffix(stmts[0], ".parquet')") {
 		t.Errorf("view statement = %q, want prefix %q and a .parquet temp path", stmts[0], wantPrefix)
 	}
 
-	// Temp file cleanup: the path embedded in the view statement must no longer exist.
+	// Temp file cleanup: the path embedded in the first view statement must no longer exist.
 	tempPath := strings.TrimSuffix(strings.TrimPrefix(stmts[0], wantPrefix), ".parquet')")
 	if _, err := os.Stat(tempPath); !os.IsNotExist(err) {
 		t.Errorf("temp file %q still exists after the run, want cleanup", tempPath)
 	}
 
-	// Four model calls: plan, generate_sql, chart_spec, narrate.
-	if got := modelClient.callCount(); got != 4 {
-		t.Errorf("model calls = %d, want 4 (plan, generate_sql, chart_spec, narrate)", got)
+	// Five model calls: plan, generate_sql, adversarial_review, chart_spec, narrate. FEAT-032 is
+	// deliberately the only extra model call the verification stack adds.
+	if got := modelClient.callCount(); got != 5 {
+		t.Errorf("model calls = %d, want 5 (plan, generate_sql, adversarial_review, chart_spec, narrate)", got)
 	}
 	if got := audit.queryCount(); got != 1 {
 		t.Errorf("query-executed audit entries = %d, want 1", got)
@@ -630,7 +699,7 @@ func TestExecutorHappyPath(t *testing.T) {
 	}
 	// The report's narrative is exactly the narrate step's output.
 	var narrateOut domain.NarrateStepOutput
-	if err := json.Unmarshal([]byte(all[5].Output), &narrateOut); err != nil {
+	if err := json.Unmarshal([]byte(all[7].Output), &narrateOut); err != nil {
 		t.Fatalf("narrate output not parseable: %v", err)
 	}
 	if rep.Narrative != narrateOut.Narrative {
@@ -645,6 +714,9 @@ func TestExecutorHappyPath(t *testing.T) {
 	}
 	if rep.ProvenanceLinks == nil || len(rep.ProvenanceLinks) != 0 {
 		t.Errorf("report provenance_links = %v, want an empty array", rep.ProvenanceLinks)
+	}
+	if rep.ParentReportID != "" {
+		t.Errorf("report parent_report_id = %q, want empty — this run has no parent", rep.ParentReportID)
 	}
 }
 
@@ -669,11 +741,16 @@ func TestExecutorSeededSubmit(t *testing.T) {
 		// Reconciliation measurement needs a distinct count result; distinct from the main rows so
 		// the count(*) query drives a fresh cursor rather than exhausting the shared one.
 		countRows: [][]any{{int64(3)}},
+		// The SUM shadow (FEAT-031) recomputes SUM(amount) over the source table; returning the
+		// same total as the primary result makes the seeded check a clean match.
+		sumRows: [][]any{{float64(100)}},
 	}
 	executor.provider = &fakeProvider{handle: handle}
 
-	// Only chart_spec and narrate consume the model; plan and generate_sql are replaced by the seed.
+	// Three model calls: adversarial_review (FEAT-032) plus chart_spec and narrate; plan and
+	// generate_sql are replaced by the seed.
 	modelClient.enqueue(
+		`{"matches":true,"verdict":"The SQL answers the question.","severity":"ok"}`,
 		`{"chart_type":"bar","x_axis_column":"region","y_axis_column":"total","title":"Sales by region"}`,
 		`{"narrative":"North leads sales."}`,
 	)
@@ -687,10 +764,10 @@ func TestExecutorSeededSubmit(t *testing.T) {
 	}
 
 	all := steps.all()
-	if len(all) != 5 {
-		t.Fatalf("steps = %d, want 5 (generate_sql, static_check, execute, chart_spec, narrate)", len(all))
+	if len(all) != 7 {
+		t.Fatalf("steps = %d, want 7 (generate_sql, static_check, execute, shadow_check, adversarial_review, chart_spec, narrate)", len(all))
 	}
-	wantNames := []domain.StepName{domain.StepGenerateSQL, domain.StepStaticCheck, domain.StepExecute, domain.StepChartSpec, domain.StepNarrate}
+	wantNames := []domain.StepName{domain.StepGenerateSQL, domain.StepStaticCheck, domain.StepExecute, domain.StepShadowCheck, domain.StepAdversarialReview, domain.StepChartSpec, domain.StepNarrate}
 	for i, name := range wantNames {
 		if all[i].StepName != name || all[i].Status != domain.StepComplete {
 			t.Errorf("step[%d] = %s/%s, want %s complete", i, all[i].StepName, all[i].Status, name)
@@ -722,9 +799,18 @@ func TestExecutorSeededSubmit(t *testing.T) {
 		t.Errorf("engine queries = %v, want the seeded SQL %q among them", queried, edited)
 	}
 
-	// Two model calls only: chart_spec and narrate.
-	if got := modelClient.callCount(); got != 2 {
-		t.Errorf("model calls = %d, want 2 (chart_spec, narrate)", got)
+	// The SUM shadow check (FEAT-031) matched: primary total 100, shadow total 100.
+	var shadowOut ShadowCheckStepOutput
+	if err := json.Unmarshal([]byte(all[3].Output), &shadowOut); err != nil {
+		t.Fatalf("shadow_check output not parseable: %v", err)
+	}
+	if len(shadowOut.Checks) != 1 || shadowOut.Checks[0].Column != "total" || !shadowOut.Checks[0].Matched {
+		t.Errorf("shadow_check checks = %+v, want the total column matched", shadowOut.Checks)
+	}
+
+	// Three model calls only: adversarial_review, chart_spec, and narrate.
+	if got := modelClient.callCount(); got != 3 {
+		t.Errorf("model calls = %d, want 3 (adversarial_review, chart_spec, narrate)", got)
 	}
 
 	// A report still materializes for the seeded run.
@@ -922,6 +1008,7 @@ func TestExecutorFailsWhenChartSpecStepReturnsGarbage(t *testing.T) {
 	modelClient.enqueue(
 		`{"answerable":true,"reason":"","approach":"group by region"}`,
 		`{"sql":"SELECT region FROM dataset_sales_csv_d5f3e2a1"}`,
+		`{"matches":true,"verdict":"ok","severity":"ok"}`,
 		"definitely not json",
 	)
 
@@ -932,14 +1019,14 @@ func TestExecutorFailsWhenChartSpecStepReturnsGarbage(t *testing.T) {
 		t.Fatalf("run status = %s, want failed after unparseable chart_spec", got)
 	}
 	all := steps.all()
-	if len(all) != 5 {
-		t.Fatalf("steps = %d, want 5 (plan, generate_sql, static_check, execute, chart_spec)", len(all))
+	if len(all) != 7 {
+		t.Fatalf("steps = %d, want 7 (plan, generate_sql, static_check, execute, shadow_check, adversarial_review, chart_spec)", len(all))
 	}
-	if all[4].Status != domain.StepFailed {
-		t.Fatalf("chart_spec step status = %s, want failed", all[4].Status)
+	if all[6].Status != domain.StepFailed {
+		t.Fatalf("chart_spec step status = %s, want failed", all[6].Status)
 	}
-	if !strings.Contains(all[4].Output, "unparseable") {
-		t.Errorf("failed chart_spec output = %q, want it to name the parse failure", all[4].Output)
+	if !strings.Contains(all[6].Output, "unparseable") {
+		t.Errorf("failed chart_spec output = %q, want it to name the parse failure", all[6].Output)
 	}
 }
 
@@ -954,6 +1041,7 @@ func TestExecutorFailsWhenNarrateStepReturnsGarbage(t *testing.T) {
 	modelClient.enqueue(
 		`{"answerable":true,"reason":"","approach":"group by region"}`,
 		`{"sql":"SELECT region FROM dataset_sales_csv_d5f3e2a1"}`,
+		`{"matches":true,"verdict":"ok","severity":"ok"}`,
 		`{"chart_type":"table","x_axis_column":"region","y_axis_column":"","title":"Regions"}`,
 		"definitely not json",
 	)
@@ -965,14 +1053,14 @@ func TestExecutorFailsWhenNarrateStepReturnsGarbage(t *testing.T) {
 		t.Fatalf("run status = %s, want failed after unparseable narrate", got)
 	}
 	all := steps.all()
-	if len(all) != 6 {
-		t.Fatalf("steps = %d, want 6 (plan, generate_sql, static_check, execute, chart_spec, narrate)", len(all))
+	if len(all) != 8 {
+		t.Fatalf("steps = %d, want 8 (plan, generate_sql, static_check, execute, shadow_check, adversarial_review, chart_spec, narrate)", len(all))
 	}
-	if all[5].Status != domain.StepFailed {
-		t.Fatalf("narrate step status = %s, want failed", all[5].Status)
+	if all[7].Status != domain.StepFailed {
+		t.Fatalf("narrate step status = %s, want failed", all[7].Status)
 	}
-	if !strings.Contains(all[5].Output, "unparseable") {
-		t.Errorf("failed narrate output = %q, want it to name the parse failure", all[5].Output)
+	if !strings.Contains(all[7].Output, "unparseable") {
+		t.Errorf("failed narrate output = %q, want it to name the parse failure", all[7].Output)
 	}
 	if created := reports.created(); len(created) != 0 {
 		t.Errorf("created reports = %v, want none — a failed narrate must not materialize a report", created)
@@ -992,6 +1080,7 @@ func TestExecutorFailsWhenReportPersistenceFails(t *testing.T) {
 	modelClient.enqueue(
 		`{"answerable":true,"reason":"","approach":"group by region"}`,
 		`{"sql":"SELECT region FROM dataset_sales_csv_d5f3e2a1"}`,
+		`{"matches":true,"verdict":"ok","severity":"ok"}`,
 		`{"chart_type":"table","x_axis_column":"region","y_axis_column":"","title":"Regions"}`,
 		`{"narrative":"All regions are listed."}`,
 	)
@@ -1003,8 +1092,8 @@ func TestExecutorFailsWhenReportPersistenceFails(t *testing.T) {
 		t.Fatalf("run status = %s, want failed when report persistence fails", got)
 	}
 	all := steps.all()
-	if len(all) != 6 {
-		t.Fatalf("steps = %d, want 6 — chart_spec and narrate still completed", len(all))
+	if len(all) != 8 {
+		t.Fatalf("steps = %d, want 8 — the full verification pipeline completed before the failure", len(all))
 	}
 	for i, step := range all {
 		if step.Status != domain.StepComplete {

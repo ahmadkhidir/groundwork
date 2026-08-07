@@ -248,6 +248,26 @@ func parseFitRates(raw []byte) map[domain.InferredType]float64 {
 	return out
 }
 
+// UpdateExclusion overrides a column's excluded_from_model flag per FEAT-010 — the user's explicit
+// decision, on Workspace Settings' Column Visibility tab (screens/13), that this column must never
+// leave the trust boundary to the model.
+//
+// Exclusion governs EGRESS, not access: the column remains queryable by the engine (usable in a
+// WHERE clause, a join, an aggregate), only its name/values are withheld from every model payload by
+// the shared payload-construction seam (model.BuildPayload / BuildFactsPayload, which filter on
+// pii_flag OR excluded_from_model). That separation is exactly why the flag is a boolean write here
+// rather than a schema change: the query path never reads it.
+func (r *ColumnRepository) UpdateExclusion(ctx context.Context, id string, excluded bool) error {
+	_, err := r.pool.Exec(ctx,
+		`UPDATE columns SET excluded_from_model = $2 WHERE id = $1`,
+		id, excluded,
+	)
+	if err != nil {
+		return fmt.Errorf("updating column exclusion: %w", err)
+	}
+	return nil
+}
+
 // UpdatePII overrides a column's PII flag and detected pattern per FEAT-007 — the user's explicit
 // review decision on screens/07-ingest-confirmation.md. pattern is caller-resolved: empty when
 // clearing a flag (schema.md's Column.pii_pattern is "empty string if not flagged"), or a specific

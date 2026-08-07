@@ -94,3 +94,46 @@ func (r *RunRepository) UpdateStatus(ctx context.Context, id string, status doma
 	}
 	return nil
 }
+
+// ListByParentRun returns the runs forked from parentRunID, ordered by created_at DESC. Backs
+// FEAT-025's branch/tree presentation on the Run Viewer (the forks of a completed run are its
+// branches) and FEAT-021's compositional follow-up tree.
+//
+// Workspace scoping is deliberately absent from the SQL: the API handler has already proved the
+// caller owns the parent run (and thus its workspace) before calling, and every child row carries
+// the same workspace_id by construction (runs is workspace-keyed and a fork is only ever created
+// within its parent's workspace). Returning the id-only shape keeps this a cheap index scan.
+func (r *RunRepository) ListByParentRun(ctx context.Context, parentRunID string) ([]domain.Run, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT id, workspace_id, question_text, status, parent_run_id, created_at, completed_at
+		 FROM runs WHERE parent_run_id = $1 ORDER BY created_at ASC, id ASC`,
+		parentRunID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("listing forked runs: %w", err)
+	}
+	defer rows.Close()
+
+	var out []domain.Run
+	for rows.Next() {
+		var (
+			run         domain.Run
+			status      string
+			parentRunID *string
+			completedAt *time.Time
+		)
+		if err := rows.Scan(&run.ID, &run.WorkspaceID, &run.QuestionText, &status, &parentRunID, &run.CreatedAt, &completedAt); err != nil {
+			return nil, fmt.Errorf("scanning forked run: %w", err)
+		}
+		run.Status = domain.RunStatus(status)
+		if parentRunID != nil {
+			run.ParentRunID = *parentRunID
+		}
+		run.CompletedAt = completedAt
+		out = append(out, run)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating forked runs: %w", err)
+	}
+	return out, nil
+}

@@ -62,5 +62,5 @@ func (e *Executor) resume(ctx context.Context, userID, runID string) {
 		log.Warn("resume: loading ledger for plan inference", slog.String("error", err.Error()))
 	}
 
-	e.executePipeline(ctx, userID, run, nil, includePlan)
+	e.executePipeline(ctx, userID, run, nil, includePlan, "")
 }

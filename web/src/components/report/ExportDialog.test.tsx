@@ -234,15 +234,140 @@ describe("ExportDialog", () => {
     );
   });
 
-  it("describes a narrative-only report honestly (no chart) and still offers PDF", () => {
-    // Pro tier so both implemented formats are radios and the row count is unambiguous.
+  it("describes a narrative-only report honestly (no chart) and omits the Image row (screens/11 edge case)", () => {
+    // Pro tier so the gated rows are radios and the row count is unambiguous.
     renderDialog({ hasChart: false, tier: SubscriptionTier.Pro });
     expect(screen.getByText(/This report has no chart/)).toBeInTheDocument();
-    // screens/11: the Image-export row is omitted entirely for narrative-only reports. No Image row
-    // exists this phase (FEAT-040 is Phase 5), so the row count is exactly the two implemented
-    // formats.
-    const rows = screen.getAllByRole("radio");
-    expect(rows).toHaveLength(2);
+    // screens/11: the Image-export row is omitted entirely for narrative-only reports — never shown
+    // and then failing. The remaining rows (PDF, Excel/CSV, Markdown/HTML, JSON) all stay; the
+    // Team-only PowerPoint row is a locked div for a Pro user.
+    expect(screen.queryByText("Chart image")).not.toBeInTheDocument();
+    expect(screen.getAllByRole("radio")).toHaveLength(4);
+  });
+
+  it("shows all six format rows for a Pro user with a chart — PowerPoint locked, never hidden", () => {
+    renderDialog({ tier: SubscriptionTier.Pro, hasChart: true });
+    expect(screen.getByRole("radio", { name: /PDF/ })).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: /Excel\/CSV/ })).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: /Markdown\/HTML/ })).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: /JSON/ })).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: /Chart image/ })).toBeInTheDocument();
+
+    // PowerPoint is Team-only (monetization.md row 120): for Pro it renders as a locked row with
+    // the Upgrade Prompt, exactly like the Free-tier treatment of the other paid rows.
+    const pptxRow = screen.getByText("PowerPoint").closest("div[aria-disabled='true']");
+    expect(pptxRow).not.toBeNull();
+    const upgradeLink = within(pptxRow as HTMLElement).getByRole("link", {
+      name: /Upgrade to Pro\/Team/,
+    });
+    expect(upgradeLink).toHaveAttribute("href", "/workspaces/ws-1/settings");
+    expect(screen.getAllByRole("radio")).toHaveLength(5);
+  });
+
+  it("keeps every paid format row visible but not selectable for a Free user (never hidden)", () => {
+    renderDialog({ tier: SubscriptionTier.Free, hasChart: true });
+    for (const name of ["Excel/CSV", "PowerPoint", "Markdown/HTML", "JSON", "Chart image"]) {
+      const row = screen.getByText(name).closest("div[aria-disabled='true']");
+      expect(row).not.toBeNull();
+    }
+    // Only PDF is a selectable radio for a Free user; the rest are locked rows.
+    expect(screen.getAllByRole("radio")).toHaveLength(1);
+  });
+
+  it("lets a Team user select PowerPoint and export the deck", async () => {
+    const user = userEvent.setup();
+    fetchMock.mockResolvedValue(okResponse("customers.pptx"));
+    renderDialog({ tier: SubscriptionTier.Team });
+
+    await user.click(screen.getByRole("radio", { name: /PowerPoint/ }));
+    await user.click(screen.getByRole("button", { name: "Export" }));
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringContaining("/v1/workspaces/ws-1/reports/report-1/export?format=pptx"),
+        expect.objectContaining({ credentials: "include" }),
+      ),
+    );
+    await waitFor(() =>
+      expect(screen.getByRole("status")).toHaveTextContent("Export ready"),
+    );
+    expect(capturedAnchor?.download).toBe("customers.pptx");
+  });
+
+  it("exports Markdown by default from the Markdown/HTML row, with the variant picker shown", async () => {
+    const user = userEvent.setup();
+    fetchMock.mockResolvedValue(okResponse("report.md"));
+    renderDialog({ tier: SubscriptionTier.Pro });
+
+    await user.click(screen.getByRole("radio", { name: /Markdown\/HTML/ }));
+    // The inline variant picker appears only while the Markdown/HTML row is selected, defaulting
+    // to Markdown (the two server formats behind the one dialog row).
+    const variant = screen.getByRole("combobox", { name: "Markdown or HTML variant" });
+    expect(variant).toHaveValue("markdown");
+    await user.click(screen.getByRole("button", { name: "Export" }));
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringContaining("?format=markdown"),
+        expect.anything(),
+      ),
+    );
+    expect(capturedAnchor?.download).toBe("report.md");
+  });
+
+  it("switching the Markdown/HTML variant to HTML exports format=html", async () => {
+    const user = userEvent.setup();
+    fetchMock.mockResolvedValue(okResponse("report.html"));
+    renderDialog({ tier: SubscriptionTier.Pro });
+
+    await user.click(screen.getByRole("radio", { name: /Markdown\/HTML/ }));
+    await user.selectOptions(
+      screen.getByRole("combobox", { name: "Markdown or HTML variant" }),
+      "html",
+    );
+    await user.click(screen.getByRole("button", { name: "Export" }));
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringContaining("?format=html"),
+        expect.anything(),
+      ),
+    );
+    expect(capturedAnchor?.download).toBe("report.html");
+  });
+
+  it("lets a Pro user export the report as JSON", async () => {
+    const user = userEvent.setup();
+    fetchMock.mockResolvedValue(okResponse("report.json"));
+    renderDialog({ tier: SubscriptionTier.Pro });
+
+    await user.click(screen.getByRole("radio", { name: /JSON/ }));
+    await user.click(screen.getByRole("button", { name: "Export" }));
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringContaining("?format=json"),
+        expect.anything(),
+      ),
+    );
+    expect(capturedAnchor?.download).toBe("report.json");
+  });
+
+  it("lets a Pro user export the chart as a standalone image", async () => {
+    const user = userEvent.setup();
+    fetchMock.mockResolvedValue(okResponse("report-chart.svg"));
+    renderDialog({ tier: SubscriptionTier.Pro });
+
+    await user.click(screen.getByRole("radio", { name: /Chart image/ }));
+    await user.click(screen.getByRole("button", { name: "Export" }));
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringContaining("?format=image"),
+        expect.anything(),
+      ),
+    );
+    expect(capturedAnchor?.download).toBe("report-chart.svg");
   });
 });
 

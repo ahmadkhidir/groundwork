@@ -50,15 +50,20 @@ type DuplicateCheckStore interface {
 
 // RegisterUploadRoutes wires FEAT-003's endpoint onto r, plus FEAT-049's pre-upload filename
 // collision check.
+//
+// members backs the FEAT-045 access check: uploading is a mutation (requireWorkspaceMutationAccess —
+// a read-only member must not upload files per FEAT-045 AC2), while the duplicate-filename check is
+// a read (requireWorkspaceAccess).
 func RegisterUploadRoutes(
 	r chi.Router,
 	workspaces WorkspaceStore,
+	members MemberLookupStore,
 	datasets DatasetStore,
 	objects ObjectStore,
 	maxUploadBytes int64,
 	logger *slog.Logger,
 ) {
-	r.Post("/workspaces/{workspaceId}/files", handleUploadFiles(workspaces, datasets, objects, maxUploadBytes, logger))
+	r.Post("/workspaces/{workspaceId}/files", handleUploadFiles(workspaces, members, datasets, objects, maxUploadBytes, logger))
 }
 
 // RegisterDuplicateCheckRoute wires FEAT-049's GET /v1/workspaces/:id/files?filename= onto r.
@@ -68,8 +73,8 @@ func RegisterUploadRoutes(
 // DatasetStore's Create-only shape above — and api.go wires dependencies feature-by-feature; see that
 // file's Dependencies doc comment for why these seams stay narrow and separate even when one
 // DatasetRepository instance satisfies all of them.
-func RegisterDuplicateCheckRoute(r chi.Router, workspaces WorkspaceStore, datasets DuplicateCheckStore, logger *slog.Logger) {
-	r.Get("/workspaces/{workspaceId}/files", handleCheckFilename(workspaces, datasets, logger))
+func RegisterDuplicateCheckRoute(r chi.Router, workspaces WorkspaceStore, members MemberLookupStore, datasets DuplicateCheckStore, logger *slog.Logger) {
+	r.Get("/workspaces/{workspaceId}/files", handleCheckFilename(workspaces, members, datasets, logger))
 }
 
 // duplicateCheckResponse is screens/05-file-upload.md's Duplicate Filename dialog's data source: does
@@ -87,17 +92,17 @@ type duplicateCheckResponse struct {
 // the dialog only ever needs to know "does a collision exist" plus which one Replace would remove —
 // if "Keep both" has already produced more than one same-named dataset, the newest one is what a
 // third upload of the same name would be colliding with next.
-func handleCheckFilename(workspaces WorkspaceStore, datasets DuplicateCheckStore, logger *slog.Logger) http.HandlerFunc {
+func handleCheckFilename(workspaces WorkspaceStore, members MemberLookupStore, datasets DuplicateCheckStore, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
 			return
 		}
+
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+		if _, _, ok := requireWorkspaceAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
 			return
 		}
-
 		filename := r.URL.Query().Get("filename")
 		if filename == "" {
 			respondJSON(w, http.StatusBadRequest, map[string]string{
@@ -171,6 +176,7 @@ func toPublicDataset(ds domain.Dataset) *publicDataset {
 // per schema.md's "empty until ingest completes" convention until that wave lands.
 func handleUploadFiles(
 	workspaces WorkspaceStore,
+	members MemberLookupStore,
 	datasets DatasetStore,
 	objects ObjectStore,
 	maxUploadBytes int64,
@@ -183,7 +189,7 @@ func handleUploadFiles(
 		}
 
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+		if _, ok := requireWorkspaceMutationAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
 			return
 		}
 

@@ -6,9 +6,9 @@
  * boundary rather than widening the shared schema. They mirror the Go shapes in
  * server/internal/domain/run.go — keep them in lockstep.
  *
- * The Phase 2 steps plus FEAT-028's static_check exist here: plan, generate_sql, static_check,
- * execute. reconcile, shadow_check, adversarial_review, chart_spec, narrate, and assemble have no
- * payload shape on the client yet.
+ * The steps exist here: plan (with FEAT-033's clarification fields), generate_sql, static_check,
+ * execute, shadow_check (FEAT-031), and adversarial_review (FEAT-032). reconcile, chart_spec,
+ * narrate, and assemble have no payload shape on the client yet.
  */
 
 /** Parsed output of the "plan" step: whether the question is answerable, and how. */
@@ -18,6 +18,19 @@ export interface PlanStepOutput {
   reason?: string;
   /** Short approach for generate_sql, populated when `answerable` is true. */
   approach?: string;
+  /**
+   * FEAT-033 (Honest Uncertainty): true when the plan judged the question AMBIGUOUS and paused the
+   * run for a specific clarifying question instead of proceeding on a guess.
+   */
+  needs_clarification?: boolean;
+  /** The SPECIFIC clarifying question, e.g. "Do you mean revenue by total value or by order count?" */
+  clarification_question?: string;
+  /** Discrete resolution choices when the ambiguity has an enumerable set, e.g. ["By revenue", "By count"]. */
+  clarification_options?: string[];
+  /** Stable short key naming the ambiguity, used to not re-ask functionally identical follow-ups. */
+  ambiguity_key?: string;
+  /** The user's answer, written back into the plan output when the clarify endpoint resumes the run. */
+  clarification_answer?: string;
 }
 
 /** Parsed output of the "generate_sql" step: the SQL text that execute will run. */
@@ -50,6 +63,43 @@ export interface ExecuteStepOutput {
   /** One array per row, in `columns` order. */
   rows: ResultValue[][];
   row_count: number;
+}
+
+/**
+ * One FEAT-031 shadow-check result: an aggregate total cross-checked against an independently
+ * computed value. `matched: false` is a real disagreement surfaced to the user — never silently
+ * discarded.
+ */
+export interface ShadowCheck {
+  /** Result column (alias) whose values were cross-checked. */
+  column: string;
+  /** Aggregate total computed from the executed result set. */
+  primary_value: number;
+  /** Same aggregate recomputed directly over the source table (no join). */
+  shadow_value: number;
+  /** False when the two computations disagree beyond rounding tolerance. */
+  matched: boolean;
+  /** Plain-language explanation of the check's outcome. */
+  message: string;
+}
+
+/** Parsed output of the "shadow_check" step (FEAT-031). */
+export interface ShadowCheckStepOutput {
+  checks: ShadowCheck[];
+  /** Explains why no cross-check was computed. Empty when `checks` is non-empty. */
+  skipped_reason?: string;
+}
+
+/**
+ * Parsed output of the "adversarial_review" step (FEAT-032): the verdict of a separate model pass
+ * that saw ONLY the question and the SQL — never the results. A blocking mismatch fails the step
+ * (its `output` then holds the verdict as the failure reason); a warning mismatch completes the
+ * step with `matches: false, severity: "warning"` so the viewer can flag it.
+ */
+export interface AdversarialReviewStepOutput {
+  matches: boolean;
+  verdict: string;
+  severity?: "ok" | "warning" | "blocking";
 }
 
 /**
@@ -107,4 +157,24 @@ export function parseExecuteStep(output: string | undefined): ExecuteStepOutput 
     return null;
   }
   return parsed as ExecuteStepOutput;
+}
+
+/** Parses a shadow_check step's output, or null when it is absent or malformed (FEAT-031). */
+export function parseShadowCheckStep(output: string | undefined): ShadowCheckStepOutput | null {
+  const parsed = parseStepOutput("shadow_check", output);
+  if (parsed === null || !Array.isArray((parsed as ShadowCheckStepOutput).checks)) {
+    return null;
+  }
+  return parsed as ShadowCheckStepOutput;
+}
+
+/** Parses an adversarial_review step's output, or null when it is absent or malformed (FEAT-032). */
+export function parseAdversarialReviewStep(
+  output: string | undefined,
+): AdversarialReviewStepOutput | null {
+  const parsed = parseStepOutput("adversarial_review", output);
+  if (parsed === null || typeof (parsed as AdversarialReviewStepOutput).matches !== "boolean") {
+    return null;
+  }
+  return parsed as AdversarialReviewStepOutput;
 }

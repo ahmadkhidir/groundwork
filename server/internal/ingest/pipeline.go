@@ -115,11 +115,44 @@ type Pipeline struct {
 	// has no complete siblings, silently skipping FEAT-008 for that pair. Serializing per workspace
 	// means whichever dataset finishes second always observes the first as a complete sibling.
 	wsLocks map[string]*sync.Mutex
+
+	// notifications, when set, receives FEAT-026's `ingest_failed` durable notification on failure
+	// (best-effort — see WithNotifications). workspaceOwners resolves the owning user of a workspace
+	// so the notification can be addressed to the right account.
+	notifications   NotificationCreator
+	workspaceOwners WorkspaceOwnerLookup
+}
+
+// NotificationCreator is the narrow FEAT-026 event-source seam the pipeline uses to record an
+// `ingest_failed` durable notification, satisfied by postgres.NotificationRepository. Deliberately
+// Create-only: the ingest package must never read or acknowledge notifications.
+type NotificationCreator interface {
+	Create(ctx context.Context, n domain.Notification) error
+}
+
+// WorkspaceOwnerLookup resolves the owner of a workspace, satisfied by
+// postgres.WorkspaceRepository.GetByID. The pipeline needs the owner so an ingest failure
+// notification can be addressed to the right user — a Dataset row knows its workspace but not its
+// owner.
+type WorkspaceOwnerLookup interface {
+	GetByID(ctx context.Context, id string) (domain.Workspace, error)
+}
+
+// WithNotifications wires FEAT-026's ingest-failure notifications into a Pipeline. Optional:
+// without it (nil), a failed ingest is logged exactly as before and no notification is written.
+// The write is best-effort either way — a notification-write failure logs and continues, because
+// the persisted failure state is the primary record and a missed notification is a convenience
+// loss, not data loss.
+func WithNotifications(notifications NotificationCreator, workspaceOwners WorkspaceOwnerLookup) func(*Pipeline) {
+	return func(p *Pipeline) {
+		p.notifications = notifications
+		p.workspaceOwners = workspaceOwners
+	}
 }
 
 // NewPipeline constructs a Pipeline.
-func NewPipeline(datasets DatasetStore, objects ObjectStore, engines EngineProvider, columns ColumnStore, joins CandidateJoinStore, tracker *Tracker, logger *slog.Logger) *Pipeline {
-	return &Pipeline{
+func NewPipeline(datasets DatasetStore, objects ObjectStore, engines EngineProvider, columns ColumnStore, joins CandidateJoinStore, tracker *Tracker, logger *slog.Logger, opts ...func(*Pipeline)) *Pipeline {
+	p := &Pipeline{
 		datasets: datasets,
 		objects:  objects,
 		engines:  engines,
@@ -130,6 +163,10 @@ func NewPipeline(datasets DatasetStore, objects ObjectStore, engines EngineProvi
 		tempDir:  os.TempDir(),
 		wsLocks:  make(map[string]*sync.Mutex),
 	}
+	for _, opt := range opts {
+		opt(p)
+	}
+	return p
 }
 
 // workspaceLock returns the mutex serializing relationship-inference-and-completion for workspaceID,
@@ -508,6 +545,24 @@ func (p *Pipeline) fail(ctx context.Context, ds domain.Dataset, reason string) {
 		slog.String("workspace_id", ds.WorkspaceID),
 		slog.String("reason", reason),
 	)
+
+	// FEAT-026 event source: `ingest_failed` durable notification. Best-effort by design — the
+	// persisted failure state above is the primary record, and a notification-write failure (or a
+	// missing workspace-owner lookup) is a convenience loss, never a reason to fail ingest harder.
+	if p.notifications != nil && p.workspaceOwners != nil {
+		ws, err := p.workspaceOwners.GetByID(ctx, ds.WorkspaceID)
+		if err == nil {
+			if nerr := p.notifications.Create(ctx, domain.Notification{
+				UserID:            ws.OwnerID,
+				Type:              domain.NotifyIngestFailed,
+				Message:           fmt.Sprintf("Ingest failed for %q. %s", ds.OriginalFilename, reason),
+				RelatedEntityType: domain.RelatedDataset,
+				RelatedEntityID:   ds.ID,
+			}); nerr != nil {
+				p.logger.Error("ingest: creating ingest_failed notification", slog.String("dataset_id", ds.ID), slog.String("error", nerr.Error()))
+			}
+		}
+	}
 }
 
 // StateFor resolves the best-known live state for datasetID: the Tracker's in-memory entry if this

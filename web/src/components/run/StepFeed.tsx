@@ -1,8 +1,12 @@
-import { AlertTriangle, CheckCircle2, Circle, Loader2, PauseCircle, XCircle } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Circle, Loader2, PauseCircle, ShieldAlert, ShieldCheck, XCircle } from "lucide-react";
 import type { ReactNode } from "react";
 import type { Step, StepStatus } from "@/types/schema";
 import { STEP_NAMES } from "@/types/schema";
-import { parseStaticCheckStep } from "@/components/run/step-payloads";
+import {
+  parseAdversarialReviewStep,
+  parseShadowCheckStep,
+  parseStaticCheckStep,
+} from "@/components/run/step-payloads";
 
 export interface StepFeedProps {
   steps: Step[];
@@ -81,6 +85,72 @@ function renderStaticCheckWarnings(step: Step): ReactNode | null {
   );
 }
 
+/**
+ * Renders a completed shadow_check step's cross-checks (FEAT-031). Each check is shown honestly:
+ * a matched total reads as a quiet confirmation, a MISMATCH is surfaced with warning styling —
+ * never silently discarded (AC2). When the check was skipped (no aggregate, or an unparseable
+ * shape), the skipped_reason explains why rather than leaving the row empty.
+ */
+function renderShadowCheck(step: Step): ReactNode | null {
+  const payload = parseShadowCheckStep(step.output);
+  if (payload === null) return null;
+  if (payload.checks.length === 0) {
+    if (!payload.skipped_reason) return null;
+    return (
+      <p className="mt-1 rounded-md bg-surface-secondary px-2 py-1.5 text-body-small text-text-secondary">
+        {payload.skipped_reason}
+      </p>
+    );
+  }
+  return (
+    <ul className="mt-1 flex flex-col gap-1">
+      {payload.checks.map((check, i) => (
+        <li
+          key={`${check.column}-${i}`}
+          className={`flex items-start gap-1.5 rounded-md px-2 py-1.5 ${
+            check.matched ? "bg-surface-secondary" : "bg-warning/12"
+          }`}
+        >
+          {check.matched ? (
+            <CheckCircle2 size={14} className="mt-[3px] shrink-0 text-success" aria-hidden="true" />
+          ) : (
+            <AlertTriangle size={14} className="mt-[3px] shrink-0 text-warning" aria-hidden="true" />
+          )}
+          <p className="text-body-small text-text-primary">{check.message}</p>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/**
+ * Renders a completed adversarial_review step's verdict (FEAT-032). A passing review reads as a
+ * quiet confirmation; a warning-severity mismatch is flagged with warning styling (it does not
+ * block, so the viewer must still surface it). A blocking mismatch fails the step itself, whose
+ * failed-output rendering already shows the verdict.
+ */
+function renderAdversarialReview(step: Step): ReactNode | null {
+  const payload = parseAdversarialReviewStep(step.output);
+  if (payload === null) return null;
+  const flag = !payload.matches && payload.severity === "warning";
+  return (
+    <p
+      className={`mt-1 flex items-start gap-1.5 rounded-md px-2 py-1.5 ${
+        flag ? "bg-warning/12" : "bg-surface-secondary"
+      }`}
+    >
+      {flag ? (
+        <ShieldAlert size={14} className="mt-[3px] shrink-0 text-warning" aria-hidden="true" />
+      ) : (
+        <ShieldCheck size={14} className="mt-[3px] shrink-0 text-success" aria-hidden="true" />
+      )}
+      <span className={`text-body-small ${flag ? "text-text-primary" : "text-text-secondary"}`}>
+        {payload.verdict}
+      </span>
+    </p>
+  );
+}
+
 export function StepFeed({ steps }: StepFeedProps) {
   if (steps.length === 0) {
     return <p className="text-body-small text-text-secondary">Waiting for the run to begin…</p>;
@@ -116,6 +186,12 @@ export function StepFeed({ steps }: StepFeedProps) {
             ) : null}
             {step.step_name === "static_check" && step.status === "complete"
               ? renderStaticCheckWarnings(step)
+              : null}
+            {step.step_name === "shadow_check" && step.status === "complete"
+              ? renderShadowCheck(step)
+              : null}
+            {step.step_name === "adversarial_review" && step.status === "complete"
+              ? renderAdversarialReview(step)
               : null}
           </div>
         </li>

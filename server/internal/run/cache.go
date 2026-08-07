@@ -20,22 +20,22 @@ import (
 )
 
 // tryCacheHit is the FEAT-027 determinism-cache fast path: if a deterministically identical run
-// (same question, same schema, same seed SQL) already completed, replay its persisted outputs and
+// (same question, same schema, same seed) already completed, replay its persisted outputs and
 // finish WITHOUT waking the engine or asking the model.
+//
+// seed is the cache-key seed computed by executePipeline: the user's edited SQL for a seeded run,
+// a "clarify:"-prefixed FEAT-033 clarification answer for a clarified run, or "" for a plain
+// question run.
 //
 // It returns true only when the cached run was fully replayed and marked complete; on a miss
 // (orchestrator.ErrCacheMiss), a hash/store failure, or ANY error mid-replay it logs and returns
 // false so the caller falls through to normal execution. Caching is a best-effort accelerator, never
 // a correctness gate — the cache can fail and the run still executes correctly.
-func (e *Executor) tryCacheHit(ctx context.Context, sc stepContext, userID string, run domain.Run, seedSQL *string, log *slog.Logger) bool {
+func (e *Executor) tryCacheHit(ctx context.Context, sc stepContext, userID string, run domain.Run, seed string, log *slog.Logger) bool {
 	qHash, schemaHash, err := e.cacheDigest(ctx, sc.workspaceID, run.QuestionText)
 	if err != nil {
 		log.Warn("cache: hashing run", slog.String("error", err.Error()))
 		return false
-	}
-	seed := ""
-	if seedSQL != nil {
-		seed = *seedSQL
 	}
 
 	record, err := e.cache.Get(ctx, sc.workspaceID, qHash, schemaHash, seed)
@@ -66,9 +66,16 @@ func (e *Executor) tryCacheHit(ctx context.Context, sc stepContext, userID strin
 //
 // Pass-1 boundary (recorded in the wave report): the cache key gates on schema SHAPE (columns, types,
 // metrics, relationships), not the underlying data rows — so a replaced Parquet with identical shape
-// still matches. SeedSQL is part of the key, so an edited-SQL run never shadows the original
-// question's answer.
-func (e *Executor) rememberCache(ctx context.Context, sc stepContext, run domain.Run, seedSQL *string, planOutput, generateSQLOutput, executeOutput, chartSpecOutput, narrateOutput string, reconcile domain.ReconciliationSummary) error {
+// still matches. seed is executePipeline's cache-key seed (edited SQL, "clarify:"-prefixed
+// clarification answer, or ""), so an edited-SQL run never shadows the original question's answer
+// and a clarified run never shadows an unclarified one.
+//
+// FEAT-031/032 note (Phase 5 boundary, recorded in the wave report): the shadow_check and
+// adversarial_review step outputs are deliberately NOT cached. Replaying a cached run replays the
+// outputs of the SOURCE run — which was already verified before it was cached — so the verification
+// steps are not re-run on a hit, and the cache.hit banner tells the viewer the answer is replayed,
+// not freshly computed.
+func (e *Executor) rememberCache(ctx context.Context, sc stepContext, run domain.Run, seed, planOutput, generateSQLOutput, executeOutput, chartSpecOutput, narrateOutput string, reconcile domain.ReconciliationSummary) error {
 	qHash, schemaHash, err := e.cacheDigest(ctx, sc.workspaceID, run.QuestionText)
 	if err != nil {
 		return err
@@ -76,10 +83,6 @@ func (e *Executor) rememberCache(ctx context.Context, sc stepContext, run domain
 	reconcileJSON, err := json.Marshal(reconcile)
 	if err != nil {
 		return fmt.Errorf("encoding reconciliation summary: %w", err)
-	}
-	seed := ""
-	if seedSQL != nil {
-		seed = *seedSQL
 	}
 	record := orchestrator.CacheRecord{
 		WorkspaceID:        sc.workspaceID,

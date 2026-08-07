@@ -1,21 +1,23 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WorkspaceSettingsScreen } from "./WorkspaceSettingsScreen";
 import { ApiError, api } from "@/lib/api-client";
 import { deletionProofStorageKey } from "./DeletedProofScreen";
+import { SubscriptionTier } from "@/types/schema";
 
 vi.mock("@/lib/api-client", async () => {
   const actual =
     await vi.importActual<typeof import("@/lib/api-client")>("@/lib/api-client");
   return {
     ...actual,
-    api: { ...actual.api, get: vi.fn(), delete: vi.fn() },
+    api: { ...actual.api, get: vi.fn(), delete: vi.fn(), post: vi.fn(), patch: vi.fn() },
   };
 });
 
 const getMock = vi.mocked(api.get);
 const deleteMock = vi.mocked(api.delete);
+const postMock = vi.mocked(api.post);
 
 // A stable object, not a fresh literal per call: Next's real useRouter() returns a referentially
 // stable router, and tests that assert on the mock's calls would otherwise accumulate.
@@ -24,7 +26,15 @@ vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: pushMock }),
 }));
 
-const WORKSPACE = { id: "ws-1", name: "Q3 Numbers" };
+const WORKSPACE = {
+  id: "ws-1",
+  name: "Q3 Numbers",
+  owner_id: "user-1",
+  engine_status: "sleeping",
+  created_at: "2026-08-01T00:00:00Z",
+  updated_at: "2026-08-01T00:00:00Z",
+  has_datasets: true,
+};
 
 const PROOF = {
   id: "proof-1",
@@ -40,20 +50,51 @@ const PROOF = {
   completed_at: "2026-08-07T14:30:00Z",
 };
 
+/** Routes the GET mock by path so each real tab's fetch resolves with its own shape. */
+function mockGetByPath() {
+  getMock.mockImplementation((path: string) => {
+    if (path === "/v1/workspaces/ws-1") {
+      return Promise.resolve({ workspace: WORKSPACE });
+    }
+    if (path === "/v1/workspaces/ws-1/columns") {
+      return Promise.resolve({ columns: [] });
+    }
+    if (path === "/v1/workspaces/ws-1/semantic-layer/metrics") {
+      return Promise.resolve({ metric_definitions: [] });
+    }
+    if (path === "/v1/workspaces/ws-1/usage") {
+      return Promise.resolve({
+        usage: { records: [], totals: { engine_seconds: 0, storage_bytes: 0, model_tokens: 0 } },
+      });
+    }
+    if (path === "/v1/workspaces/ws-1/members") {
+      return Promise.resolve({ members: [] });
+    }
+    if (path === "/v1/workspaces/ws-1/report-shares") {
+      return Promise.resolve({ shares: [] });
+    }
+    if (path.startsWith("/v1/workspaces/ws-1/reports?")) {
+      return Promise.resolve({ reports: [] });
+    }
+    return Promise.resolve({});
+  });
+}
+
 describe("WorkspaceSettingsScreen", () => {
   beforeEach(() => {
     getMock.mockReset();
     deleteMock.mockReset();
+    postMock.mockReset();
     pushMock.mockReset();
-    getMock.mockResolvedValue({ workspace: WORKSPACE });
+    mockGetByPath();
   });
 
   afterEach(() => {
     sessionStorage.clear();
   });
 
-  it("renders the five settings tabs with the Audit Log tab active by default", () => {
-    render(<WorkspaceSettingsScreen workspaceId="ws-1" />);
+  it("renders the five settings tabs with the Audit Log tab active by default", async () => {
+    render(<WorkspaceSettingsScreen workspaceId="ws-1" userTier={SubscriptionTier.Free} />);
 
     expect(
       screen.getByRole("heading", { level: 1, name: "Workspace Settings" }),
@@ -83,25 +124,67 @@ describe("WorkspaceSettingsScreen", () => {
     ).toHaveAttribute("href", "/workspaces/ws-1/audit-log");
   });
 
-  it("switches tabs and shows later-phase states, with no fake controls", () => {
+  it("renders the Column Visibility tab with an honest empty state (FEAT-010)", async () => {
+    const user = userEvent.setup();
     render(<WorkspaceSettingsScreen workspaceId="ws-1" />);
 
-    fireEvent.click(screen.getByRole("tab", { name: "Usage" }));
-    expect(screen.getByRole("tab", { name: "Usage" })).toHaveAttribute(
-      "aria-selected",
-      "true",
+    await user.click(screen.getByRole("tab", { name: "Column Visibility" }));
+
+    expect(getMock).toHaveBeenCalledWith("/v1/workspaces/ws-1/columns");
+    await waitFor(() =>
+      expect(screen.getByText("No columns yet")).toBeInTheDocument(),
     );
-    expect(screen.getByText(/FEAT-047/)).toBeInTheDocument();
+  });
 
-    fireEvent.click(screen.getByRole("tab", { name: "Column Visibility" }));
-    expect(screen.getByText(/FEAT-010/)).toBeInTheDocument();
+  it("locks the Sharing sections behind the tier (FEAT-045/FEAT-046 upgrade prompts)", async () => {
+    const user = userEvent.setup();
+    render(<WorkspaceSettingsScreen workspaceId="ws-1" userTier={SubscriptionTier.Free} />);
 
-    fireEvent.click(screen.getByRole("tab", { name: "Sharing" }));
-    expect(screen.getByText(/FEAT-045, FEAT-046/)).toBeInTheDocument();
+    await user.click(screen.getByRole("tab", { name: "Sharing" }));
 
-    // No deletion or management control exists on the later-phase tabs.
-    expect(screen.queryByRole("button", { name: /Delete/ })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /Remove/ })).not.toBeInTheDocument();
+    expect(screen.getByText(/Workspace sharing is available on the Team plan/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/Shared report links are available on the Pro and Team plans/),
+    ).toBeInTheDocument();
+    // Locked sections never fetch their data.
+    expect(getMock).not.toHaveBeenCalledWith("/v1/workspaces/ws-1/members");
+    expect(getMock).not.toHaveBeenCalledWith("/v1/workspaces/ws-1/report-shares");
+  });
+
+  it("renders the Usage tab stat rows (FEAT-047)", async () => {
+    const user = userEvent.setup();
+    render(<WorkspaceSettingsScreen workspaceId="ws-1" userTier={SubscriptionTier.Free} />);
+
+    await user.click(screen.getByRole("tab", { name: "Usage" }));
+
+    expect(getMock).toHaveBeenCalledWith("/v1/workspaces/ws-1/usage");
+    await waitFor(() => expect(screen.getByText("Engine time")).toBeInTheDocument());
+    expect(screen.getByText("Storage")).toBeInTheDocument();
+    expect(screen.getByText("Model tokens")).toBeInTheDocument();
+  });
+
+  it("a read-only shared member sees only the Usage tab and their access level (FEAT-045)", async () => {
+    render(
+      <WorkspaceSettingsScreen
+        workspaceId="ws-1"
+        userId="user-2"
+        userTier={SubscriptionTier.Free}
+      />,
+    );
+
+    await waitFor(() => expect(screen.getByText(/Read-only access/)).toBeInTheDocument());
+
+    // Column Visibility, Sharing management, Audit Log, and Danger Zone are hidden entirely, not
+    // just disabled (screens/13).
+    const tabs = screen.getAllByRole("tab");
+    expect(tabs.map((tab) => tab.textContent)).toEqual(["Usage"]);
+    expect(screen.queryByRole("tab", { name: "Danger Zone" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("tab", { name: "Column Visibility" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("tab", { name: "Sharing" })).not.toBeInTheDocument();
+
+    // The Usage tab is selected and rendered for the read-only member.
+    expect(screen.getByRole("tab", { name: "Usage" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByText("Engine time")).toBeInTheDocument();
   });
 
   it("keeps the back navigation to the workspace home", () => {

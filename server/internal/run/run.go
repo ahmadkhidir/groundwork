@@ -1,19 +1,23 @@
-// Package run implements FEAT-013's linear persisted executor: the component that takes a created
-// run and advances it — engine wake, plan, generate_sql, execute, chart_spec, narrate, then Report
-// materialization — writing every boundary to real runs/steps rows as it goes.
+// Package run implements the persisted executor: the component that takes a created run and
+// advances it — engine wake, plan, generate_sql, static_check, execute, shadow_check (FEAT-031),
+// adversarial_review (FEAT-032), chart_spec, narrate, then Report materialization — writing every
+// boundary to real runs/steps rows as it goes.
 //
 // This is the Phase 2 boundary in concrete form (IMPLEMENTATION.md "Phase 2 boundary assumptions"):
-// a LINEAR executor with no leases, heartbeats, forks, or resume. A step is created the moment its
-// work begins and completed or failed in a single follow-up write; the per-step idempotency key
-// (runID:stepName) is persisted so the schema's retry-safety guarantee is present from day one, but
-// no retry machinery runs this wave. static_check, reconcile, shadow_check, adversarial_review, and
-// assemble are Phase 3/5 and deliberately not implemented here.
+// a LINEAR executor with no leases, heartbeats, or resume (resume arrived with FEAT-022). A step is
+// created the moment its work begins and completed or failed in a single follow-up write; the
+// per-step idempotency key (runID:stepName) is persisted so the schema's retry-safety guarantee is
+// present, and the orchestrator step machine replays completed work on resume (FEAT-022). reconcile
+// is measured inside execute (its data folds into the Report) rather than as its own step row, and
+// assemble is the Report materialization itself; both follow architecture.md's PipelineOrder.
 //
 // This package is the ONLY route to the model that exists at runtime: the executor builds every
 // metadata payload through model.BuildPayload and every facts payload through model.BuildFactsPayload
 // (the two shared construction functions risk_log.md R-016 requires — see model/payload.go's package
 // doc for why the type system enforces them) and transmits them through model.Client, which writes
-// the egress log in the same code path as the outbound call (behavior rule 7).
+// the egress log in the same code path as the outbound call (behavior rule 7). The one verification
+// layer with an extra model call is adversarial_review (FEAT-032 AC3); shadow_check (FEAT-031) is
+// deterministic engine computation only.
 package run
 
 import (
@@ -87,8 +91,13 @@ type ColumnStore interface {
 // the executor writes the Report row itself, in the same completion path — a completed run without
 // its Report is a corrupt state, so a persistence failure here fails the run rather than being
 // swallowed.
+//
+// GetByRunID backs FEAT-021/FEAT-025's parent-report linkage: a forked run's report records its
+// parent report by resolving the run's parent_run_id to the parent run's materialized report (empty
+// when the parent has none yet — the link is honest, never fabricated).
 type ReportStore interface {
 	Create(ctx context.Context, report domain.Report) error
+	GetByRunID(ctx context.Context, workspaceID, runID string) (domain.Report, error)
 }
 
 // ProvenanceStore persists and reads claim-level provenance links (FEAT-030). Satisfied by
@@ -321,8 +330,9 @@ func (e *Executor) Submit(userID string, run domain.Run) {
 //
 // The seeded path deliberately skips plan and the model's generate_sql call entirely: the edited
 // query IS the plan, so no plan step row is created and no model round-trip decides what to run. The
-// run then continues through the same execute → chart_spec → narrate → report materialization tail
-// as a normal run, so the resulting Report is built from exactly the edited query's result set.
+// run then continues through the same execute → shadow_check → adversarial_review → chart_spec →
+// narrate → report materialization tail as a normal run, so the resulting Report is built from
+// exactly the edited query's result set.
 //
 // sql is trimmed before being persisted; a whitespace-only value fails the run at the generate_sql
 // step with an honest message rather than executing nothing.
@@ -350,32 +360,46 @@ type stepContext struct {
 // execute advances run through its pipeline: wake the engine, plan, generate_sql, execute, then a
 // single terminal status. It is the normal (model-driven) path; see executeSeeded for FEAT-018.
 func (e *Executor) execute(ctx context.Context, userID string, run domain.Run) {
-	e.executePipeline(ctx, userID, run, nil, true)
+	e.executePipeline(ctx, userID, run, nil, true, "")
 }
 
 // executeSeeded is the FEAT-018 path: the run's generate_sql step is seeded with the user's edited
 // SQL instead of being produced by plan + the model. includePlan is false (no plan step row).
 func (e *Executor) executeSeeded(ctx context.Context, userID string, run domain.Run, sql string) {
-	e.executePipeline(ctx, userID, run, &sql, false)
+	e.executePipeline(ctx, userID, run, &sql, false, "")
 }
 
 // executePipeline advances run through its pipeline to a single terminal status. seedSQL is nil for
 // a normal run (plan → model generate_sql) and non-nil for FEAT-018's edited-SQL path (generate_sql
 // seeded directly, plan skipped entirely). includePlan is true for a normal run (a plan step exists)
 // and false for a seeded run or for a resume whose plan step was never persisted (it has already
-// completed generate_sql). Every branch that cannot continue marks the run failed (FEAT-022: the
-// pipeline is idempotent+resumable — every step is skipped when a completed row already exists, so
-// re-entering it (Resume) replays done work and only executes from the first unfinished step).
-func (e *Executor) executePipeline(ctx context.Context, userID string, run domain.Run, seedSQL *string, includePlan bool) {
+// completed generate_sql). clarification is the user's FEAT-033 answer when this execution resumes a
+// run that paused for a clarifying question ("" otherwise); it is folded into the determinism-cache
+// seed so a clarified execution never replays — or shadows — an unclarified one. Every branch that
+// cannot continue marks the run failed (FEAT-022: the pipeline is idempotent+resumable — every step
+// is skipped when a completed row already exists, so re-entering it (Resume) replays done work and
+// only executes from the first unfinished step).
+func (e *Executor) executePipeline(ctx context.Context, userID string, run domain.Run, seedSQL *string, includePlan bool, clarification string) {
 	log := e.logger.With(slog.String("run_id", run.ID), slog.String("workspace_id", run.WorkspaceID))
 	sc := stepContext{runID: run.ID, workspaceID: run.WorkspaceID, userID: userID}
+
+	// The determinism-cache key folds the seed SQL and any clarification answer into one seed slot
+	// (see tryCacheHit/rememberCache): identical question + schema + seed replay; anything different
+	// executes fresh.
+	cacheSeed := ""
+	if seedSQL != nil {
+		cacheSeed = *seedSQL
+	}
+	if c := clarificationCacheSeed(clarification); c != "" {
+		cacheSeed = c
+	}
 
 	// Determinism cache fast-path (FEAT-027): if a deterministically-identical run already completed
 	// (same question, same schema, and — for edited SQL — same seed), replay its persisted outputs
 	// and finish WITHOUT waking the engine or asking the model. Caching is best-effort: any hash
 	// failure or store error logs and falls through to a normal execution.
 	if e.cache != nil {
-		if e.tryCacheHit(ctx, sc, userID, run, seedSQL, log) {
+		if e.tryCacheHit(ctx, sc, userID, run, cacheSeed, log) {
 			return
 		}
 	}
@@ -430,7 +454,7 @@ func (e *Executor) executePipeline(ctx context.Context, userID string, run domai
 	// empty string when the user's edited SQL is the plan (or when a resume continues past plan).
 	// The rest of the pipeline is identical.
 	var generateSQLOutput string
-	var planOutput string
+	var planJSON string
 	if seedSQL != nil {
 		// FEAT-018 seeded path: no plan step row and no model generate_sql call. The user's exact
 		// edited SQL is persisted as the generate_sql step output, so the Run Viewer and the Report
@@ -446,9 +470,9 @@ func (e *Executor) executePipeline(ctx context.Context, userID string, run domai
 	} else {
 		// plan — only when this execution owns a plan step. Resuming a seeded run (or a run
 		// interrupted after generate_sql) must not fabricate a plan row that never existed.
-		var plan domain.PlanStepOutput
+		var plan planOutput
 		if includePlan {
-			planOutput, err = e.execStep(ctx, sc, domain.StepPlan, "", log, func() (string, error) {
+			planJSON, err = e.execStep(ctx, sc, domain.StepPlan, "", log, func() (string, error) {
 				return e.runPlan(ctx, sc, run, log)
 			})
 			if err != nil {
@@ -457,15 +481,29 @@ func (e *Executor) executePipeline(ctx context.Context, userID string, run domai
 				return
 			}
 
-			if err := json.Unmarshal([]byte(planOutput), &plan); err != nil {
+			if err := json.Unmarshal([]byte(planJSON), &plan); err != nil {
 				log.Error("parsing plan output", slog.String("error", err.Error()))
 				e.stepFailed(ctx, log, run)
 				return
 			}
 
-			// FEAT-033 boundary (Phase 2 form): an ambiguous or unanswerable question fails the run
-			// with a plain-language reason rather than proceeding to generate_sql on a guess. The
-			// reason lives in the completed plan step's output, where the Run Viewer reads it verbatim.
+			// FEAT-033 (Honest Uncertainty): a question the plan judges ambiguous pauses the run
+			// with a specific clarifying question (screen 12) instead of proceeding to generate_sql
+			// on a guess — and instead of the Phase 2 behavior of failing with a plain message. The
+			// run is settled to halted (the paused state); the clarify endpoint answers it and this
+			// pipeline re-enters with the answer in the plan output. The answer guard is what lets a
+			// resumed (already-clarified) run sail past this branch.
+			if plan.awaitingClarification() {
+				log.Info("run paused: awaiting clarification", slog.String("question", plan.ClarificationQuestion))
+				if err := e.setRunStatus(ctx, log, run.ID, domain.RunHalted); err != nil {
+					log.Error("marking run halted for clarification", slog.String("error", err.Error()))
+				}
+				return
+			}
+
+			// A genuinely unanswerable question (data missing, no column that records what was
+			// asked) still fails the run with a plain-language reason rather than proceeding to
+			// generate_sql on a guess — the distinction from an ambiguity is the plan's own call.
 			if !plan.Answerable {
 				reason := plan.Reason
 				if strings.TrimSpace(reason) == "" {
@@ -478,7 +516,7 @@ func (e *Executor) executePipeline(ctx context.Context, userID string, run domai
 		}
 
 		// generate_sql — if already completed (a resume after a crash), EnsureStep replays its output.
-		generateSQLOutput, err = e.execStep(ctx, sc, domain.StepGenerateSQL, planOutput, log, func() (string, error) {
+		generateSQLOutput, err = e.execStep(ctx, sc, domain.StepGenerateSQL, planJSON, log, func() (string, error) {
 			return e.runGenerateSQL(ctx, sc, run, plan, log)
 		})
 		if err != nil {
@@ -522,6 +560,30 @@ func (e *Executor) executePipeline(ctx context.Context, userID string, run domai
 	var executeOut domain.ExecuteStepOutput
 	if err := json.Unmarshal([]byte(executeOutput), &executeOut); err != nil {
 		log.Error("parsing execute output", slog.String("error", err.Error()))
+		e.stepFailed(ctx, log, run)
+		return
+	}
+
+	// shadow_check (FEAT-031, Verification Layer 4): an independent, deterministic cross-check of
+	// the aggregate's totals, recomputed directly over the source table — no extra model call (AC3).
+	// A disagreement is persisted in the step output and surfaced in the Run Viewer; it never blocks
+	// (the analysis is advisory, like static_check).
+	if _, err := e.execStep(ctx, sc, domain.StepShadowCheck, executeOutput, log, func() (string, error) {
+		return e.runShadowCheck(ctx, sc, handle, genSQL.SQL, executeOut, log)
+	}); err != nil {
+		log.Error("shadow_check step failed", slog.String("error", err.Error()))
+		e.stepFailed(ctx, log, run)
+		return
+	}
+
+	// adversarial_review (FEAT-032, Verification Layer 5): the ONE verification layer with an extra
+	// model call (AC3). A separate model pass sees only the question + SQL — never the results (AC1,
+	// enforced by building the payload through the shared metadata-only seam) — and a detected
+	// semantic mismatch blocks the run before chart_spec/narrate show any results (AC2).
+	if _, err := e.execStep(ctx, sc, domain.StepAdversarialReview, generateSQLOutput, log, func() (string, error) {
+		return e.runAdversarialReview(ctx, sc, run, genSQL.SQL, log)
+	}); err != nil {
+		log.Error("adversarial_review step failed", slog.String("error", err.Error()))
 		e.stepFailed(ctx, log, run)
 		return
 	}
@@ -587,8 +649,10 @@ func (e *Executor) executePipeline(ctx context.Context, userID string, run domai
 	// determinism-identical key so a later identical run short-circuits model+engine entirely. The
 	// run is already materially complete (report persisted), so a cache write failure is best-effort:
 	// log it and complete anyway rather than failing a finished run on secondary bookkeeping.
+	// cacheSeed folds in the clarification answer (see executePipeline), so a clarified run never
+	// shadows an unclarified one.
 	if e.cache != nil {
-		if err := e.rememberCache(ctx, sc, run, seedSQL, planOutput, generateSQLOutput, executeOutput, chartSpecOutput, narrateOutput, reconcile); err != nil {
+		if err := e.rememberCache(ctx, sc, run, cacheSeed, planJSON, generateSQLOutput, executeOutput, chartSpecOutput, narrateOutput, reconcile); err != nil {
 			log.Warn("persisting run cache", slog.String("error", err.Error()))
 		}
 	}
@@ -675,7 +739,10 @@ func (e *Executor) runPlan(ctx context.Context, sc stepContext, run domain.Run, 
 		return "", err
 	}
 
-	var out domain.PlanStepOutput
+	// planOutput extends domain.PlanStepOutput with the FEAT-033 clarification fields; the model's
+	// reply may carry either the original answerable/reason/approach contract or the new
+	// needs_clarification surface (see planSystemPrompt).
+	var out planOutput
 	if err := parseModelJSON([]byte(raw), &out); err != nil {
 		return "", fmt.Errorf("plan step returned unparseable output: %w", err)
 	}
@@ -688,8 +755,26 @@ func (e *Executor) runPlan(ctx context.Context, sc stepContext, run domain.Run, 
 
 // runGenerateSQL executes the generate_sql step: the same workspace payload, this time carrying the
 // plan's chosen approach as prior context, answered with the SQL that execute will run.
-func (e *Executor) runGenerateSQL(ctx context.Context, sc stepContext, run domain.Run, plan domain.PlanStepOutput, log *slog.Logger) (string, error) {
-	payload, err := e.buildPayload(ctx, sc.workspaceID, run.QuestionText, plan.Approach)
+//
+// When the run was paused for a FEAT-033 clarifying question and the user answered it, the answer
+// rides into the prior context too — generate_sql must honor the clarification, not re-derive the
+// ambiguity it resolved.
+func (e *Executor) runGenerateSQL(ctx context.Context, sc stepContext, run domain.Run, plan planOutput, log *slog.Logger) (string, error) {
+	prior := plan.Approach
+	if answer := plan.clarificationResolution(); answer != "" {
+		question := strings.TrimSpace(plan.ClarificationQuestion)
+		if question == "" {
+			question = "the earlier ambiguity"
+		}
+		clause := fmt.Sprintf("The user clarified %s with: %s.", question, answer)
+		if prior != "" {
+			prior += " " + clause
+		} else {
+			prior = clause
+		}
+	}
+
+	payload, err := e.buildPayload(ctx, sc.workspaceID, run.QuestionText, prior)
 	if err != nil {
 		return "", err
 	}
@@ -1026,7 +1111,23 @@ func isIdentifierByte(b byte) bool {
 // chart_spec step's spec, the measured reconciliation summary, and (FEAT-030) the resolved
 // provenance links. A run whose steps all succeeded but whose Report cannot be persisted is a
 // corrupt state, so this fails the run rather than being best-effort.
+//
+// FEAT-021/FEAT-025: when the run was forked (run.ParentRunID set — a compositional follow-up or a
+// fork-on-amendment), the new report records its parent report — the report the parent run
+// materialized — so report history reads as a traceable tree (screens/09's Parent report link). The
+// link is honest: if the parent run has no materialized report yet, the field stays empty rather
+// than being fabricated.
 func (e *Executor) createReport(ctx context.Context, sc stepContext, run domain.Run, reconcile domain.ReconciliationSummary, chart domain.ChartSpec, narrative string, links []domain.ProvenanceLink) error {
+	parentReportID := ""
+	if run.ParentRunID != "" {
+		if parent, err := e.reports.GetByRunID(ctx, sc.workspaceID, run.ParentRunID); err == nil {
+			parentReportID = parent.ID
+		} else {
+			e.logger.Warn("creating report: parent run has no materialized report",
+				slog.String("parent_run_id", run.ParentRunID), slog.String("error", err.Error()))
+		}
+	}
+
 	ids := make([]string, len(links))
 	for i := range links {
 		ids[i] = links[i].ID
@@ -1040,7 +1141,7 @@ func (e *Executor) createReport(ctx context.Context, sc stepContext, run domain.
 		ChartSpec:             chart,
 		ProvenanceLinks:       ids,
 		ReconciliationSummary: reconcile,
-		ParentReportID:        "",
+		ParentReportID:        parentReportID,
 		CreatedAt:             time.Now().UTC(),
 	}
 	if err := e.reports.Create(ctx, report); err != nil {
@@ -1309,15 +1410,31 @@ func convertValue(v any) any {
 }
 
 // planSystemPrompt frames the plan step: decide answerability against the payload's actual schema
-// and semantic layer, and never guess. The model's reply must be JSON matching PlanStepOutput.
+// and semantic layer, and never guess. The model's reply must be JSON matching planOutput — the
+// answerable contract (FEAT-013 AC4) plus the FEAT-033 clarification surface.
+//
+// The distinction the prompt enforces is the whole of Honest Uncertainty: an AMBIGUOUS question
+// (the data could answer it, but which metric/period/grain is unclear) pauses for a specific
+// clarifying question; a genuinely UNANSWERABLE question (the data simply lacks what was asked)
+// fails with a plain-language reason. A clarification previously given in this workspace rides in
+// the payload's corrections (persisted by the clarify endpoint) and must NOT be re-asked.
 const planSystemPrompt = `You are the planning step of a grounded analytics system. You will be given a user's question and the schema/profile metadata of the datasets available in their workspace, plus any confirmed relationships, metric definitions, and corrections that form the workspace's semantic layer.
 
 Your job is to decide, from the schema and semantic layer alone, whether the question can be answered against this workspace's data — NOT to answer it yourself, and NEVER to invent data or make up values. There is no code path where you answer from data held in the prompt: only the schema and metadata are here.
 
-Respond with ONLY a JSON object of the form {"answerable": true|false, "reason": "...", "approach": "..."}.
-- Set answerable to true only when the question is clear and the workspace's tables/relationships/metrics suffice to answer it.
-- When answerable is false, set reason to a short, plain-language explanation of what is missing or ambiguous (e.g. "The data has no column that records region." or "It is unclear whether you mean revenue by count or by total value."), and omit approach.
-- When answerable is true, set approach to a concise plan for the SQL step: which tables, joins, and metrics it should use.
+Respond with ONLY a JSON object of the form:
+{"answerable": true|false, "reason": "...", "approach": "...", "needs_clarification": true|false, "clarification_question": "...", "clarification_options": ["..."], "ambiguity_key": "..."}
+
+Decide in this order:
+1. If the question is genuinely AMBIGUOUS — the data could answer it, but a needed choice is undefined (which metric, over what time period, at what grain, which statuses count) — set needs_clarification to true and answerable to true, and:
+   - clarification_question must name the SPECIFIC ambiguity and ask for the exact resolution, e.g. "Do you mean revenue by total value or by order count?" or "Over what time period?" — never a generic 'please clarify'.
+   - clarification_options should list a small enumerable set of discrete resolutions when one exists (e.g. ["By revenue", "By count"]); omit it when only a free-text answer makes sense.
+   - ambiguity_key should be a stable short key naming the ambiguity, e.g. "metric_undefined" or "time_period_undefined".
+   - Omit approach; the approach is decided once the user resolves the ambiguity.
+2. If the question is unanswerable because the DATA genuinely lacks what it asks (e.g. "The data has no column that records region.") — set answerable to false, reason to a short plain-language explanation, and omit approach. Do not ask a clarifying question for a missing-column gap; no answer to a clarification would create data that does not exist.
+3. If the question is clear and answerable — set answerable to true, omit needs_clarification, and set approach to a concise plan for the SQL step: which tables, joins, and metrics it should use.
+
+The payload may carry a corrections array. A correction whose description begins with "Clarification:" records an ambiguity already resolved in this workspace: if its bracketed key (e.g. "[metric_undefined]") matches the ambiguity you would otherwise raise, do NOT re-ask — treat the ambiguity as resolved using that correction's corrected_logic, set answerable to true, and proceed with an approach.
 Do not include markdown fences or any text outside the JSON object.`
 
 // generateSQLSystemPrompt frames the generate_sql step: write SQL referencing exactly the table

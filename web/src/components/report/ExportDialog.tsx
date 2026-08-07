@@ -1,14 +1,18 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import {
+  Braces,
   CheckCircle2,
+  FileCode,
+  FileImage,
   FileSpreadsheet,
   FileText,
   Loader2,
   Lock,
+  Presentation,
   X,
   type LucideIcon,
 } from "lucide-react";
@@ -29,14 +33,23 @@ export interface ExportDialogProps {
   tier?: SubscriptionTier;
   /**
    * False for a narrative-only report (screens/11 edge case: "Report contains no chart → Image
-   * export format is omitted from the list entirely"). No Image row exists this phase (FEAT-040 is
-   * Phase 5), so this currently only varies the PDF row's description — the signal is plumbed so the
-   * Phase 5 Image row can honor the edge case without re-plumbing.
+   * export format is omitted from the list entirely"). FEAT-040's Image row honors this: a report
+   * with no execute facts has nothing to export as a chart image, so the row is omitted rather
+   * than shown and then failing.
    */
   hasChart?: boolean;
 }
 
-type ExportFormatId = "pdf" | "csv";
+/**
+ * The formats the dialog can request. The "markup" id is the Markdown/HTML ROW (screens/11 lists
+ * "Markdown/HTML" as ONE format option); the actual format= value is resolved at export time via
+ * `markupVariant` — markdown or html — because the two are distinct server formats behind one row.
+ */
+type ExportFormatId = "pdf" | "csv" | "pptx" | "markup" | "json" | "image";
+
+/** The Markdown/HTML row's variant picker value (resolved to the real format= param). */
+type MarkupVariant = "markdown" | "html";
+
 type DialogStatus = "idle" | "exporting" | "ready" | "error";
 
 interface FormatOption {
@@ -44,7 +57,7 @@ interface FormatOption {
   name: string;
   description: string;
   icon: LucideIcon;
-  /** The lowest tier that may use this format, per monetization.md Feature Gate Mapping (FEAT-035 PDF: Free; FEAT-036 Excel/CSV: Pro). */
+  /** The lowest tier that may use this format, per monetization.md Feature Gate Mapping (FEAT-035 PDF: Free; FEAT-036 CSV: Pro; FEAT-037 PowerPoint: Team; FEAT-038/039/040: Pro). */
   minTier: SubscriptionTier;
 }
 
@@ -61,6 +74,34 @@ const FORMAT_OPTIONS: FormatOption[] = [
     name: "Excel/CSV",
     description: "The underlying result set as a CSV spreadsheet.",
     icon: FileSpreadsheet,
+    minTier: SubscriptionTier.Pro,
+  },
+  {
+    id: "pptx",
+    name: "PowerPoint",
+    description: "Charts and narrative as an editable slide deck.",
+    icon: Presentation,
+    minTier: SubscriptionTier.Team,
+  },
+  {
+    id: "markup",
+    name: "Markdown/HTML",
+    description: "For wikis and internal docs, with the chart embedded.",
+    icon: FileCode,
+    minTier: SubscriptionTier.Pro,
+  },
+  {
+    id: "json",
+    name: "JSON",
+    description: "Structured report data for programmatic use.",
+    icon: Braces,
+    minTier: SubscriptionTier.Pro,
+  },
+  {
+    id: "image",
+    name: "Chart image",
+    description: "The chart as a standalone SVG image file.",
+    icon: FileImage,
     minTier: SubscriptionTier.Pro,
   },
 ];
@@ -134,6 +175,8 @@ function ExportDialogContent({
   const searchParams = useSearchParams();
 
   const [selectedFormat, setSelectedFormat] = useState<ExportFormatId | null>(null);
+  // Markdown/HTML is one row (screens/11); this resolves which of the two server formats it means.
+  const [markupVariant, setMarkupVariant] = useState<MarkupVariant>("markdown");
   const [status, setStatus] = useState<DialogStatus>("idle");
   const [errorMessage, setErrorMessage] = useState("");
   const mountedRef = useRef(true);
@@ -167,12 +210,16 @@ function ExportDialogContent({
 
   async function runExport() {
     if (!selectedFormat) return;
+    // The Markdown/HTML row resolves to markdown or html at export time — one dialog row, two
+    // server formats (FEAT-038).
+    const formatParam: ResolvedExportFormat =
+      selectedFormat === "markup" ? markupVariant : selectedFormat;
     setStatus("exporting");
     setErrorMessage("");
     try {
       await downloadExportFile(
-        `/v1/workspaces/${workspaceId}/reports/${reportId}/export?format=${selectedFormat}`,
-        defaultFilename(selectedFormat),
+        `/v1/workspaces/${workspaceId}/reports/${reportId}/export?format=${formatParam}`,
+        defaultFilename(formatParam),
       );
       // Closing during export does not cancel the job — the download above already fired. State
       // updates are skipped once unmounted.
@@ -217,7 +264,9 @@ function ExportDialogContent({
 
         <div className="flex-1 overflow-y-auto p-4">
           <div role="radiogroup" aria-label="Export format" className="flex flex-col gap-3">
-            {FORMAT_OPTIONS.map((option) => {
+            {/* screens/11 edge case: a narrative-only report has no chart to export, so the Image
+                row is OMITTED entirely for it — never shown and then failing. */}
+            {FORMAT_OPTIONS.filter((option) => option.id !== "image" || hasChart).map((option) => {
               const available = canUseFormat(option, tier);
               const selected = selectedFormat === option.id;
               const description =
@@ -226,56 +275,85 @@ function ExportDialogContent({
                   : option.description;
               const Icon = option.icon;
 
-              if (available) {
-                return (
-                  <button
-                    key={option.id}
-                    type="button"
-                    role="radio"
-                    aria-checked={selected}
-                    onClick={() => setSelectedFormat(option.id)}
-                    className={cn(
-                      "flex w-full items-start gap-3 rounded-md border p-4 text-left",
-                      selected
-                        ? "border-primary bg-primary-light/40"
-                        : "border-border hover:bg-surface-secondary",
-                    )}
-                  >
-                    <Icon size={20} className="mt-0.5 shrink-0 text-text-secondary" aria-hidden="true" />
-                    <span className="min-w-0 flex-1">
-                      <span className="block font-medium text-text-primary">{option.name}</span>
-                      <span className="block text-body-small text-text-secondary">{description}</span>
-                      {exporting && selected && (
-                        <span className="mt-2 flex items-center gap-2 text-body-small text-text-secondary">
-                          <Loader2 size={14} className="animate-spin" aria-hidden="true" />
-                          Preparing your export…
-                        </span>
-                      )}
-                    </span>
-                  </button>
-                );
-              }
-
-              // Locked format row: reduced emphasis, upgrade prompt, NOT selectable — never hidden.
               return (
-                <div
-                  key={option.id}
-                  aria-disabled="true"
-                  className="flex w-full items-start gap-3 rounded-md border border-border p-4 opacity-70"
-                >
-                  <Icon size={20} className="mt-0.5 shrink-0 text-text-secondary" aria-hidden="true" />
-                  <span className="min-w-0 flex-1">
-                    <span className="block font-medium text-text-primary">{option.name}</span>
-                    <span className="block text-body-small text-text-secondary">{description}</span>
-                    <Link
-                      href={routes.settings(workspaceId)}
-                      className="mt-1 inline-flex items-center gap-1 text-body-small text-provenance hover:text-provenance"
+                <Fragment key={option.id}>
+                  {available ? (
+                    <button
+                      type="button"
+                      role="radio"
+                      aria-checked={selected}
+                      onClick={() => setSelectedFormat(option.id)}
+                      className={cn(
+                        "flex w-full items-start gap-3 rounded-md border p-4 text-left",
+                        selected
+                          ? "border-primary bg-primary-light/40"
+                          : "border-border hover:bg-surface-secondary",
+                      )}
                     >
-                      <Lock size={12} aria-hidden="true" />
-                      Upgrade to Pro/Team
-                    </Link>
-                  </span>
-                </div>
+                      <Icon size={20} className="mt-0.5 shrink-0 text-text-secondary" aria-hidden="true" />
+                      <span className="min-w-0 flex-1">
+                        <span className="block font-medium text-text-primary">{option.name}</span>
+                        <span className="block text-body-small text-text-secondary">{description}</span>
+                        {exporting && selected && (
+                          <span className="mt-2 flex items-center gap-2 text-body-small text-text-secondary">
+                            <Loader2 size={14} className="animate-spin" aria-hidden="true" />
+                            Preparing your export…
+                          </span>
+                        )}
+                      </span>
+                    </button>
+                  ) : (
+                    // Locked format row: reduced emphasis, upgrade prompt, NOT selectable — never
+                    // hidden (monetization.md's "always show what you're missing").
+                    <div
+                      aria-disabled="true"
+                      className="flex w-full items-start gap-3 rounded-md border border-border p-4 opacity-70"
+                    >
+                      <Icon size={20} className="mt-0.5 shrink-0 text-text-secondary" aria-hidden="true" />
+                      <span className="min-w-0 flex-1">
+                        <span className="block font-medium text-text-primary">{option.name}</span>
+                        <span className="block text-body-small text-text-secondary">{description}</span>
+                        <Link
+                          href={routes.settings(workspaceId)}
+                          className="mt-1 inline-flex items-center gap-1 text-body-small text-provenance hover:text-provenance"
+                        >
+                          <Lock size={12} aria-hidden="true" />
+                          Upgrade to Pro/Team
+                        </Link>
+                      </span>
+                    </div>
+                  )}
+
+                  {/* The Markdown/HTML row is one format option (screens/11) but maps to two server
+                      formats; the variant picker appears only while that row is selected. It sits
+                      OUTSIDE the radio button (interactive content cannot nest in a button). */}
+                  {available && selected && option.id === "markup" && (
+                    <div
+                      role="group"
+                      aria-label="Markdown or HTML variant"
+                      className="ml-11 flex items-center gap-2 rounded-md border border-border bg-surface-secondary px-3 py-2"
+                    >
+                      <label
+                        htmlFor="markup-variant"
+                        className="text-body-small text-text-secondary"
+                      >
+                        Format:
+                      </label>
+                      <select
+                        id="markup-variant"
+                        aria-label="Markdown or HTML variant"
+                        value={markupVariant}
+                        onChange={(event) =>
+                          setMarkupVariant(event.target.value as MarkupVariant)
+                        }
+                        className="rounded border border-border bg-surface px-2 py-1 text-body-small text-text-primary"
+                      >
+                        <option value="markdown">Markdown (.md)</option>
+                        <option value="html">HTML (.html)</option>
+                      </select>
+                    </div>
+                  )}
+                </Fragment>
               );
             })}
           </div>
@@ -323,8 +401,26 @@ function ExportDialogContent({
   );
 }
 
-function defaultFilename(format: ExportFormatId): string {
-  return format === "pdf" ? "groundwork-report.pdf" : "groundwork-report-results.csv";
+/** The format= value actually sent to the server (the markup row resolves to one of these). */
+type ResolvedExportFormat = "pdf" | "csv" | "pptx" | "markdown" | "html" | "json" | "image";
+
+function defaultFilename(format: ResolvedExportFormat): string {
+  switch (format) {
+    case "csv":
+      return "groundwork-report-results.csv";
+    case "pptx":
+      return "groundwork-report.pptx";
+    case "markdown":
+      return "groundwork-report.md";
+    case "html":
+      return "groundwork-report.html";
+    case "json":
+      return "groundwork-report.json";
+    case "image":
+      return "groundwork-report-chart.svg";
+    default:
+      return "groundwork-report.pdf";
+  }
 }
 
 /**

@@ -96,6 +96,13 @@ func (f *fakeConfirmationColumnStore) UpdatePII(ctx context.Context, id string, 
 	return nil
 }
 
+func (f *fakeConfirmationColumnStore) UpdateExclusion(ctx context.Context, id string, excluded bool) error {
+	c := f.byID[id]
+	c.ExcludedFromModel = excluded
+	f.byID[id] = c
+	return nil
+}
+
 // fakeConfirmationAuditWriter records FEAT-007's pii_override entries so a test can assert the
 // override and its audit entry happen together, in the one handler.
 type fakeConfirmationAuditWriter struct {
@@ -162,7 +169,7 @@ func newTestConfirmationRouterWithAudit(
 	r := chi.NewRouter()
 	r.Route("/v1", func(r chi.Router) {
 		r.Use(authsession.RequireAuth(testAuthSecret))
-		RegisterConfirmationRoutes(r, workspaces, datasets, columns, joins, relationshipStore, auditWriter,
+		RegisterConfirmationRoutes(r, workspaces, newFakeMemberLookupStore(), datasets, columns, joins, relationshipStore, auditWriter,
 			slog.New(slog.NewTextHandler(io.Discard, nil)))
 	})
 	return r
@@ -627,5 +634,114 @@ func TestUpdateColumnPIIOverrideFailsWhenAuditWriteFails(t *testing.T) {
 
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want %d when the audit entry could not be written", rec.Code, http.StatusInternalServerError)
+	}
+}
+
+// ------------------------------------------------------------------------------------------------
+// FEAT-010 — column-level exclusion (the excluded_from_model write path).
+// ------------------------------------------------------------------------------------------------
+
+// TestUpdateColumnExclusionViaPatch is FEAT-010 AC1 at the API layer: the user can mark any column
+// as excluded from model visibility through the existing column PATCH.
+func TestUpdateColumnExclusionViaPatch(t *testing.T) {
+	workspaces := newFakeWorkspaceStore()
+	workspaces.byID["ws-1"] = domain.Workspace{ID: "ws-1", OwnerID: "user-1"}
+	columns := newFakeConfirmationColumnStore()
+	columns.put("ws-1", domain.Column{ID: "col-1", DatasetID: "ds-1", Name: "salary", InferredType: domain.TypeNumber})
+	router := newTestConfirmationRouter(workspaces, &fakeConfirmationDatasetStore{byID: map[string]domain.Dataset{}}, columns, &fakeConfirmationCandidateJoinStore{byID: map[string]domain.CandidateJoin{}}, &fakeRelationshipStore{})
+
+	req := authedRequest(t, http.MethodPatch, "/v1/workspaces/ws-1/columns/col-1", map[string]any{"excluded_from_model": true}, "user-1", domain.TierFree)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+	if !columns.byID["col-1"].ExcludedFromModel {
+		t.Error("excluded_from_model not persisted for the column")
+	}
+	var body struct {
+		Column publicColumn `json:"column"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+	if !body.Column.ExcludedFromModel {
+		t.Error("response column omits excluded_from_model=true, so the settings toggle cannot update")
+	}
+}
+
+// TestUpdateColumnExclusionViaSettingsRoute covers screens/13's named data source for the exclusion
+// toggle: PATCH /api/workspaces/:id/columns/:columnId/exclusion, registered as an alias of the same
+// handler.
+func TestUpdateColumnExclusionViaSettingsRoute(t *testing.T) {
+	workspaces := newFakeWorkspaceStore()
+	workspaces.byID["ws-1"] = domain.Workspace{ID: "ws-1", OwnerID: "user-1"}
+	columns := newFakeConfirmationColumnStore()
+	columns.put("ws-1", domain.Column{ID: "col-1", DatasetID: "ds-1", Name: "salary", InferredType: domain.TypeNumber, ExcludedFromModel: true})
+	router := newTestConfirmationRouter(workspaces, &fakeConfirmationDatasetStore{byID: map[string]domain.Dataset{}}, columns, &fakeConfirmationCandidateJoinStore{byID: map[string]domain.CandidateJoin{}}, &fakeRelationshipStore{})
+
+	req := authedRequest(t, http.MethodPatch, "/v1/workspaces/ws-1/columns/col-1/exclusion", map[string]any{"excluded_from_model": false}, "user-1", domain.TierFree)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+	if columns.byID["col-1"].ExcludedFromModel {
+		t.Error("excluded_from_model not cleared through the settings exclusion route")
+	}
+}
+
+// TestUpdateColumnExclusionOnlyDoesNotTouchOtherFields: the pointer-body discipline must hold for the
+// exclusion field too — a request carrying only excluded_from_model must not reset the type or the
+// PII flag.
+func TestUpdateColumnExclusionOnlyDoesNotTouchOtherFields(t *testing.T) {
+	workspaces := newFakeWorkspaceStore()
+	workspaces.byID["ws-1"] = domain.Workspace{ID: "ws-1", OwnerID: "user-1"}
+	columns := newFakeConfirmationColumnStore()
+	columns.put("ws-1", domain.Column{
+		ID: "col-1", DatasetID: "ds-1", Name: "salary",
+		InferredType: domain.TypeNumber, PIIFlag: true, PIIPattern: "manual",
+	})
+	router := newTestConfirmationRouter(workspaces, &fakeConfirmationDatasetStore{byID: map[string]domain.Dataset{}}, columns, &fakeConfirmationCandidateJoinStore{byID: map[string]domain.CandidateJoin{}}, &fakeRelationshipStore{})
+
+	req := authedRequest(t, http.MethodPatch, "/v1/workspaces/ws-1/columns/col-1", map[string]any{"excluded_from_model": true}, "user-1", domain.TierFree)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+	col := columns.byID["col-1"]
+	if col.InferredType != domain.TypeNumber {
+		t.Errorf("inferred_type = %q, want %q (exclusion-only must not touch the type)", col.InferredType, domain.TypeNumber)
+	}
+	if !col.PIIFlag || col.PIIPattern != "manual" {
+		t.Error("exclusion-only request disturbed the PII flag/pattern")
+	}
+}
+
+// TestUpdateColumnExclusionWritesNoPIIAuditEntry: exclusion changes are not PII-override decisions,
+// so they must not inflate the pii_override audit trail (schema.md's AuditLogEntry enum has no
+// exclusion action type; nothing is invented here).
+func TestUpdateColumnExclusionWritesNoPIIAuditEntry(t *testing.T) {
+	workspaces := newFakeWorkspaceStore()
+	workspaces.byID["ws-1"] = domain.Workspace{ID: "ws-1", OwnerID: "user-1"}
+	columns := newFakeConfirmationColumnStore()
+	columns.put("ws-1", domain.Column{ID: "col-1", DatasetID: "ds-1", Name: "salary", InferredType: domain.TypeNumber})
+	auditWriter := &fakeConfirmationAuditWriter{}
+	router := newTestConfirmationRouterWithAudit(workspaces, &fakeConfirmationDatasetStore{byID: map[string]domain.Dataset{}}, columns,
+		&fakeConfirmationCandidateJoinStore{byID: map[string]domain.CandidateJoin{}}, &fakeRelationshipStore{}, auditWriter)
+
+	req := authedRequest(t, http.MethodPatch, "/v1/workspaces/ws-1/columns/col-1", map[string]any{"excluded_from_model": true}, "user-1", domain.TierFree)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+	if len(auditWriter.entries) != 0 {
+		t.Errorf("got %d pii_override entries for an exclusion-only write, want 0", len(auditWriter.entries))
 	}
 }

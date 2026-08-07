@@ -93,6 +93,7 @@ func TestHaltOnCompleteRunIsNoOp(t *testing.T) {
 	modelClient.enqueue(
 		`{"answerable":true,"reason":"","approach":"select all"}`,
 		`{"sql":"SELECT region FROM dataset_sales_data_q3_csv_d5f3e2a1"}`,
+		`{"matches":true,"verdict":"ok","severity":"ok"}`,
 		`{"chart_type":"table","x_axis_column":"region","y_axis_column":"","title":"Regions"}`,
 		`{"narrative":"All regions are listed."}`,
 	)

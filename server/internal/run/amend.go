@@ -58,7 +58,8 @@ func (e *Executor) amendAndResume(ctx context.Context, userID, runID string, ste
 	}
 
 	// Resume from the amended step: seed generate_sql with the edited SQL (no model call) and run
-	// the ordinary seeded tail (static_check → execute → chart_spec → narrate → report). Invalidated
-	// downstream steps are re-run via the step machine's reset path; unaffected prior steps replay.
-	e.executePipeline(ctx, userID, run, &newInput, false)
+	// the ordinary seeded tail (static_check → execute → shadow_check → adversarial_review →
+	// chart_spec → narrate → report). Invalidated downstream steps are re-run via the step machine's
+	// reset path; unaffected prior steps replay.
+	e.executePipeline(ctx, userID, run, &newInput, false, "")
 }

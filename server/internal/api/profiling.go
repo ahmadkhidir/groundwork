@@ -41,9 +41,12 @@ type ProfilingCandidateJoinStore interface {
 // column statistics and candidate joins, per features.md's acceptance criterion that profiling
 // statistics are "stored and retrievable, not recomputed on every use." Neither endpoint triggers any
 // computation — both are pure reads served entirely from Postgres.
-func RegisterProfilingRoutes(r chi.Router, workspaces WorkspaceStore, datasets ProfilingDatasetStore, columns ProfilingColumnStore, joins ProfilingCandidateJoinStore, logger *slog.Logger) {
-	r.Get("/workspaces/{workspaceId}/datasets/{datasetId}/columns", handleListColumns(workspaces, datasets, columns, logger))
-	r.Get("/workspaces/{workspaceId}/candidate-joins", handleListCandidateJoins(workspaces, datasets, joins, logger))
+//
+// members backs the FEAT-045 access check: both routes are reads, so each uses requireWorkspaceAccess
+// (owner OR read-only member) — read-only members may view profiling data per FEAT-045 AC2.
+func RegisterProfilingRoutes(r chi.Router, workspaces WorkspaceStore, members MemberLookupStore, datasets ProfilingDatasetStore, columns ProfilingColumnStore, joins ProfilingCandidateJoinStore, logger *slog.Logger) {
+	r.Get("/workspaces/{workspaceId}/datasets/{datasetId}/columns", handleListColumns(workspaces, members, datasets, columns, logger))
+	r.Get("/workspaces/{workspaceId}/candidate-joins", handleListCandidateJoins(workspaces, members, datasets, joins, logger))
 }
 
 type publicColumn struct {
@@ -92,7 +95,7 @@ func toPublicColumn(c domain.Column) publicColumn {
 // Verifies the dataset actually belongs to the workspace named in the route, in addition to the
 // caller owning that workspace — otherwise a valid dataset id from a workspace the caller does not
 // own could be probed via a workspace id the caller does own.
-func handleListColumns(workspaces WorkspaceStore, datasets ProfilingDatasetStore, columns ProfilingColumnStore, logger *slog.Logger) http.HandlerFunc {
+func handleListColumns(workspaces WorkspaceStore, members MemberLookupStore, datasets ProfilingDatasetStore, columns ProfilingColumnStore, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
@@ -100,7 +103,7 @@ func handleListColumns(workspaces WorkspaceStore, datasets ProfilingDatasetStore
 		}
 
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+		if _, _, ok := requireWorkspaceAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
 			return
 		}
 
@@ -220,7 +223,7 @@ func computeSkippedFilenamePairs(datasets []domain.Dataset) []skippedFilenamePai
 // FEAT-008/FEAT-049's Relationship inference skipped notice: any 2+ datasets in the workspace sharing
 // an original_filename, which the ingest pipeline never compares against each other (see
 // internal/ingest.Pipeline.inferRelationshipsAndComplete).
-func handleListCandidateJoins(workspaces WorkspaceStore, datasets ProfilingDatasetStore, joins ProfilingCandidateJoinStore, logger *slog.Logger) http.HandlerFunc {
+func handleListCandidateJoins(workspaces WorkspaceStore, members MemberLookupStore, datasets ProfilingDatasetStore, joins ProfilingCandidateJoinStore, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
@@ -228,7 +231,7 @@ func handleListCandidateJoins(workspaces WorkspaceStore, datasets ProfilingDatas
 		}
 
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+		if _, _, ok := requireWorkspaceAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
 			return
 		}
 

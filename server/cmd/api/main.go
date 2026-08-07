@@ -102,8 +102,13 @@ func run(logger *slog.Logger) error {
 	semanticSummaryRepo := postgres.NewSemanticSummaryRepository(pool)
 
 	ingestTracker := ingest.NewTracker()
+	// FEAT-026's notification repository is constructed here (before the pipeline) because the
+	// pipeline's ingest-failure event source consumes it via WithNotifications.
+	notificationRepo := postgres.NewNotificationRepository(pool)
 	ingestPipeline := ingest.NewPipeline(
-		datasetRepo, objectStore, engineProvider, columnRepo, candidateJoinRepo, ingestTracker, logger)
+		datasetRepo, objectStore, engineProvider, columnRepo, candidateJoinRepo, ingestTracker, logger,
+		// FEAT-026: write an `ingest_failed` durable notification when an upload fails (best-effort).
+		ingest.WithNotifications(notificationRepo, workspaceRepo))
 
 	// FEAT-013 (Phase 2). The run executor is the only consumer of the Anthropic key; the model
 	// client is constructible without it (Complete fails honestly per-call), so a keyless dev
@@ -119,6 +124,13 @@ func run(logger *slog.Logger) error {
 	// workspace it describes, so this repository is the only store that can be read AFTER a
 	// workspace is gone (screens/14's follow-up proof GET).
 	deletionRecordRepo := postgres.NewDeletionRecordRepository(pool)
+
+	// FEAT-045 (workspace_members), FEAT-046 (report_shares), FEAT-047 (usage_records), and
+	// FEAT-026 (notifications) — Phase 5. All four tables ship in migration 00001; these
+	// repositories are the read/write side of the new endpoints.
+	memberRepo := postgres.NewMemberRepository(pool)
+	shareRepo := postgres.NewReportShareRepository(pool)
+	usageRepo := postgres.NewUsageRepository(pool)
 	modelClient := model.NewClient(cfg.AnthropicAPIKey, auditWriter, logger)
 	if cfg.AnthropicAPIKey == "" {
 		logger.Warn("ANTHROPIC_API_KEY is not set — FEAT-013 runs will fail at the model step")
@@ -206,6 +218,21 @@ func run(logger *slog.Logger) error {
 		WorkspaceDeletionCascade: workspaceRepo,
 		WorkspaceDeletionProofs:  deletionRecordRepo,
 		WorkspaceDeletionAudit:   auditWriter,
+
+		// FEAT-045 (workspace sharing): same memberRepo satisfies the management seam and the
+		// narrow access-check lookup; userRepo answers invite-by-email. FEAT-046 (report shares):
+		// shareRepo. FEAT-047 (usage): usageRepo. FEAT-012 (wake-on-intent): engineProvider.
+		// FEAT-026 (durable notifications): notificationRepo (read side; the event sources that
+		// create notifications are wired in assembly).
+		Members:             memberRepo,
+		MemberLookup:        memberRepo,
+		MemberUsers:         userRepo,
+		Shares:              shareRepo,
+		ShareLookup:         shareRepo,
+		Usage:               usageRepo,
+		EngineWake:          engineProvider,
+		Notifications:       notificationRepo,
+		ExportNotifications: notificationRepo,
 	}
 
 	server := &http.Server{

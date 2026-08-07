@@ -44,6 +44,20 @@ func (f *fakeRunRepo) GetByID(_ context.Context, id string) (domain.Run, error) 
 	return run, nil
 }
 
+// ListByParentRun mirrors RunRepository.ListByParentRun for the fork tree (FEAT-025): every run
+// whose parent_run_id matches, in insertion order.
+func (f *fakeRunRepo) ListByParentRun(_ context.Context, parentRunID string) ([]domain.Run, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []domain.Run
+	for _, run := range f.runs {
+		if run.ParentRunID == parentRunID {
+			out = append(out, run)
+		}
+	}
+	return out, nil
+}
+
 var errTestRunNotFound = &testRunNotFoundError{}
 
 type testRunNotFoundError struct{}
@@ -69,19 +83,25 @@ func (f *fakeRunStepRepo) ListByRun(_ context.Context, runID string) ([]domain.S
 // fakeRunExecutor records every run it was asked to submit; the real executor runs a goroutine, so
 // asserting Submit happened (and with what run) is the handler test's boundary.
 type fakeRunExecutor struct {
-	mu      sync.Mutex
-	userIDs []string
-	runs    []domain.Run
-	sqls    []string
-	resumed []string
-	halted  []string
-	amended []amendedRequest
+	mu        sync.Mutex
+	userIDs   []string
+	runs      []domain.Run
+	sqls      []string
+	resumed   []string
+	halted    []string
+	amended   []amendedRequest
+	clarified []clarifiedRequest
 }
 
 type amendedRequest struct {
 	runID    string
 	stepName domain.StepName
 	input    string
+}
+
+type clarifiedRequest struct {
+	runID  string
+	answer string
 }
 
 func (f *fakeRunExecutor) Submit(userID string, run domain.Run) {
@@ -128,6 +148,15 @@ func (f *fakeRunExecutor) AmendAndResume(userID string, runID string, stepName d
 	f.amended = append(f.amended, amendedRequest{runID: runID, stepName: stepName, input: input})
 }
 
+// Clarify records the clarify request (FEAT-033); the real executor runs a goroutine, so asserting
+// the request reached it (and with what answer) is the handler test's boundary.
+func (f *fakeRunExecutor) Clarify(userID string, runID string, answer string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.userIDs = append(f.userIDs, userID)
+	f.clarified = append(f.clarified, clarifiedRequest{runID: runID, answer: answer})
+}
+
 func (f *fakeRunExecutor) submitted() []domain.Run {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -157,6 +186,14 @@ func (f *fakeRunExecutor) amendedRuns() []amendedRequest {
 	defer f.mu.Unlock()
 	out := make([]amendedRequest, len(f.amended))
 	copy(out, f.amended)
+	return out
+}
+
+func (f *fakeRunExecutor) clarifiedRuns() []clarifiedRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]clarifiedRequest, len(f.clarified))
+	copy(out, f.clarified)
 	return out
 }
 

@@ -33,6 +33,13 @@ function PIIStatus({ column }: { column: ConfirmationColumn }) {
       ) : (
         <StatusPill variant="neutral">not sensitive</StatusPill>
       )}
+      {/* FEAT-010: a column explicitly excluded from model visibility (a user-controlled override on
+          top of the automatic PII default) is surfaced wherever the column appears, per that
+          feature's AC3 ("Exclusion status is visible wherever the column appears in ingest review or
+          the semantic layer"). */}
+      {column.excluded_from_model && (
+        <StatusPill variant="neutral">excluded from model</StatusPill>
+      )}
       {reviewedLabel && (
         <span className="text-caption text-text-secondary">{reviewedLabel}</span>
       )}

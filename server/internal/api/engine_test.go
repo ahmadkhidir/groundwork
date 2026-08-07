@@ -55,7 +55,7 @@ func newTestEngineRouterWithDatasets(workspaces WorkspaceStore, provider EngineS
 	r.Route("/v1", func(r chi.Router) {
 		r.Group(func(r chi.Router) {
 			r.Use(authsession.RequireAuth(testAuthSecret))
-			RegisterEngineRoutes(r, workspaces, provider, datasets, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			RegisterEngineRoutes(r, workspaces, newFakeMemberLookupStore(), provider, datasets, slog.New(slog.NewTextHandler(io.Discard, nil)))
 		})
 	})
 	return r

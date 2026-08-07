@@ -34,8 +34,12 @@ type WorkspaceDatasetPresence interface {
 }
 
 // RegisterEngineRoutes wires FEAT-011's endpoint onto r.
-func RegisterEngineRoutes(r chi.Router, workspaces WorkspaceStore, provider EngineStatusProvider, datasets WorkspaceDatasetPresence, logger *slog.Logger) {
-	r.Get("/workspaces/{workspaceId}", handleGetWorkspace(workspaces, provider, datasets, logger))
+//
+// members backs the FEAT-045 access check: the workspace GET is a READ, so it uses
+// requireWorkspaceAccess (owner OR read-only member) — a read-only member must be able to view the
+// workspace home per FEAT-045 AC2.
+func RegisterEngineRoutes(r chi.Router, workspaces WorkspaceStore, members MemberLookupStore, provider EngineStatusProvider, datasets WorkspaceDatasetPresence, logger *slog.Logger) {
+	r.Get("/workspaces/{workspaceId}", handleGetWorkspace(workspaces, members, provider, datasets, logger))
 }
 
 // publicWorkspaceDetail is the single-workspace GET's payload: the shared workspace shape plus the
@@ -64,7 +68,7 @@ type publicWorkspaceDetail struct {
 // This handler instead asks engine.Provider directly, so the status pill on Workspace Home is never
 // a stale read — Provider.Status's own contract guarantees that asking never itself triggers a wake,
 // so this is safe to poll on every screen visit.
-func handleGetWorkspace(workspaces WorkspaceStore, provider EngineStatusProvider, datasets WorkspaceDatasetPresence, logger *slog.Logger) http.HandlerFunc {
+func handleGetWorkspace(workspaces WorkspaceStore, members MemberLookupStore, provider EngineStatusProvider, datasets WorkspaceDatasetPresence, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
@@ -72,7 +76,7 @@ func handleGetWorkspace(workspaces WorkspaceStore, provider EngineStatusProvider
 		}
 
 		workspaceID := chi.URLParam(r, "workspaceId")
-		ws, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID)
+		ws, _, ok := requireWorkspaceAccess(w, r, workspaces, members, claims.UserID, workspaceID)
 		if !ok {
 			return
 		}

@@ -226,7 +226,7 @@ func newTestSemanticRouter(
 	r := chi.NewRouter()
 	r.Route("/v1", func(r chi.Router) {
 		r.Use(authsession.RequireAuth(testAuthSecret))
-		RegisterSemanticRoutes(r, workspaces, relationships, metrics, corrections, summary,
+		RegisterSemanticRoutes(r, workspaces, newFakeMemberLookupStore(), relationships, metrics, corrections, summary,
 			slog.New(slog.NewTextHandler(io.Discard, nil)))
 	})
 	return r

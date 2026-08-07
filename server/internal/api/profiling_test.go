@@ -73,7 +73,7 @@ func newTestProfilingRouter(workspaces WorkspaceStore, datasets ProfilingDataset
 	r := chi.NewRouter()
 	r.Route("/v1", func(r chi.Router) {
 		r.Use(authsession.RequireAuth(testAuthSecret))
-		RegisterProfilingRoutes(r, workspaces, datasets, columns, joins, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		RegisterProfilingRoutes(r, workspaces, newFakeMemberLookupStore(), datasets, columns, joins, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	})
 	return r
 }

@@ -36,9 +36,11 @@ func TestResumeReplaysCompletedStepsAndRunsFromFirstUnfinished(t *testing.T) {
 	failedRun.Status = domain.RunFailed
 	runs.run = failedRun
 
-	// Plan is replayed (no model call), so only generate_sql, chart_spec, and narrate call the model.
+	// Plan is replayed (no model call), so only generate_sql, adversarial_review, chart_spec, and
+	// narrate call the model.
 	modelClient.enqueue(
 		`{"sql":"SELECT region, COUNT(*) AS cnt FROM dataset_sales_data_q3_csv_d5f3e2a1 GROUP BY region"}`,
+		`{"matches":true,"verdict":"ok","severity":"ok"}`,
 		`{"chart_type":"table","x_axis_column":"region","y_axis_column":"","series_column":"","title":"Customers by region"}`,
 		`{"narrative":"North leads the count."}`,
 	)
@@ -46,14 +48,14 @@ func TestResumeReplaysCompletedStepsAndRunsFromFirstUnfinished(t *testing.T) {
 	executor.Resume("user-1", "run-1")
 	waitFor(t, func() bool { return runs.current().Status == domain.RunComplete })
 
-	// Plan was never re-run (replayed), so the model was called exactly 3 times, never for plan.
-	if got := modelClient.callCount(); got != 3 {
-		t.Fatalf("model calls = %d, want 3 (plan replayed, not re-called)", got)
+	// Plan was never re-run (replayed), so the model was called exactly 4 times, never for plan.
+	if got := modelClient.callCount(); got != 4 {
+		t.Fatalf("model calls = %d, want 4 (plan replayed, not re-called)", got)
 	}
 
 	all := steps.all()
-	if len(all) != 6 {
-		t.Fatalf("steps = %d, want 6 (plan + generate_sql + static_check + execute + chart_spec + narrate): %+v", len(all), all)
+	if len(all) != 8 {
+		t.Fatalf("steps = %d, want 8 (plan + generate_sql + static_check + execute + shadow_check + adversarial_review + chart_spec + narrate): %+v", len(all), all)
 	}
 	// The replayed plan keeps its original row id and stays complete.
 	for _, s := range all {

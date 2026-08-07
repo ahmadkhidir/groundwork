@@ -63,27 +63,34 @@ type SemanticSummaryStore interface {
 }
 
 // RegisterSemanticRoutes wires FEAT-019's endpoints onto r.
+//
+// members backs the FEAT-045 access check: the GETs (summary, relationship list, metric list,
+// corrections list) use requireWorkspaceAccess (owner OR read-only member — read-only members may
+// VIEW the semantic layer), while every mutation (relationship PATCH, metric POST/PATCH/DELETE,
+// correction DELETE) uses requireWorkspaceMutationAccess — a read-only member must not edit the
+// semantic layer per FEAT-045 AC2.
 func RegisterSemanticRoutes(
 	r chi.Router,
 	workspaces WorkspaceStore,
+	members MemberLookupStore,
 	relationships SemanticRelationshipStore,
 	metrics SemanticMetricDefinitionStore,
 	corrections SemanticCorrectionStore,
 	summary SemanticSummaryStore,
 	logger *slog.Logger,
 ) {
-	r.Get("/workspaces/{workspaceId}/semantic-layer/summary", handleSemanticSummary(workspaces, summary, logger))
+	r.Get("/workspaces/{workspaceId}/semantic-layer/summary", handleSemanticSummary(workspaces, members, summary, logger))
 
-	r.Get("/workspaces/{workspaceId}/semantic-layer/relationships", handleListSemanticRelationships(workspaces, relationships, logger))
-	r.Patch("/workspaces/{workspaceId}/semantic-layer/relationships/{relationshipId}", handleUpdateSemanticRelationship(workspaces, relationships, logger))
+	r.Get("/workspaces/{workspaceId}/semantic-layer/relationships", handleListSemanticRelationships(workspaces, members, relationships, logger))
+	r.Patch("/workspaces/{workspaceId}/semantic-layer/relationships/{relationshipId}", handleUpdateSemanticRelationship(workspaces, members, relationships, logger))
 
-	r.Get("/workspaces/{workspaceId}/semantic-layer/metrics", handleListMetricDefinitions(workspaces, metrics, logger))
-	r.Post("/workspaces/{workspaceId}/semantic-layer/metrics", handleCreateMetricDefinition(workspaces, metrics, logger))
-	r.Patch("/workspaces/{workspaceId}/semantic-layer/metrics/{metricId}", handleUpdateMetricDefinition(workspaces, metrics, logger))
-	r.Delete("/workspaces/{workspaceId}/semantic-layer/metrics/{metricId}", handleDeleteMetricDefinition(workspaces, metrics, logger))
+	r.Get("/workspaces/{workspaceId}/semantic-layer/metrics", handleListMetricDefinitions(workspaces, members, metrics, logger))
+	r.Post("/workspaces/{workspaceId}/semantic-layer/metrics", handleCreateMetricDefinition(workspaces, members, metrics, logger))
+	r.Patch("/workspaces/{workspaceId}/semantic-layer/metrics/{metricId}", handleUpdateMetricDefinition(workspaces, members, metrics, logger))
+	r.Delete("/workspaces/{workspaceId}/semantic-layer/metrics/{metricId}", handleDeleteMetricDefinition(workspaces, members, metrics, logger))
 
-	r.Get("/workspaces/{workspaceId}/semantic-layer/corrections", handleListCorrections(workspaces, corrections, logger))
-	r.Delete("/workspaces/{workspaceId}/semantic-layer/corrections/{correctionId}", handleDeleteCorrection(workspaces, corrections, logger))
+	r.Get("/workspaces/{workspaceId}/semantic-layer/corrections", handleListCorrections(workspaces, members, corrections, logger))
+	r.Delete("/workspaces/{workspaceId}/semantic-layer/corrections/{correctionId}", handleDeleteCorrection(workspaces, members, corrections, logger))
 }
 
 func internalErrorResponse(w http.ResponseWriter) {
@@ -99,14 +106,14 @@ func internalErrorResponse(w http.ResponseWriter) {
 
 // handleSemanticSummary serves GET /v1/workspaces/:id/semantic-layer/summary —
 // screens/04-workspace-home.md's compact "N relationships, M metric definitions" panel.
-func handleSemanticSummary(workspaces WorkspaceStore, summary SemanticSummaryStore, logger *slog.Logger) http.HandlerFunc {
+func handleSemanticSummary(workspaces WorkspaceStore, members MemberLookupStore, summary SemanticSummaryStore, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
 			return
 		}
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+		if _, _, ok := requireWorkspaceAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
 			return
 		}
 
@@ -137,14 +144,14 @@ func handleSemanticSummary(workspaces WorkspaceStore, summary SemanticSummarySto
 // handleListSemanticRelationships serves GET /v1/workspaces/:id/semantic-layer/relationships —
 // screens/15-semantic-layer.md's Relationships tab, and the FEAT-009-seeded rows this feature was
 // deferred to make readable.
-func handleListSemanticRelationships(workspaces WorkspaceStore, relationships SemanticRelationshipStore, logger *slog.Logger) http.HandlerFunc {
+func handleListSemanticRelationships(workspaces WorkspaceStore, members MemberLookupStore, relationships SemanticRelationshipStore, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
 			return
 		}
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+		if _, _, ok := requireWorkspaceAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
 			return
 		}
 
@@ -176,14 +183,14 @@ type updateSemanticRelationshipRequest struct {
 // Relationships tab. Per screens/15's edge case, this never retroactively alters an in-progress
 // run's already-generated SQL; it only changes what a future run's grounding context sees, which is
 // automatic here since this handler has no notion of an in-flight run at all.
-func handleUpdateSemanticRelationship(workspaces WorkspaceStore, relationships SemanticRelationshipStore, logger *slog.Logger) http.HandlerFunc {
+func handleUpdateSemanticRelationship(workspaces WorkspaceStore, members MemberLookupStore, relationships SemanticRelationshipStore, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
 			return
 		}
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+		if _, ok := requireWorkspaceMutationAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
 			return
 		}
 
@@ -273,14 +280,14 @@ func toPublicMetricDefinition(m domain.MetricDefinition) publicMetricDefinition 
 
 // handleListMetricDefinitions serves GET /v1/workspaces/:id/semantic-layer/metrics —
 // screens/15-semantic-layer.md's Metric Definitions tab.
-func handleListMetricDefinitions(workspaces WorkspaceStore, metrics SemanticMetricDefinitionStore, logger *slog.Logger) http.HandlerFunc {
+func handleListMetricDefinitions(workspaces WorkspaceStore, members MemberLookupStore, metrics SemanticMetricDefinitionStore, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
 			return
 		}
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+		if _, _, ok := requireWorkspaceAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
 			return
 		}
 
@@ -314,14 +321,14 @@ type createMetricDefinitionRequest struct {
 }
 
 // handleCreateMetricDefinition serves POST /v1/workspaces/:id/semantic-layer/metrics.
-func handleCreateMetricDefinition(workspaces WorkspaceStore, metrics SemanticMetricDefinitionStore, logger *slog.Logger) http.HandlerFunc {
+func handleCreateMetricDefinition(workspaces WorkspaceStore, members MemberLookupStore, metrics SemanticMetricDefinitionStore, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
 			return
 		}
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+		if _, ok := requireWorkspaceMutationAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
 			return
 		}
 
@@ -383,14 +390,14 @@ type updateMetricDefinitionRequest struct {
 // in-progress run is saved immediately but does not retroactively alter that run's already-generated
 // SQL — it applies from the next run onward. As with relationship edits above, this falls out
 // naturally: this handler has no notion of an in-flight run.
-func handleUpdateMetricDefinition(workspaces WorkspaceStore, metrics SemanticMetricDefinitionStore, logger *slog.Logger) http.HandlerFunc {
+func handleUpdateMetricDefinition(workspaces WorkspaceStore, members MemberLookupStore, metrics SemanticMetricDefinitionStore, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
 			return
 		}
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+		if _, ok := requireWorkspaceMutationAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
 			return
 		}
 
@@ -472,14 +479,14 @@ func handleUpdateMetricDefinition(workspaces WorkspaceStore, metrics SemanticMet
 }
 
 // handleDeleteMetricDefinition serves DELETE /v1/workspaces/:id/semantic-layer/metrics/:metricId.
-func handleDeleteMetricDefinition(workspaces WorkspaceStore, metrics SemanticMetricDefinitionStore, logger *slog.Logger) http.HandlerFunc {
+func handleDeleteMetricDefinition(workspaces WorkspaceStore, members MemberLookupStore, metrics SemanticMetricDefinitionStore, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
 			return
 		}
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+		if _, ok := requireWorkspaceMutationAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
 			return
 		}
 
@@ -544,14 +551,14 @@ func toPublicCorrection(c domain.Correction) publicCorrection {
 // handleListCorrections serves GET /v1/workspaces/:id/semantic-layer/corrections —
 // screens/15-semantic-layer.md's Corrections tab. Legitimately returns an empty list until FEAT-020
 // (a later wave) starts writing rows — see corrections.go's doc comment.
-func handleListCorrections(workspaces WorkspaceStore, corrections SemanticCorrectionStore, logger *slog.Logger) http.HandlerFunc {
+func handleListCorrections(workspaces WorkspaceStore, members MemberLookupStore, corrections SemanticCorrectionStore, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
 			return
 		}
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+		if _, _, ok := requireWorkspaceAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
 			return
 		}
 
@@ -579,14 +586,14 @@ func handleListCorrections(workspaces WorkspaceStore, corrections SemanticCorrec
 // plain 404, matching this API's non-enumeration pattern (a cross-workspace correction is never
 // confirmed to exist). Deleting from a workspace the caller does not own is already blocked by
 // requireWorkspaceOwnership above.
-func handleDeleteCorrection(workspaces WorkspaceStore, corrections SemanticCorrectionStore, logger *slog.Logger) http.HandlerFunc {
+func handleDeleteCorrection(workspaces WorkspaceStore, members MemberLookupStore, corrections SemanticCorrectionStore, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
 			return
 		}
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+		if _, ok := requireWorkspaceMutationAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
 			return
 		}
 

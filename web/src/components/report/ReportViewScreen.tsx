@@ -6,6 +6,7 @@ import Link from "next/link";
 import { ArrowLeft } from "lucide-react";
 import { Button, buttonClassNames } from "@/components/ui/Button";
 import { Card, CardHeader } from "@/components/ui/Card";
+import { Input } from "@/components/ui/Input";
 import { ErrorState } from "@/components/shared/ErrorState";
 import { Skeleton } from "@/components/shared/Skeleton";
 import { ChartRenderer } from "./ChartRenderer";
@@ -22,11 +23,11 @@ import { api, ApiError } from "@/lib/api-client";
 import { routes } from "@/lib/routes";
 import {
   isForkedReport,
+  SubscriptionTier,
   type ProvenanceLink,
   type Report,
   type Run,
   type Step,
-  type SubscriptionTier,
 } from "@/types/schema";
 
 export interface ReportViewScreenProps {
@@ -76,6 +77,11 @@ export function ReportViewScreen({ workspaceId, reportId, userTier }: ReportView
   const router = useRouter();
   const [state, setState] = useState<ScreenState>({ status: "loading" });
   const loaded = useRef(false);
+  // FEAT-021's report-scoped follow-up: "Ask a follow-up" opens a question input on this report;
+  // submitting creates a run linked to this report and routes to its Run Viewer.
+  const [followUpOpen, setFollowUpOpen] = useState(false);
+  const [followUpDraft, setFollowUpDraft] = useState("");
+  const [submittingFollowUp, setSubmittingFollowUp] = useState(false);
 
   const openClaim = useCallback(
     (link: ProvenanceLink) => {
@@ -89,6 +95,29 @@ export function ReportViewScreen({ workspaceId, reportId, userTier }: ReportView
     // reload (routes.reportExport builds ?export=1; QueryParam.Export owns the parameter name).
     router.push(routes.reportExport(workspaceId, reportId));
   }, [router, workspaceId, reportId]);
+
+  // FEAT-021: a follow-up question is report-scoped. The run records this report as its parent
+  // (parent_report_id), so the answer materializes as a NEW linked report — the original report and
+  // its run stay fully intact, and report history reads as a tree.
+  const handleFollowUpSubmit = useCallback(async () => {
+    const question = followUpDraft.trim();
+    if (!question) return;
+    setSubmittingFollowUp(true);
+    try {
+      const { run: nextRun } = await api.post<{ run: Run }>(
+        `/v1/workspaces/${workspaceId}/runs`,
+        {
+          question_text: question,
+          parent_report_id: reportId,
+        },
+      );
+      router.push(routes.run(workspaceId, nextRun.id));
+    } catch {
+      // A failed submission leaves the input open with the draft intact.
+    } finally {
+      setSubmittingFollowUp(false);
+    }
+  }, [router, workspaceId, reportId, followUpDraft]);
 
   const load = useCallback(async () => {
     try {
@@ -167,6 +196,9 @@ export function ReportViewScreen({ workspaceId, reportId, userTier }: ReportView
   // screens/11 edge case that omits the (Phase 5) Image row; this phase it only varies the PDF row
   // description.
   const hasChart = executeResult !== null;
+  // FEAT-021 is Pro/Team (monetization.md). Display-only lock for the Free tier: the server is
+  // authoritative and returns 403 upgrade_required regardless; this is the honest UI treatment.
+  const followUpLocked = userTier === SubscriptionTier.Free;
 
   return (
     <main
@@ -256,15 +288,38 @@ export function ReportViewScreen({ workspaceId, reportId, userTier }: ReportView
             >
               Export
             </Button>
-            <Link
-              href={routes.workspace(workspaceId)}
-              className={buttonClassNames("outline", "w-full justify-start")}
+            <Button
+              variant="outline"
+              className="w-full justify-start"
+              onClick={() => setFollowUpOpen((open) => !open)}
+              disabled={followUpLocked}
+              aria-expanded={followUpOpen}
             >
-              {/* screens/09's "Ask a follow-up" affordance. Report-scoped forking (FEAT-021) is a
-                  Phase 5 feature; this phase routes it to the existing Ask panel on Workspace Home,
-                  which is the working question-asking path. */}
-              Ask a follow-up
-            </Link>
+              {/* screens/09's "Ask a follow-up" affordance. Report-scoped (FEAT-021): the input
+                  below posts a run with this report as its parent, and the resulting report links
+                  back here. Pro/Team only (monetization.md); the server enforces it. */}
+              {followUpLocked ? "Ask a follow-up (Pro)" : "Ask a follow-up"}
+            </Button>
+            {followUpOpen && (
+              <div className="flex flex-col gap-2 rounded-md border border-border bg-surface-secondary p-3">
+                <Input
+                  label="Follow-up question"
+                  value={followUpDraft}
+                  onChange={(event) => setFollowUpDraft(event.target.value)}
+                  disabled={submittingFollowUp}
+                  placeholder="e.g. break this down by month"
+                  data-testid="followup-input-web"
+                />
+                <Button
+                  variant="primary"
+                  loading={submittingFollowUp}
+                  disabled={followUpDraft.trim().length === 0}
+                  onClick={handleFollowUpSubmit}
+                >
+                  Ask
+                </Button>
+              </div>
+            )}
             <Link
               href={routes.run(workspaceId, report.run_id)}
               className={buttonClassNames("ghost", "w-full justify-start")}
@@ -280,6 +335,27 @@ export function ReportViewScreen({ workspaceId, reportId, userTier }: ReportView
         data-testid="report-mobile-actions"
         className="fixed inset-x-0 bottom-0 z-40 border-t border-border bg-surface p-3 md:hidden"
       >
+        {followUpOpen && (
+          <div className="mx-auto mb-3 flex w-full max-w-3xl gap-2">
+            <Input
+              label="Follow-up question"
+              value={followUpDraft}
+              onChange={(event) => setFollowUpDraft(event.target.value)}
+              disabled={submittingFollowUp}
+              placeholder="e.g. break this down by month"
+              data-testid="followup-input-mobile"
+            />
+            <Button
+              variant="primary"
+              loading={submittingFollowUp}
+              disabled={followUpDraft.trim().length === 0}
+              onClick={handleFollowUpSubmit}
+              className="shrink-0"
+            >
+              Ask
+            </Button>
+          </div>
+        )}
         <div className="mx-auto flex w-full max-w-3xl gap-3">
           <Button variant="primary" touchTarget className="flex-1" onClick={openExport}>
             Export
@@ -288,11 +364,13 @@ export function ReportViewScreen({ workspaceId, reportId, userTier }: ReportView
             variant="outline"
             touchTarget
             className="flex-1"
-            onClick={() => router.push(routes.workspace(workspaceId))}
+            onClick={() => setFollowUpOpen((open) => !open)}
+            disabled={followUpLocked}
+            aria-expanded={followUpOpen}
           >
-            {/* screens/09's mobile "Ask a follow-up". Report-scoped forking (FEAT-021) is Phase 5;
-                this phase routes to the existing Ask panel on Workspace Home. */}
-            Ask a follow-up
+            {/* screens/09's mobile "Ask a follow-up". Report-scoped (FEAT-021): the input above
+                posts a run with this report as its parent. Pro/Team only (monetization.md). */}
+            {followUpLocked ? "Ask a follow-up (Pro)" : "Ask a follow-up"}
           </Button>
         </div>
       </div>

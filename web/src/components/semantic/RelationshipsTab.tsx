@@ -22,7 +22,12 @@ export interface RelationshipsTabProps {
 function columnLabel(columnsById: Map<string, ConfirmationColumn>, columnId: string): string {
   const col = columnsById.get(columnId);
   if (!col) return columnId;
-  return `${col.dataset_filename}: ${col.name}`;
+  // FEAT-010 AC3: exclusion status is visible wherever the column appears in the semantic layer, so
+  // a relationship column that is excluded from model visibility is labeled as such rather than
+  // looking identical to an ordinary column.
+  return col.excluded_from_model
+    ? `${col.dataset_filename}: ${col.name} (excluded from model)`
+    : `${col.dataset_filename}: ${col.name}`;
 }
 
 function cardinalityLabel(cardinality: Cardinality): string {

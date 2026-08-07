@@ -22,6 +22,9 @@ import (
 type RunStore interface {
 	Create(ctx context.Context, run domain.Run) error
 	GetByID(ctx context.Context, id string) (domain.Run, error)
+	// ListByParentRun backs FEAT-025's branch/tree presentation: the Run Viewer shows every run
+	// forked from the run being viewed as its branches.
+	ListByParentRun(ctx context.Context, parentRunID string) ([]domain.Run, error)
 }
 
 // RunStepStore exposes a run's persisted step feed, satisfied by postgres.StepRepository.
@@ -51,44 +54,72 @@ type RunStepStore interface {
 // AmendAndResume (FEAT-024) restarts a halted run from an amended step: the amended step and
 // everything after it in pipeline order are invalidated for re-execution, earlier completed steps
 // are preserved, and execution resumes. It returns immediately.
+//
+// Clarify (FEAT-033) answers a run that paused for a clarifying question: the answer is written
+// into the plan step's persisted output and the run resumes from generate_sql with the
+// clarification applied. It returns immediately.
 type RunExecutor interface {
 	Submit(userID string, run domain.Run)
 	SubmitWithSQL(userID string, run domain.Run, sql string)
 	Resume(userID string, runID string)
 	Halt(userID string, runID string)
 	AmendAndResume(userID string, runID string, stepName domain.StepName, input string)
+	Clarify(userID string, runID string, answer string)
 }
 
 // RegisterRunRoutes wires FEAT-013's endpoints onto r. reports backs the GET run response's
-// report_id lookup (FEAT-018); it may be nil in test doubles that do not exercise that field.
+// report_id lookup (FEAT-018) and the FEAT-021/FEAT-025 parent-context validation on run creation
+// (a follow-up report must exist in the workspace before a run may claim it as parent); it may be
+// nil in test doubles that do not exercise those fields.
+//
+// users backs FEAT-021/FEAT-025's tier gate: compositional follow-ups and fork-on-amendment are
+// Pro/Team per monetization.md, enforced against the AUTHORITATIVE tier from UserTierLookup (never
+// the session cookie's claim) — the same discipline RegisterExportRoutes follows. It may be nil in
+// test doubles that do not exercise the gate.
 //
 // corrections backs FEAT-020's capture hook: when a run is created with the user's edited SQL
-// (FEAT-018), handleCreateRun persists a durable Correction row attributing the edit. It is the same
-// SemanticCorrectionStore the semantic layer routes use (api.go's SemanticCorrections seam) and may
-// be nil when the semantic layer is not wired (e.g. minimal run-route tests) — capture is skipped,
-// never an error.
+// (FEAT-018), handleCreateRun persists a durable Correction row attributing the edit, and the
+// clarifying-question flow (FEAT-033) persists each clarification the same way so the same ambiguity
+// is not re-asked in the same context. It is the same SemanticCorrectionStore the semantic layer
+// routes use (api.go's SemanticCorrections seam) and may be nil when the semantic layer is not wired
+// (e.g. minimal run-route tests) — capture is skipped, never an error.
 //
 // hub, when non-nil, backs FEAT-023's live run-event stream (a "run.status"/step event subscription
 // that streams the run's in-progress DAG transitions to the Run Viewer over SSE) and FEAT-022's
 // resume endpoint.
-func RegisterRunRoutes(r chi.Router, workspaces WorkspaceStore, runs RunStore, steps RunStepStore, reports ReportStore, corrections SemanticCorrectionStore, executor RunExecutor, hub *events.Hub, logger *slog.Logger) {
-	r.Post("/workspaces/{workspaceId}/runs", handleCreateRun(workspaces, runs, corrections, executor, logger))
-	r.Get("/workspaces/{workspaceId}/runs/{runId}", handleGetRun(workspaces, runs, steps, reports, logger))
+//
+// The clarify endpoint is registered OUTSIDE the hub gate on purpose: answering a clarifying
+// question is a run mutation, not a streaming concern, so FEAT-033 keeps working even in a test or
+// minimal deployment where the SSE hub is not wired.
+func RegisterRunRoutes(r chi.Router, workspaces WorkspaceStore, members MemberLookupStore, runs RunStore, steps RunStepStore, reports ReportStore, users UserTierLookup, corrections SemanticCorrectionStore, executor RunExecutor, hub *events.Hub, logger *slog.Logger) {
+	r.Post("/workspaces/{workspaceId}/runs", handleCreateRun(workspaces, members, runs, reports, users, corrections, executor, logger))
+	r.Get("/workspaces/{workspaceId}/runs/{runId}", handleGetRun(workspaces, members, runs, steps, reports, logger))
+	r.Post("/workspaces/{workspaceId}/runs/{runId}/clarify", handleClarifyRun(workspaces, members, runs, steps, corrections, executor, logger))
 	if hub != nil {
-		r.Get("/workspaces/{workspaceId}/runs/{runId}/stream", handleStreamRun(workspaces, runs, hub, logger))
-		r.Post("/workspaces/{workspaceId}/runs/{runId}/resume", handleResumeRun(workspaces, runs, executor, logger))
-		r.Post("/workspaces/{workspaceId}/runs/{runId}/halt", handleHaltRun(workspaces, runs, executor, logger))
-		r.Post("/workspaces/{workspaceId}/runs/{runId}/amend", handleAmendRun(workspaces, runs, executor, logger))
+		r.Get("/workspaces/{workspaceId}/runs/{runId}/stream", handleStreamRun(workspaces, members, runs, hub, logger))
+		r.Post("/workspaces/{workspaceId}/runs/{runId}/resume", handleResumeRun(workspaces, members, runs, executor, logger))
+		r.Post("/workspaces/{workspaceId}/runs/{runId}/halt", handleHaltRun(workspaces, members, runs, executor, logger))
+		r.Post("/workspaces/{workspaceId}/runs/{runId}/amend", handleAmendRun(workspaces, members, runs, executor, logger))
 	}
 }
 
 // createRunRequest is the POST body for asking a question: screens/04-workspace-home.md's Ask panel,
-// and FEAT-018's "Run edited query" action (question_text carried forward + the edited sql).
+// FEAT-018's "Run edited query" action (question_text carried forward + the edited sql), FEAT-021's
+// report-scoped "Ask a follow-up" (parent_report_id), and FEAT-025's fork-on-amendment
+// (parent_run_id).
 type createRunRequest struct {
 	QuestionText string `json:"question_text"`
 	// SQL, when present, seeds the new run's generate_sql output with the user's edited query
 	// (FEAT-018): the run skips plan and model generate_sql and executes exactly this SQL.
 	SQL string `json:"sql,omitempty"`
+	// ParentRunID forks this run from the named run (FEAT-025): the new run records it as
+	// parent_run_id, the original stays intact, and the Run Viewer presents both as a branch tree.
+	ParentRunID string `json:"parent_run_id,omitempty"`
+	// ParentReportID makes this run a compositional follow-up on the named report (FEAT-021): the
+	// run is linked to the report's source run, and the report this run materializes records the
+	// parent report id. When both parent fields are present, the report's run takes precedence and
+	// the run linkage is derived from it (they are the same fork under two names).
+	ParentReportID string `json:"parent_report_id,omitempty"`
 }
 
 // handleCreateRun serves screens/04-workspace-home.md's Ask panel: POST /api/workspaces/:id/runs.
@@ -103,7 +134,15 @@ type createRunRequest struct {
 // handed it. Capture is best-effort by design — a failure to persist the preference logs and
 // continues, because the run the user asked for is the primary resource and must not be blocked on a
 // secondary write.
-func handleCreateRun(workspaces WorkspaceStore, runs RunStore, corrections SemanticCorrectionStore, executor RunExecutor, logger *slog.Logger) http.HandlerFunc {
+//
+// FEAT-021/FEAT-025's parent context also lives here: a request carrying parent_report_id (a
+// compositional follow-up) or parent_run_id (a fork-on-amendment) links the new run to its parent
+// BEFORE the executor sees it, so the report this run materializes can record its own parent link.
+// Both are validated against the workspace (non-enumeration): an id the caller cannot own reads as
+// not found. Both are also TIER-GATED — monetization.md gates FEAT-021/FEAT-025 to Pro/Team — and
+// the authoritative tier is read from Postgres via users, never the session cookie's claim (the
+// same discipline RegisterExportRoutes follows).
+func handleCreateRun(workspaces WorkspaceStore, members MemberLookupStore, runs RunStore, reports ReportStore, users UserTierLookup, corrections SemanticCorrectionStore, executor RunExecutor, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
@@ -111,7 +150,7 @@ func handleCreateRun(workspaces WorkspaceStore, runs RunStore, corrections Seman
 		}
 
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+		if _, ok := requireWorkspaceMutationAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
 			return
 		}
 
@@ -138,6 +177,69 @@ func handleCreateRun(workspaces WorkspaceStore, runs RunStore, corrections Seman
 			Status:       domain.RunQueued,
 			CreatedAt:    time.Now().UTC(),
 		}
+
+		// Resolve the parent linkage (FEAT-021/FEAT-025). A report-scoped follow-up is the richer
+		// context: validate the report exists in this workspace and derive the run linkage from the
+		// report's own source run. A bare parent_run_id (fork-on-amendment) is validated the same
+		// non-enumeration way as handleGetRun's workspace check.
+		parentID := strings.TrimSpace(req.ParentRunID)
+		reportID := strings.TrimSpace(req.ParentReportID)
+		if parentID != "" || reportID != "" {
+			// Tier gate: follow-ups and forks are Pro/Team (monetization.md). The authoritative
+			// tier comes from the store, not the session cookie.
+			if users != nil {
+				user, _, err := users.FindByID(r.Context(), claims.UserID)
+				if err != nil {
+					logger.Error("looking up user for follow-up tier gate",
+						slog.String("workspace_id", workspaceID),
+						slog.String("error", err.Error()),
+					)
+					respondJSON(w, http.StatusInternalServerError, map[string]string{
+						"error": "Something went wrong. Try again.",
+						"code":  "internal_error",
+					})
+					return
+				}
+				if user.Tier != domain.TierPro && user.Tier != domain.TierTeam {
+					respondJSON(w, http.StatusForbidden, map[string]string{
+						"error": "Follow-up questions and forking are available on the Pro and Team plans. Upgrade to branch from a report or run.",
+						"code":  "upgrade_required",
+					})
+					return
+				}
+			}
+		}
+		if reportID != "" {
+			if reports == nil {
+				respondJSON(w, http.StatusBadRequest, map[string]string{
+					"error": "Follow-up questions are not available right now.",
+					"code":  "parent_context_unavailable",
+				})
+				return
+			}
+			parent, err := reports.GetByID(r.Context(), workspaceID, reportID)
+			if err != nil {
+				// The store scopes by workspace, so both "does not exist" and "belongs to another
+				// workspace" read as one 404 — the same stance every read endpoint takes.
+				respondJSON(w, http.StatusNotFound, map[string]string{
+					"error": "Report not found.",
+					"code":  "not_found",
+				})
+				return
+			}
+			parentID = parent.RunID
+		} else if parentID != "" {
+			parent, err := runs.GetByID(r.Context(), parentID)
+			if err != nil || parent.WorkspaceID != workspaceID {
+				respondJSON(w, http.StatusNotFound, map[string]string{
+					"error": "Run not found.",
+					"code":  "not_found",
+				})
+				return
+			}
+		}
+		run.ParentRunID = parentID
+
 		if err := runs.Create(r.Context(), run); err != nil {
 			logger.Error("creating run",
 				slog.String("workspace_id", workspaceID),
@@ -227,7 +329,7 @@ const correctionDescriptionMax = 60
 // round trip renders both the status pill and the step feed consistently. A run-scoped report_id is
 // attached when one of this run's reports exists (FEAT-018's auto-navigate-to-report uses it); null
 // while running or when no report materialized.
-func handleGetRun(workspaces WorkspaceStore, runs RunStore, steps RunStepStore, reports ReportStore, logger *slog.Logger) http.HandlerFunc {
+func handleGetRun(workspaces WorkspaceStore, members MemberLookupStore, runs RunStore, steps RunStepStore, reports ReportStore, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
@@ -235,7 +337,7 @@ func handleGetRun(workspaces WorkspaceStore, runs RunStore, steps RunStepStore, 
 		}
 
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+		if _, _, ok := requireWorkspaceAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
 			return
 		}
 
@@ -285,10 +387,27 @@ func handleGetRun(workspaces WorkspaceStore, runs RunStore, steps RunStepStore, 
 			}
 		}
 
+		// FEAT-025: the run's forked children (the branches of the tree this run is the parent of).
+		// Served with the run itself so the Run Viewer's branch/tree presentation is one round trip.
+		// A store error degrades to an empty list — the run is the primary resource and the tree is
+		// a presentation nicety; the fork link the run already carries never depends on it.
+		forked, err := runs.ListByParentRun(r.Context(), run.ID)
+		if err != nil {
+			logger.Error("listing forked runs",
+				slog.String("run_id", run.ID),
+				slog.String("error", err.Error()),
+			)
+			forked = []domain.Run{}
+		}
+		if forked == nil {
+			forked = []domain.Run{}
+		}
+
 		respondJSON(w, http.StatusOK, map[string]any{
-			"run":       run,
-			"steps":     stepList,
-			"report_id": reportID,
+			"run":         run,
+			"steps":       stepList,
+			"report_id":   reportID,
+			"forked_runs": forked,
 		})
 	}
 }
@@ -307,7 +426,7 @@ func handleGetRun(workspaces WorkspaceStore, runs RunStore, steps RunStepStore, 
 // timeout, an accepted Pass-1 limitation) is repaired by the viewer re-reading state and
 // reconnecting. A stream.end event is sent after the run reaches a terminal state so the viewer can
 // stop listening.
-func handleStreamRun(workspaces WorkspaceStore, runs RunStore, hub *events.Hub, logger *slog.Logger) http.HandlerFunc {
+func handleStreamRun(workspaces WorkspaceStore, members MemberLookupStore, runs RunStore, hub *events.Hub, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
@@ -315,7 +434,7 @@ func handleStreamRun(workspaces WorkspaceStore, runs RunStore, hub *events.Hub, 
 		}
 
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+		if _, _, ok := requireWorkspaceAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
 			return
 		}
 
@@ -397,7 +516,7 @@ func writeSSE(w io.Writer, flusher http.Flusher, ev events.Event) {
 // idempotency+skip guarantees make this safe: completed steps are replayed, the first non-completed
 // one is reclaimed, and a run already being executed concurrently is rejected with 409 rather than
 // double-driven. A truly completed run is also rejected — there is nothing honest to resume.
-func handleResumeRun(workspaces WorkspaceStore, runs RunStore, executor RunExecutor, logger *slog.Logger) http.HandlerFunc {
+func handleResumeRun(workspaces WorkspaceStore, members MemberLookupStore, runs RunStore, executor RunExecutor, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
@@ -405,7 +524,7 @@ func handleResumeRun(workspaces WorkspaceStore, runs RunStore, executor RunExecu
 		}
 
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+		if _, ok := requireWorkspaceMutationAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
 			return
 		}
 
@@ -440,7 +559,7 @@ func handleResumeRun(workspaces WorkspaceStore, runs RunStore, executor RunExecu
 // the current step's model/engine work) and marks the run halted so the viewer pivots to the
 // halted/editable state. A terminal run has nothing to halt; the endpoint still acknowledges the
 // request (idempotent), mirroring how resume treats a no-op resume.
-func handleHaltRun(workspaces WorkspaceStore, runs RunStore, executor RunExecutor, logger *slog.Logger) http.HandlerFunc {
+func handleHaltRun(workspaces WorkspaceStore, members MemberLookupStore, runs RunStore, executor RunExecutor, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
@@ -448,7 +567,7 @@ func handleHaltRun(workspaces WorkspaceStore, runs RunStore, executor RunExecuto
 		}
 
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+		if _, ok := requireWorkspaceMutationAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
 			return
 		}
 
@@ -482,7 +601,7 @@ type amendRunRequest struct {
 // for re-execution and resumes the run from that step forward — earlier completed steps are never
 // re-run (AC3). The request is validated for the fields the executor consumes; a blank step or a
 // blank input is a client bug, not a model request.
-func handleAmendRun(workspaces WorkspaceStore, runs RunStore, executor RunExecutor, logger *slog.Logger) http.HandlerFunc {
+func handleAmendRun(workspaces WorkspaceStore, members MemberLookupStore, runs RunStore, executor RunExecutor, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
@@ -490,7 +609,7 @@ func handleAmendRun(workspaces WorkspaceStore, runs RunStore, executor RunExecut
 		}
 
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+		if _, ok := requireWorkspaceMutationAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
 			return
 		}
 
@@ -525,5 +644,154 @@ func handleAmendRun(workspaces WorkspaceStore, runs RunStore, executor RunExecut
 
 		executor.AmendAndResume(claims.UserID, runID, req.StepName, req.Input)
 		respondJSON(w, http.StatusAccepted, map[string]any{"status": "amended", "run_id": runID})
+	}
+}
+
+// clarifyRunRequest is the POST body for answering a run's clarifying question (FEAT-033, screen 12).
+type clarifyRunRequest struct {
+	// Answer is the user's resolution of the specific ambiguity, e.g. "By revenue".
+	Answer string `json:"answer"`
+}
+
+// handleClarifyRun serves the clarifying-question flow (FEAT-033, screen 12):
+// POST /api/workspaces/:id/runs/:runId/clarify.
+//
+// A run that paused with a pending clarifying question (the plan step completed with
+// needs_clarification and the run was settled to halted) is answered here: the handler persists the
+// clarification as a durable, workspace-scoped Correction — so the SAME ambiguity is not re-asked
+// for a functionally identical follow-up in the same context (AC3, via the corrections grounding
+// every later payload carries) — and hands the answer to the executor, which writes it into the plan
+// step's output and resumes the run from generate_sql with the clarification applied.
+//
+// Guards: the run must be halted AND its plan step must carry a pending clarification — a run the
+// user halted manually has nothing to clarify, and answering it would be a fabricated resolution.
+// The executor re-verifies the same guards; the handler's checks are the HTTP-layer control that
+// turns a misdirected POST into a 409 rather than a silent no-op.
+func handleClarifyRun(workspaces WorkspaceStore, members MemberLookupStore, runs RunStore, steps RunStepStore, corrections SemanticCorrectionStore, executor RunExecutor, logger *slog.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		claims, ok := requireClaims(w, r)
+		if !ok {
+			return
+		}
+
+		workspaceID := chi.URLParam(r, "workspaceId")
+		if _, ok := requireWorkspaceMutationAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
+			return
+		}
+
+		runID := chi.URLParam(r, "runId")
+		run, err := runs.GetByID(r.Context(), runID)
+		if err != nil || run.WorkspaceID != workspaceID {
+			respondJSON(w, http.StatusNotFound, map[string]string{
+				"error": "Run not found.",
+				"code":  "not_found",
+			})
+			return
+		}
+
+		var req clarifyRunRequest
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		answer := strings.TrimSpace(req.Answer)
+		if answer == "" {
+			respondJSON(w, http.StatusBadRequest, map[string]string{
+				"error": "An answer is required.",
+				"code":  "invalid_answer",
+			})
+			return
+		}
+
+		// Verify the run is actually paused awaiting clarification: halted status AND a completed
+		// plan step whose output carries a pending needs_clarification. Anything else is a 409 —
+		// the run is not in a state this answer belongs to.
+		plan, ok := planStepPendingClarification(r, steps, runID)
+		if !ok {
+			respondJSON(w, http.StatusConflict, map[string]string{
+				"error": "This run is not waiting for a clarifying question.",
+				"code":  "run_not_awaiting_clarification",
+			})
+			return
+		}
+
+		// FEAT-033 AC3: persist the clarification as a durable, workspace-scoped preference so the
+		// same ambiguity is not re-asked in this context. Best-effort like FEAT-020's capture: the
+		// resumed run is the primary resource and must not be blocked on a secondary write.
+		if corrections != nil {
+			if err := corrections.Create(r.Context(), clarifyCorrection(run, plan, answer)); err != nil {
+				logger.Error("persisting clarification correction",
+					slog.String("workspace_id", workspaceID),
+					slog.String("run_id", run.ID),
+					slog.String("error", err.Error()),
+				)
+			}
+		}
+
+		executor.Clarify(claims.UserID, runID, answer)
+		respondJSON(w, http.StatusAccepted, map[string]any{"status": "clarified", "run_id": runID})
+	}
+}
+
+// pendingClarificationPlan is the slice of a plan step's output handleClarifyRun needs: whether a
+// clarification is pending and the ambiguity's stable key + question for the persisted correction.
+type pendingClarificationPlan struct {
+	NeedsClarification    bool     `json:"needs_clarification"`
+	ClarificationQuestion string   `json:"clarification_question"`
+	ClarificationOptions  []string `json:"clarification_options"`
+	AmbiguityKey          string   `json:"ambiguity_key"`
+	ClarificationAnswer   string   `json:"clarification_answer"`
+}
+
+// planStepPendingClarification reads the run's plan step and reports whether it carries a PENDING
+// clarifying question (needs_clarification set and no answer yet). ok=false covers every other
+// state — no plan step, plan not complete, malformed output, or an already-answered clarification.
+func planStepPendingClarification(r *http.Request, steps RunStepStore, runID string) (pendingClarificationPlan, bool) {
+	list, err := steps.ListByRun(r.Context(), runID)
+	if err != nil {
+		return pendingClarificationPlan{}, false
+	}
+	for _, st := range list {
+		if st.StepName != domain.StepPlan || st.Status != domain.StepComplete {
+			continue
+		}
+		var plan pendingClarificationPlan
+		if err := json.Unmarshal([]byte(st.Output), &plan); err != nil {
+			return pendingClarificationPlan{}, false
+		}
+		if !plan.NeedsClarification || strings.TrimSpace(plan.ClarificationAnswer) != "" {
+			return pendingClarificationPlan{}, false
+		}
+		return plan, true
+	}
+	return pendingClarificationPlan{}, false
+}
+
+// clarifyCorrection builds the durable Correction row FEAT-033 persists when a user answers a
+// clarifying question, so the same ambiguity is not re-asked for functionally identical follow-up
+// questions in the same context (AC3).
+//
+// The row's shape rides the existing corrections surface: Description leads with "Clarification:"
+// and carries the ambiguity key in brackets (the plan prompt recognizes this prefix), CorrectedLogic
+// is the user's answer, and OriginalLogic is the ambiguity key (the "logic" the clarification
+// overrides). OriginatingRunID anchors it to the run whose clarification produced it, matching
+// FEAT-020's attribution convention.
+func clarifyCorrection(run domain.Run, plan pendingClarificationPlan, answer string) domain.Correction {
+	key := strings.TrimSpace(plan.AmbiguityKey)
+	question := strings.TrimSpace(plan.ClarificationQuestion)
+	if key == "" {
+		key = "ambiguity"
+	}
+	description := fmt.Sprintf("Clarification [%s]: %s", key, question)
+	if question == "" {
+		description = fmt.Sprintf("Clarification [%s]", key)
+	}
+	return domain.Correction{
+		ID:               uuid.NewString(),
+		WorkspaceID:      run.WorkspaceID,
+		Description:      description,
+		OriginalLogic:    key,
+		CorrectedLogic:   answer,
+		OriginatingRunID: run.ID,
+		CreatedAt:        time.Now().UTC(),
 	}
 }

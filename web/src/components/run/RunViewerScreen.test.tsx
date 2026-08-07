@@ -128,7 +128,7 @@ describe("RunViewerScreen", () => {
     expect(screen.getByText("Waiting for the run to begin…")).toBeInTheDocument();
   });
 
-  it("surfaces the Phase 2 clarification reason when the plan judges the question unanswerable", async () => {
+  it("surfaces the unanswerable reason when the plan judges the question unanswerable (FEAT-033)", async () => {
     getMock.mockResolvedValue({
       run: run("failed"),
       steps: [
@@ -143,7 +143,7 @@ describe("RunViewerScreen", () => {
     render(<RunViewerScreen workspaceId="ws-1" runId="run-1" />);
 
     const alert = await screen.findByRole("alert");
-    expect(alert).toHaveTextContent("This question needs clarification");
+    expect(alert).toHaveTextContent("can't be answered from the available data");
     expect(alert).toHaveTextContent("The data has no column that records region.");
   });
 
@@ -283,7 +283,7 @@ describe("RunViewerScreen", () => {
     expect(pushMock).not.toHaveBeenCalled();
   });
 
-  it("starts a NEW run seeded with the edited SQL and navigates to it (FEAT-018)", async () => {
+  it("starts a NEW run seeded with the edited SQL, forked from this run (FEAT-018/FEAT-025)", async () => {
     getMock.mockResolvedValue({ run: run("complete"), steps: completeRunSteps() });
     postMock.mockResolvedValue({ run: run("complete", { id: "run-2" }) });
     render(<RunViewerScreen workspaceId="ws-1" runId="run-1" />);
@@ -302,7 +302,12 @@ describe("RunViewerScreen", () => {
     await vi.waitFor(() => {
       expect(postMock).toHaveBeenCalledWith(
         "/v1/workspaces/ws-1/runs",
-        expect.objectContaining({ question_text: "How many customers per region?", sql: edited }),
+        expect.objectContaining({
+          question_text: "How many customers per region?",
+          sql: edited,
+          // FEAT-025: amending a run forks it — the new run is linked to the viewed run.
+          parent_run_id: "run-1",
+        }),
       );
       expect(pushMock).toHaveBeenCalledWith("/workspaces/ws-1/runs/run-2");
     });
@@ -332,5 +337,151 @@ describe("RunViewerScreen", () => {
 
     await screen.findByText("How many customers per region?");
     expect(screen.queryByRole("link", { name: /correction saved/i })).not.toBeInTheDocument();
+  });
+
+  it("shows the Clarifying Question Prompt when the plan paused for a clarification (FEAT-033)", async () => {
+    getMock.mockResolvedValue({
+      run: run("halted"),
+      steps: [
+        step("plan", {
+          output: JSON.stringify({
+            answerable: true,
+            needs_clarification: true,
+            clarification_question: "Do you mean revenue by total value or by order count?",
+            clarification_options: ["By revenue", "By count"],
+            ambiguity_key: "metric_undefined",
+          }),
+        }),
+      ],
+    });
+    render(<RunViewerScreen workspaceId="ws-1" runId="run-1" />);
+
+    // Screen 12's card renders inline with the SPECIFIC ambiguity and its discrete options.
+    const card = await screen.findByTestId("clarification-card");
+    expect(card).toHaveTextContent("Do you mean revenue by total value or by order count?");
+    expect(screen.getByRole("radio", { name: "By revenue" })).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: "By count" })).toBeInTheDocument();
+    // Submit is disabled until a response is given.
+    expect(screen.getByRole("button", { name: "Submit" })).toBeDisabled();
+  });
+
+  it("submits the clarifying answer, collapses to the Resolved summary, and the run resumes (FEAT-033)", async () => {
+    getMock.mockResolvedValue({
+      run: run("halted"),
+      steps: [
+        step("plan", {
+          output: JSON.stringify({
+            answerable: true,
+            needs_clarification: true,
+            clarification_question: "Do you mean revenue by total value or by order count?",
+            clarification_options: ["By revenue", "By count"],
+            ambiguity_key: "metric_undefined",
+          }),
+        }),
+      ],
+    });
+    postMock.mockResolvedValue({ status: "clarified", run_id: "run-1" });
+    render(<RunViewerScreen workspaceId="ws-1" runId="run-1" />);
+
+    await screen.findByTestId("clarification-card");
+    const { fireEvent } = await import("@testing-library/react");
+    fireEvent.click(screen.getByRole("radio", { name: "By revenue" }));
+    const submit = screen.getByRole("button", { name: "Submit" });
+    expect(submit).not.toBeDisabled();
+    submit.click();
+
+    await vi.waitFor(() => {
+      expect(postMock).toHaveBeenCalledWith("/v1/workspaces/ws-1/runs/run-1/clarify", {
+        answer: "By revenue",
+      });
+    });
+    // Screen 12's Resolved state: the card collapses to a compact summary.
+    expect(await screen.findByTestId("clarification-resolved")).toHaveTextContent("By revenue");
+  });
+
+  it("shows the forked-from link and the forked-runs branch tree (FEAT-025)", async () => {
+    getMock.mockResolvedValue({
+      run: run("complete", { parent_run_id: "run-parent" }),
+      steps: completeRunSteps(),
+      forked_runs: [
+        run("complete", { id: "run-child-1", question_text: "Break it down by month" }),
+      ],
+    });
+    render(<RunViewerScreen workspaceId="ws-1" runId="run-1" />);
+
+    const parentLink = await screen.findByRole("link", { name: /forked from run run-pare/i });
+    expect(parentLink).toHaveAttribute("href", "/workspaces/ws-1/runs/run-parent");
+
+    const childLink = await screen.findByRole("link", { name: /break it down by month/i });
+    expect(childLink).toHaveAttribute("href", "/workspaces/ws-1/runs/run-child-1");
+    // The tree reads as branches, not a flat list: the header names them.
+    expect(screen.getByText(/Forked runs/)).toBeInTheDocument();
+  });
+
+  it("surfaces shadow-check disagreements and the adversarial review verdict in the step feed (FEAT-031/032)", async () => {
+    getMock.mockResolvedValue({
+      run: run("complete"),
+      steps: [
+        ...completeRunSteps(),
+        step("shadow_check", {
+          output: JSON.stringify({
+            checks: [
+              {
+                column: "cnt",
+                primary_value: 300,
+                shadow_value: 250,
+                matched: false,
+                message:
+                  "COUNT totals 300 over the result set but 250 recomputed directly from the source table without the join — a join may be inflating (or deflating) this value.",
+              },
+            ],
+          }),
+        }),
+        step("adversarial_review", {
+          output: JSON.stringify({
+            matches: true,
+            verdict: "The SQL counts customers per region as asked.",
+            severity: "ok",
+          }),
+        }),
+      ],
+    });
+    render(<RunViewerScreen workspaceId="ws-1" runId="run-1" />);
+
+    // The shadow mismatch is surfaced honestly — never silently discarded.
+    expect(
+      await screen.findByText(/COUNT totals 300 over the result set but 250 recomputed/i),
+    ).toBeInTheDocument();
+    // The adversarial verdict is surfaced too.
+    expect(
+      screen.getByText("The SQL counts customers per region as asked."),
+    ).toBeInTheDocument();
+  });
+
+  it("surfaces an adversarial-review block as the failed step's reason (FEAT-032)", async () => {
+    getMock.mockResolvedValue({
+      run: run("failed"),
+      steps: [
+        step("plan", { output: JSON.stringify({ answerable: true, approach: "x" }) }),
+        step("generate_sql", { output: JSON.stringify({ sql: SQL_TEXT }) }),
+        step("execute", {
+          output: JSON.stringify({ columns: ["region", "cnt"], rows: [["North", 10]], row_count: 1 }),
+        }),
+        step("shadow_check", { output: JSON.stringify({ checks: [] }) }),
+        step("adversarial_review", {
+          status: "failed",
+          output: "The question asks for active customers only, but the SQL has no status filter.",
+        }),
+      ],
+    });
+    render(<RunViewerScreen workspaceId="ws-1" runId="run-1" />);
+
+    // The failed adversarial step shows its verdict as the reason, before any results would be
+    // trusted.
+    expect(
+      await screen.findByText(
+        "The question asks for active customers only, but the SQL has no status filter.",
+      ),
+    ).toBeInTheDocument();
   });
 });

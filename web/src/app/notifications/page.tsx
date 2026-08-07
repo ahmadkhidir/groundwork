@@ -1,16 +1,9 @@
 import type { Metadata } from "next";
-import { PlaceholderScreen } from "@/components/PlaceholderScreen";
+import { NotificationsScreen } from "@/components/notifications/NotificationsScreen";
 
 export const metadata: Metadata = { title: "Notifications" };
 
-/** Route: `/notifications` — see docs/Groundwork/screens/16-notifications.md */
+/** Route: `/notifications` — see docs/Groundwork/screens/16-notifications.md (FEAT-026) */
 export default function Page() {
-  return (
-    <PlaceholderScreen
-      screen="16 — Notifications"
-      spec="screens/16-notifications.md"
-      features="FEAT-026"
-      phase="Phase 5"
-    />
-  );
+  return <NotificationsScreen />;
 }

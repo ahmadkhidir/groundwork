@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { ArrowLeft, Sparkles } from "lucide-react";
+import { ArrowLeft, GitBranch, Sparkles } from "lucide-react";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { StatusPill, runStatusPill } from "@/components/ui/StatusPill";
 import { ErrorState } from "@/components/shared/ErrorState";
@@ -11,6 +11,7 @@ import { Skeleton } from "@/components/shared/Skeleton";
 import { EditableCodeBlock } from "./EditableCodeBlock";
 import { StepFeed } from "./StepFeed";
 import { ResultTable } from "./ResultTable";
+import { ClarifyingQuestionCard } from "./ClarifyingQuestionCard";
 import {
   parseExecuteStep,
   parseGenerateSQLStep,
@@ -20,6 +21,7 @@ import { api, ApiError, subscribeToStream } from "@/lib/api-client";
 import { routes } from "@/lib/routes";
 import {
   RunStatus,
+  isForkedRun,
   type Run,
   type Step,
   type StepName,
@@ -40,11 +42,22 @@ interface GetRunResponse {
    * "View report" link.
    */
   report_id?: string | null;
+  /**
+   * Runs forked from this one (FEAT-025's branch/tree presentation). Empty for a run with no
+   * branches; the parent link a forked run carries is the other half of the tree.
+   */
+  forked_runs?: Run[];
 }
 
 type ScreenState =
   | { status: "loading" }
-  | { status: "loaded"; run: Run; steps: Step[]; reportId: string | null }
+  | {
+      status: "loaded";
+      run: Run;
+      steps: Step[];
+      reportId: string | null;
+      forkedRuns: Run[];
+    }
   | { status: "error"; message: string };
 
 /**
@@ -113,6 +126,10 @@ export function RunViewerScreen({ workspaceId, runId }: RunViewerScreenProps) {
   const [cachedFrom, setCachedFrom] = useState<string | null>(null);
   // Busy state while "Run edited query" is submitting the new run.
   const [submittingEdit, setSubmittingEdit] = useState(false);
+  // Busy state while a clarifying answer (FEAT-033) is being submitted, and the resolved answer
+  // once submitted (screen 12's Resolved state collapses the card to a summary).
+  const [submittingClarify, setSubmittingClarify] = useState(false);
+  const [clarifiedAnswer, setClarifiedAnswer] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -125,6 +142,7 @@ export function RunViewerScreen({ workspaceId, runId }: RunViewerScreenProps) {
         run: response.run,
         steps: response.steps,
         reportId,
+        forkedRuns: response.forked_runs ?? [],
       });
       loaded.current = true;
       // FEAT-018 auto-navigate: a run that completed while the viewer was watching materialized a
@@ -149,8 +167,9 @@ export function RunViewerScreen({ workspaceId, runId }: RunViewerScreenProps) {
     }
   }, [router, workspaceId, runId]);
 
-  // FEAT-018: "Run edited query" starts a NEW run seeded with the edited SQL and hands the user to
-  // its viewer. The current run is never mutated.
+  // FEAT-018/FEAT-025: "Run edited query" starts a NEW run seeded with the edited SQL and hands the
+  // user to its viewer. The current run is never mutated. The new run is a FORK of the viewed run
+  // (parent_run_id), so amendment history reads as a branch/tree — the original stays fully intact.
   const handleRunEdited = useCallback(
     async (sql: string) => {
       const trimmed = sql.trim();
@@ -162,6 +181,7 @@ export function RunViewerScreen({ workspaceId, runId }: RunViewerScreenProps) {
           {
             question_text: state.status === "loaded" ? state.run.question_text : "",
             sql: trimmed,
+            parent_run_id: runId,
           },
         );
         router.push(routes.run(workspaceId, nextRun.id));
@@ -172,7 +192,27 @@ export function RunViewerScreen({ workspaceId, runId }: RunViewerScreenProps) {
         setSubmittingEdit(false);
       }
     },
-    [router, workspaceId, state],
+    [router, workspaceId, runId, state],
+  );
+
+  // FEAT-033: the user answered the clarifying question. POST the answer; the server persists it
+  // (so the same ambiguity is not re-asked in this context) and resumes the run from generate_sql.
+  // On acceptance the card collapses to the Resolved summary and the live stream reconnects to
+  // watch the resumed pipeline.
+  const handleClarifySubmit = useCallback(
+    async (answer: string) => {
+      setSubmittingClarify(true);
+      try {
+        await api.post(`/v1/workspaces/${workspaceId}/runs/${runId}/clarify`, { answer });
+        setClarifiedAnswer(answer);
+      } catch {
+        // A failed submission keeps the card in its Awaiting state with the answer intact; the
+        // run remains paused server-side either way.
+      } finally {
+        setSubmittingClarify(false);
+      }
+    },
+    [workspaceId, runId],
   );
 
   // Apply one live event to the loaded state. Runs resolve to per-step upserts by step name, so an
@@ -303,8 +343,9 @@ export function RunViewerScreen({ workspaceId, runId }: RunViewerScreenProps) {
   const run = state.status === "loaded" ? state.run : null;
   const steps = state.status === "loaded" ? state.steps : [];
   const reportId = state.status === "loaded" ? state.reportId : null;
+  const forkedRuns = state.status === "loaded" ? state.forkedRuns : [];
 
-  // Parse the three Phase 2 step payloads at the boundary (schema.ts's convention on Step).
+  // Parse the step payloads at the boundary (schema.ts's convention on Step).
   const planStep = steps.find((step) => step.step_name === "plan");
   const plan = planStep ? parsePlanStep(planStep.output) : null;
   const generateSQLStep = steps.find((step) => step.step_name === "generate_sql");
@@ -315,12 +356,26 @@ export function RunViewerScreen({ workspaceId, runId }: RunViewerScreenProps) {
   const runPill = run ? runStatusPill(run.status) : null;
   const question = run?.question_text ?? "";
 
+  // FEAT-033's Clarification Needed state (screen 12): the run is paused (halted) with a pending
+  // clarifying question in the plan output. Distinct from a user halt, which the plan output does
+  // not carry.
+  const needsClarification =
+    run?.status === RunStatus.Halted &&
+    plan !== null &&
+    plan.needs_clarification === true &&
+    !plan.clarification_answer;
+  const clarificationResolved =
+    plan?.needs_clarification === true && Boolean(plan.clarification_answer);
+  const clarificationQuestion =
+    plan?.clarification_question?.trim() || "This question needs a clarification before it can be answered.";
+
   // Phase 2 form of the Clarification Needed state: the plan step completed saying the question is
   // not answerable, so the run failed — surface the reason as a banner.
   const notAnswerable =
     run?.status === RunStatus.Failed &&
     plan !== null &&
-    plan.answerable === false;
+    plan.answerable === false &&
+    plan.needs_clarification !== true;
   const clarificationReason =
     plan?.reason?.trim() || "This question couldn't be answered from the available data.";
 
@@ -360,6 +415,41 @@ export function RunViewerScreen({ workspaceId, runId }: RunViewerScreenProps) {
         </p>
       )}
 
+      {/* FEAT-025's branch/tree presentation: a forked run links to its parent; a run with
+          branches lists them. Report history reads as a traceable tree, never a flat list. */}
+      {run && isForkedRun(run) && run.parent_run_id && (
+        <Link
+          href={routes.run(workspaceId, run.parent_run_id)}
+          className="mb-2 inline-flex items-center gap-1 text-body-small text-provenance hover:text-provenance"
+        >
+          <GitBranch size={14} aria-hidden="true" />
+          Forked from run {run.parent_run_id.slice(0, 8)}…
+        </Link>
+      )}
+      {run && forkedRuns.length > 0 && (
+        <div className="mb-4 rounded-md border border-border bg-surface p-3">
+          <p className="text-caption uppercase tracking-wide text-text-secondary">
+            Forked runs ({forkedRuns.length})
+          </p>
+          <ul className="mt-2 flex flex-col gap-1">
+            {forkedRuns.map((fork) => (
+              <li key={fork.id}>
+                <Link
+                  href={routes.run(workspaceId, fork.id)}
+                  className="inline-flex items-center gap-1 text-body-small text-text-primary hover:text-provenance"
+                >
+                  <GitBranch size={13} className="shrink-0 text-text-secondary" aria-hidden="true" />
+                  <span className="truncate">{fork.question_text || fork.id}</span>
+                  <span className="ml-1 shrink-0 text-text-secondary">
+                    {runStatusPill(fork.status).label.toLowerCase()}
+                  </span>
+                </Link>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
       {cachedFrom && (
         <div
           role="status"
@@ -388,7 +478,7 @@ export function RunViewerScreen({ workspaceId, runId }: RunViewerScreenProps) {
           role="alert"
           className="mb-4 rounded-md border border-warning bg-warning/12 p-3 text-body-small text-text-primary"
         >
-          <p className="font-medium">This question needs clarification</p>
+          <p className="font-medium">This question can&apos;t be answered from the available data</p>
           <p className="mt-1 text-text-secondary">{clarificationReason}</p>
         </div>
       )}
@@ -397,12 +487,34 @@ export function RunViewerScreen({ workspaceId, runId }: RunViewerScreenProps) {
         <Card>
           <CardHeader
             title="Steps"
-            description="Plan → generate SQL → execute. Verification steps (static check, reconcile, shadow check) arrive in later phases."
+            description="Plan → generate SQL → execute. Verification: static check, shadow check, adversarial review."
           />
           {run ? <StepFeed steps={steps} /> : <Skeleton className="h-32" />}
         </Card>
 
         <div className="flex flex-col gap-6">
+          {/* Screen 12: the Clarifying Question Prompt, inline on the Run Viewer. FEAT-033 pauses
+              the run with a SPECIFIC question instead of guessing; answering resumes it. */}
+          {needsClarification && (
+            <ClarifyingQuestionCard
+              question={clarificationQuestion}
+              options={plan?.clarification_options ?? []}
+              onSubmit={handleClarifySubmit}
+              submitting={submittingClarify}
+              resolvedAnswer={clarifiedAnswer ?? undefined}
+            />
+          )}
+
+          {/* After a clarification, the card collapses to a compact summary even across reloads
+              (the answer is persisted in the plan output — screen 12's Resolved state). */}
+          {clarificationResolved && needsClarification === false && (
+            <ClarifyingQuestionCard
+              question={clarificationQuestion}
+              options={plan?.clarification_options ?? []}
+              onSubmit={handleClarifySubmit}
+              resolvedAnswer={plan?.clarification_answer}
+            />
+          )}
           <Card>
             <EditableCodeBlock
               label="Generated SQL"

@@ -58,9 +58,10 @@ func TestAmendAndResumeReRunsFromAmendedStep(t *testing.T) {
 	runs.run = haltedRun
 	steps.steps = amendedRunSteps()
 
-	// After amend, only chart_spec and narrate call the model: generate_sql is seeded verbatim and
-	// plan is never re-asked (its row replays untouched).
+	// After amend, adversarial_review, chart_spec, and narrate call the model: generate_sql is
+	// seeded verbatim and plan is never re-asked (its row replays untouched).
 	modelClient.enqueue(
+		`{"matches":true,"verdict":"The SQL answers the question.","severity":"ok"}`,
 		`{"chart_type":"bar","x_axis_column":"region","y_axis_column":"total","title":"Sales by region"}`,
 		`{"narrative":"North leads sales."}`,
 	)
@@ -98,20 +99,22 @@ func TestAmendAndResumeReRunsFromAmendedStep(t *testing.T) {
 		t.Errorf("generate_sql SQL = %q, want the amended input %q", genOut.SQL, edited)
 	}
 
-	// Downstream all re-ran to complete in their original rows.
-	for _, name := range []domain.StepName{domain.StepStaticCheck, domain.StepExecute, domain.StepChartSpec, domain.StepNarrate} {
+	// Downstream all re-ran to complete in their original rows, including the two new verification
+	// steps the amended execution inserts (shadow_check, adversarial_review).
+	for _, name := range []domain.StepName{domain.StepStaticCheck, domain.StepExecute, domain.StepShadowCheck, domain.StepAdversarialReview, domain.StepChartSpec, domain.StepNarrate} {
 		s := byName[name]
 		if s.Status != domain.StepComplete {
 			t.Errorf("%s = %+v, want complete after amend", name, s)
 		}
 	}
-	if len(all) != 6 {
-		t.Errorf("steps = %d, want 6 — amend re-uses rows, it never inserts new ones", len(all))
+	if len(all) != 8 {
+		t.Errorf("steps = %d, want 8 — amend re-uses the existing six rows and inserts the two new verification steps", len(all))
 	}
 
-	// Exactly two model calls (chart_spec, narrate); plan and generate_sql were not re-asked.
-	if got := modelClient.callCount(); got != 2 {
-		t.Errorf("model calls = %d, want 2 (chart_spec, narrate)", got)
+	// Exactly three model calls (adversarial_review, chart_spec, narrate); plan and generate_sql
+	// were not re-asked.
+	if got := modelClient.callCount(); got != 3 {
+		t.Errorf("model calls = %d, want 3 (adversarial_review, chart_spec, narrate)", got)
 	}
 
 	// A report still materializes for the amended run.

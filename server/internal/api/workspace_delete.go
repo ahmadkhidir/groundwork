@@ -159,9 +159,11 @@ func handleDeleteWorkspace(
 			return
 		}
 		workspaceID := chi.URLParam(r, "workspaceId")
-		// Owner-only: screens/14's "deletion is owner-only, enforced at the Workspace Settings level"
-		// and architecture.md's API-layer enforcement. A read-only shared member or any non-owner gets
-		// the same 404 as a workspace that does not exist — the API's non-enumeration rule.
+		// Owner-only — screens/14's "deletion is owner-only, enforced at the Workspace Settings
+		// level" and architecture.md's API-layer enforcement. Deliberately stricter than FEAT-045's
+		// mutation access: a read-only shared member must never be able to delete the workspace, so
+		// this keeps requireWorkspaceOwnership rather than requireWorkspaceMutationAccess. A non-owner
+		// gets the same 404 as a workspace that does not exist — the API's non-enumeration rule.
 		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
 			return
 		}

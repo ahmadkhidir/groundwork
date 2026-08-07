@@ -56,14 +56,18 @@ type ReportRunStore interface {
 // endpoint, and FEAT-030's provenance endpoints onto r. Mounted under the authenticated group by
 // the caller (see api.go).
 //
+// members backs the FEAT-045 access check: every route here is a READ (report view, list,
+// provenance detail), so each uses requireWorkspaceAccess (owner OR read-only member) — read-only
+// members must be able to view reports and provenance per FEAT-045 AC2.
+//
 // provenance and runSteps may be nil: without them the report endpoint still serves the report with
 // provenance_links as the raw id array (no expansion), and the provenance-panel detail endpoint is
 // simply not registered.
-func RegisterReportRoutes(r chi.Router, workspaces WorkspaceStore, reports ReportStore, provenance ProvenanceStore, runSteps RunStepStore, logger *slog.Logger) {
-	r.Get("/workspaces/{workspaceId}/reports", handleListReports(workspaces, reports, logger))
-	r.Get("/workspaces/{workspaceId}/reports/{reportId}", handleGetReport(workspaces, reports, provenance, logger))
+func RegisterReportRoutes(r chi.Router, workspaces WorkspaceStore, members MemberLookupStore, reports ReportStore, provenance ProvenanceStore, runSteps RunStepStore, logger *slog.Logger) {
+	r.Get("/workspaces/{workspaceId}/reports", handleListReports(workspaces, members, reports, logger))
+	r.Get("/workspaces/{workspaceId}/reports/{reportId}", handleGetReport(workspaces, members, reports, provenance, logger))
 	if provenance != nil && runSteps != nil {
-		r.Get("/workspaces/{workspaceId}/reports/{reportId}/provenance/{claimId}", handleGetProvenanceClaim(workspaces, reports, provenance, runSteps, logger))
+		r.Get("/workspaces/{workspaceId}/reports/{reportId}/provenance/{claimId}", handleGetProvenanceClaim(workspaces, members, reports, provenance, runSteps, logger))
 	}
 }
 
@@ -121,7 +125,7 @@ func reportsLimit(r *http.Request) int {
 // payloads remain the read endpoint's job, so this list stays cheap even for a workspace with many
 // reports. Ownership is enforced here (requireWorkspaceOwnership) and the store scopes by workspace
 // again in SQL, the same non-enumeration stance as every other read endpoint.
-func handleListReports(workspaces WorkspaceStore, reports ReportStore, logger *slog.Logger) http.HandlerFunc {
+func handleListReports(workspaces WorkspaceStore, members MemberLookupStore, reports ReportStore, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
@@ -129,7 +133,7 @@ func handleListReports(workspaces WorkspaceStore, reports ReportStore, logger *s
 		}
 
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+		if _, _, ok := requireWorkspaceAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
 			return
 		}
 
@@ -160,7 +164,7 @@ func handleListReports(workspaces WorkspaceStore, reports ReportStore, logger *s
 // When a provenance seam is wired, the report's provenance_links (stored as ids) are expanded into
 // full claim objects so the viewer can render each inline Provenance-Linked Number (screens/09) —
 // the shared component needs claim_text/claim stated_value, not opaque ids.
-func handleGetReport(workspaces WorkspaceStore, reports ReportStore, provenance ProvenanceStore, logger *slog.Logger) http.HandlerFunc {
+func handleGetReport(workspaces WorkspaceStore, members MemberLookupStore, reports ReportStore, provenance ProvenanceStore, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
@@ -168,7 +172,7 @@ func handleGetReport(workspaces WorkspaceStore, reports ReportStore, provenance 
 		}
 
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+		if _, _, ok := requireWorkspaceAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
 			return
 		}
 
@@ -281,7 +285,7 @@ type provenanceSource struct {
 // (with the relevant column named for highlighting). The rows are reconstructed from the run's
 // persisted execute step output, so "View Full Run" and claim rendering need no live engine — and if
 // that output is gone, the distinct "source unavailable" state is returned rather than an error.
-func handleGetProvenanceClaim(workspaces WorkspaceStore, reports ReportStore, provenance ProvenanceStore, runSteps RunStepStore, logger *slog.Logger) http.HandlerFunc {
+func handleGetProvenanceClaim(workspaces WorkspaceStore, members MemberLookupStore, reports ReportStore, provenance ProvenanceStore, runSteps RunStepStore, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
@@ -289,7 +293,7 @@ func handleGetProvenanceClaim(workspaces WorkspaceStore, reports ReportStore, pr
 		}
 
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+		if _, _, ok := requireWorkspaceAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
 			return
 		}
 

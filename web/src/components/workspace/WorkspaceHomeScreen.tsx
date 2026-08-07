@@ -12,6 +12,7 @@ import { AskPanel } from "./AskPanel";
 import { RecentReportsPanel } from "./RecentReportsPanel";
 import { SemanticLayerSummaryPanel } from "./SemanticLayerSummaryPanel";
 import { DatasetsPanel } from "./DatasetsPanel";
+import { NotificationsBell } from "@/components/notifications/NotificationsBell";
 import { api, ApiError } from "@/lib/api-client";
 import { routes } from "@/lib/routes";
 import type { Workspace } from "@/types/schema";
@@ -141,6 +142,9 @@ export function WorkspaceHomeScreen({ workspaceId }: WorkspaceHomeScreenProps) {
         >
           Settings
         </Link>
+        {/* FEAT-026: the notifications bell. No full Navigation Shell exists yet (see the note
+            above), so the bell mounts here beside the workspace links until one lands. */}
+        <NotificationsBell />
       </nav>
 
       <div className="mb-6 flex items-center justify-between gap-4">
@@ -162,7 +166,20 @@ export function WorkspaceHomeScreen({ workspaceId }: WorkspaceHomeScreenProps) {
       </div>
 
       <Card className="mb-6">
-        <AskPanel workspaceId={workspaceId} />
+        <AskPanel
+          workspaceId={workspaceId}
+          // FEAT-012 (wake-on-intent): the Ask panel's focus handler fires an engine wake; keep the
+          // status pill honest by feeding it the wake response so the pill doesn't lag behind until
+          // the next poll.
+          engineStatus={workspace?.engine_status}
+          onEngineStatusChange={(status) => {
+            setState((current) =>
+              current.status === "loaded"
+                ? { ...current, workspace: { ...current.workspace, engine_status: status } }
+                : current,
+            );
+          }}
+        />
       </Card>
 
       {/* "Upload data prompt... Shown when no files ingested yet" (screens/04-workspace-home.md) —

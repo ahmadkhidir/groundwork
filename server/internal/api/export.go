@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/csv"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -16,15 +17,21 @@ import (
 
 // ExportFormat identifies a supported report export target (screens/11-export-dialog.md).
 //
-// This phase implements FEAT-035 (PDF) and FEAT-036 (Excel/CSV). The remaining rows the dialog
-// lists — PowerPoint, Markdown/HTML, JSON, Image — are Phase 5 features (FEAT-037..040) and are not
-// registered here; see ExportDialog.tsx, which lists only the formats this phase can actually serve.
+// Phase 4 implemented FEAT-035 (PDF) and FEAT-036 (Excel/CSV); Phase 5 adds FEAT-037 (PowerPoint),
+// FEAT-038 (Markdown/HTML), FEAT-039 (JSON), and FEAT-040 (single chart image). The dialog lists
+// exactly these rows (screens/11), each mapping to one of these values — except the Markdown/HTML
+// row, which maps to either FormatMarkdown or FormatHTML via the dialog's inline variant picker.
 type ExportFormat string
 
-// Export formats this phase serves.
+// Export formats served by the export endpoint.
 const (
-	FormatPDF ExportFormat = "pdf"
-	FormatCSV ExportFormat = "csv"
+	FormatPDF      ExportFormat = "pdf"
+	FormatCSV      ExportFormat = "csv"
+	FormatPPTX     ExportFormat = "pptx"
+	FormatMarkdown ExportFormat = "markdown"
+	FormatHTML     ExportFormat = "html"
+	FormatJSON     ExportFormat = "json"
+	FormatImage    ExportFormat = "image"
 )
 
 // exportFormatTiers maps each export format to the subscription tiers allowed to request it, per
@@ -32,6 +39,10 @@ const (
 //
 //	FEAT-035 PDF       — Free / Pro / Team
 //	FEAT-036 Excel/CSV — Pro / Team only
+//	FEAT-037 PowerPoint — Team only
+//	FEAT-038 Markdown/HTML — Pro / Team only
+//	FEAT-039 JSON       — Pro / Team only
+//	FEAT-040 Image      — Pro / Team only
 //
 // The check is enforced in the handler against the AUTHORITATIVE tier read from Postgres via
 // UserTierLookup — never the session cookie's tier claim, which is display-only data (see
@@ -46,6 +57,48 @@ var exportFormatTiers = map[ExportFormat]map[domain.SubscriptionTier]bool{
 		domain.TierPro:  true,
 		domain.TierTeam: true,
 	},
+	FormatPPTX: {
+		domain.TierTeam: true,
+	},
+	FormatMarkdown: {
+		domain.TierPro:  true,
+		domain.TierTeam: true,
+	},
+	FormatHTML: {
+		domain.TierPro:  true,
+		domain.TierTeam: true,
+	},
+	FormatJSON: {
+		domain.TierPro:  true,
+		domain.TierTeam: true,
+	},
+	FormatImage: {
+		domain.TierPro:  true,
+		domain.TierTeam: true,
+	},
+}
+
+// exportDeniedMessage is the user-facing 403 text for a format the caller's tier cannot use. Each
+// message names the plan(s) that unlock the format, per monetization.md's Feature Gate Mapping, so
+// monetization's "always show what you're missing" principle carries through to the API response
+// the same way the dialog's locked rows carry it in the UI.
+func exportDeniedMessage(format ExportFormat) string {
+	switch format {
+	case FormatCSV:
+		return "Excel/CSV export is available on the Pro and Team plans. Upgrade to export the underlying result set."
+	case FormatPPTX:
+		return "PowerPoint export is available on the Team plan. Upgrade to export a slide deck."
+	case FormatMarkdown:
+		return "Markdown export is available on the Pro and Team plans. Upgrade to export for wikis and docs."
+	case FormatHTML:
+		return "HTML export is available on the Pro and Team plans. Upgrade to export for wikis and docs."
+	case FormatJSON:
+		return "JSON export is available on the Pro and Team plans. Upgrade to export structured data."
+	case FormatImage:
+		return "Chart image export is available on the Pro and Team plans. Upgrade to export a chart image."
+	default:
+		return "This export format is available on a paid plan. Upgrade to use it."
+	}
 }
 
 // ExportAuditWriter is the seam the export handler uses to record an `export` entry in the combined
@@ -59,17 +112,37 @@ type ExportAuditWriter interface {
 	WriteExport(ctx context.Context, workspaceID, userID string) error
 }
 
+// NotificationCreator is the FEAT-026 event-source seam the export handler writes an
+// `export_ready` durable notification through, satisfied by postgres.NotificationRepository. It is
+// deliberately narrow (Create only) and deliberately best-effort: the export is the primary
+// resource, so a notification-write failure logs and continues rather than failing the download —
+// the exact opposite of the fail-closed audit write above, because a missing audit entry is
+// evidence drift while a missing notification is merely a missed convenience.
+type NotificationCreator interface {
+	Create(ctx context.Context, n domain.Notification) error
+}
+
 // RegisterExportRoutes wires the report export endpoint onto r (screens/11-export-dialog.md,
-// FEAT-035/FEAT-036). Mounted under the authenticated group by the caller (see api.go).
+// FEAT-035..040). Mounted under the authenticated group by the caller (see api.go).
 //
 // reports, runSteps, users, and audit are all required collaborators: the handler reads the report
 // and its run's persisted execute step, enforces the tier gate, and records the export. Do not
 // register this with nil seams — a gate that could be skipped is not a gate.
-func RegisterExportRoutes(r chi.Router, workspaces WorkspaceStore, reports ReportStore, runSteps RunStepStore, users UserTierLookup, audit ExportAuditWriter, logger *slog.Logger) {
-	r.Get("/workspaces/{workspaceId}/reports/{reportId}/export", handleExportReport(workspaces, reports, runSteps, users, audit, logger))
+//
+// members backs the FEAT-045 access check: export is a mutation-adjacent action (it records an
+// export audit entry and produces an artifact), so the handler uses requireWorkspaceMutationAccess —
+// a read-only shared member must not be able to pull the underlying result set out of a workspace
+// they cannot change.
+//
+// provenance is optional: when wired, the JSON export (FEAT-039) expands the report's
+// provenance_links from opaque ids into full claim objects, exactly as the report read endpoint
+// does; without it (or on a read failure), the export falls back to the id array — never an error.
+func RegisterExportRoutes(r chi.Router, workspaces WorkspaceStore, members MemberLookupStore, reports ReportStore, runSteps RunStepStore, users UserTierLookup, audit ExportAuditWriter, provenance ProvenanceStore, notifications NotificationCreator, logger *slog.Logger) {
+	r.Get("/workspaces/{workspaceId}/reports/{reportId}/export", handleExportReport(workspaces, members, reports, runSteps, users, audit, provenance, notifications, logger))
 }
 
-// handleExportReport serves GET /api/workspaces/:id/reports/:reportId/export?format=pdf|csv.
+// handleExportReport serves GET /api/workspaces/:id/reports/:reportId/export?format=pdf|csv|pptx|
+// markdown|html|json|image.
 //
 // The endpoint is deliberately a plain authenticated GET with credentials: the browser session
 // cookie travels on the request (the same way every other read endpoint authenticates), and the
@@ -78,21 +151,26 @@ func RegisterExportRoutes(r chi.Router, workspaces WorkspaceStore, reports Repor
 // alone cannot carry the cross-origin session cookie.
 //
 // Pipeline, in order:
-//  1. Ownership — requireWorkspaceOwnership (404 for "not yours", non-enumeration).
+//  1. Access — requireWorkspaceMutationAccess (owner, or a read-only member gets 403 — a read-only
+//     member must not pull the underlying result set out; a non-member gets the same 404 as a
+//     nonexistent workspace, non-enumeration).
 //  2. Format — the ?format= parameter must be a registered ExportFormat (400 otherwise).
 //  3. Report — the report must exist in this workspace (404).
 //  4. Tier gate — the AUTHORITATIVE tier from UserTierLookup; a format the tier cannot use is a
-//     403 `upgrade_required`, so a Free user hitting the Excel/CSV row directly (screens/11's
-//     "not selectable at all" edge case enforced server-side) never gets the data.
-//  5. Build — CSV from the persisted execute step output (the same facts the in-app chart and data
-//     table draw from, so "matches exactly what was shown" holds); PDF from the report's narrative
-//     plus a vector chart drawn from the same facts (see export_pdf.go).
+//     403 `upgrade_required` naming the plan(s) that unlock it, so a Free user hitting a paid row
+//     directly (screens/11's "not selectable at all" edge case enforced server-side) never gets
+//     the data.
+//  5. Build — one builder per format (see export_pdf.go, export_pptx.go, export_markup.go,
+//     export_json.go, export_image.go). CSV, JSON's result set, and the image chart all come from
+//     the persisted execute step output (the same facts the in-app chart and data table draw from,
+//     so "matches exactly what was shown" holds); PDF/PPTX/Markdown/HTML degrade honestly with a
+//     note when that data is gone.
 //  6. Audit — WriteExport in this same code path, fail-closed.
 //  7. Serve — bytes with Content-Type and Content-Disposition.
 //
 // The session engine is never touched: everything comes from the Report Store and the run's
 // persisted steps, so export works while the workspace's engine is asleep (FEAT-035 AC3).
-func handleExportReport(workspaces WorkspaceStore, reports ReportStore, runSteps RunStepStore, users UserTierLookup, audit ExportAuditWriter, logger *slog.Logger) http.HandlerFunc {
+func handleExportReport(workspaces WorkspaceStore, members MemberLookupStore, reports ReportStore, runSteps RunStepStore, users UserTierLookup, audit ExportAuditWriter, provenance ProvenanceStore, notifications NotificationCreator, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
@@ -100,7 +178,7 @@ func handleExportReport(workspaces WorkspaceStore, reports ReportStore, runSteps
 		}
 
 		workspaceID := chi.URLParam(r, "workspaceId")
-		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+		if _, ok := requireWorkspaceMutationAccess(w, r, workspaces, members, claims.UserID, workspaceID); !ok {
 			return
 		}
 
@@ -108,7 +186,7 @@ func handleExportReport(workspaces WorkspaceStore, reports ReportStore, runSteps
 		allowedTiers, ok := exportFormatTiers[format]
 		if !ok {
 			respondJSON(w, http.StatusBadRequest, map[string]string{
-				"error": "Unknown export format. Use format=pdf or format=csv.",
+				"error": "Unknown export format. Use format=pdf, csv, pptx, markdown, html, json, or image.",
 				"code":  "invalid_format",
 			})
 			return
@@ -142,15 +220,33 @@ func handleExportReport(workspaces WorkspaceStore, reports ReportStore, runSteps
 		}
 		if !allowedTiers[user.Tier] {
 			respondJSON(w, http.StatusForbidden, map[string]string{
-				"error": "Excel/CSV export is available on the Pro and Team plans. Upgrade to export the underlying result set.",
+				"error": exportDeniedMessage(format),
 				"code":  "upgrade_required",
 			})
 			return
 		}
 
+		// Claim-level provenance, expanded once for every builder that wants it (JSON, PPTX,
+		// Markdown/HTML): a file artifact that names claims by opaque id is nearly useless to the
+		// audiences these formats target. Mirrors handleGetReport's expansion; when the seam is
+		// absent or the read fails, the report's own id array is kept (never an export error).
+		links := []domain.ProvenanceLink{}
+		if provenance != nil && len(report.ProvenanceLinks) > 0 {
+			links, err = provenance.ListByReport(r.Context(), report.ID)
+			if err != nil {
+				logger.Warn("expanding provenance links for export",
+					slog.String("report_id", report.ID),
+					slog.String("format", string(format)),
+					slog.String("error", err.Error()),
+				)
+				links = []domain.ProvenanceLink{}
+			}
+		}
+
 		// The run's persisted execute step is the single source of the underlying result set. It is
-		// loaded for BOTH formats: CSV exports the facts verbatim, and the PDF draws its chart from
-		// the same facts so the printed chart matches the in-app rendering.
+		// loaded for every format: CSV exports the facts verbatim, the PDF/PPTX/Markdown/HTML draw
+		// their chart from the same facts, the JSON export embeds it, and the image export IS it —
+		// so every exported chart matches the in-app rendering.
 		exec, execAvailable := loadExecuteOutput(r.Context(), runSteps, report.RunID)
 
 		var (
@@ -195,6 +291,85 @@ func handleExportReport(workspaces WorkspaceStore, reports ReportStore, runSteps
 				return
 			}
 			contentType = "application/pdf"
+		case FormatPPTX:
+			body, err = buildReportPPTX(report, links, &exec, execAvailable)
+			if err != nil {
+				logger.Error("building PowerPoint export",
+					slog.String("report_id", report.ID),
+					slog.String("error", err.Error()),
+				)
+				respondJSON(w, http.StatusInternalServerError, map[string]string{
+					"error": "Something went wrong. Try again.",
+					"code":  "internal_error",
+				})
+				return
+			}
+			contentType = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+		case FormatMarkdown:
+			body, err = buildReportMarkdown(report, links, &exec, execAvailable)
+			if err != nil {
+				logger.Error("building Markdown export",
+					slog.String("report_id", report.ID),
+					slog.String("error", err.Error()),
+				)
+				respondJSON(w, http.StatusInternalServerError, map[string]string{
+					"error": "Something went wrong. Try again.",
+					"code":  "internal_error",
+				})
+				return
+			}
+			contentType = "text/markdown; charset=utf-8"
+		case FormatHTML:
+			body, err = buildReportHTML(report, links, &exec, execAvailable)
+			if err != nil {
+				logger.Error("building HTML export",
+					slog.String("report_id", report.ID),
+					slog.String("error", err.Error()),
+				)
+				respondJSON(w, http.StatusInternalServerError, map[string]string{
+					"error": "Something went wrong. Try again.",
+					"code":  "internal_error",
+				})
+				return
+			}
+			contentType = "text/html; charset=utf-8"
+		case FormatJSON:
+			body, err = buildReportJSON(report, links, &exec, execAvailable)
+			if err != nil {
+				logger.Error("building JSON export",
+					slog.String("report_id", report.ID),
+					slog.String("error", err.Error()),
+				)
+				respondJSON(w, http.StatusInternalServerError, map[string]string{
+					"error": "Something went wrong. Try again.",
+					"code":  "internal_error",
+				})
+				return
+			}
+			contentType = "application/json; charset=utf-8"
+		case FormatImage:
+			// The chart IS the execute output rendered as SVG; without it there is nothing honest
+			// to export (the same 409 condition as CSV).
+			if !execAvailable {
+				respondJSON(w, http.StatusConflict, map[string]string{
+					"error": "The chart data behind this report is no longer available, so it cannot be exported as an image.",
+					"code":  "result_data_unavailable",
+				})
+				return
+			}
+			body, err = buildChartSVG(report.ChartSpec, exec)
+			if err != nil {
+				logger.Error("building chart image export",
+					slog.String("report_id", report.ID),
+					slog.String("error", err.Error()),
+				)
+				respondJSON(w, http.StatusInternalServerError, map[string]string{
+					"error": "Something went wrong. Try again.",
+					"code":  "internal_error",
+				})
+				return
+			}
+			contentType = "image/svg+xml; charset=utf-8"
 		default:
 			// Unreachable in practice (format was validated against exportFormatTiers above), but a
 			// future format added to the gate map without a builder must fail loudly, not serve an
@@ -228,6 +403,25 @@ func handleExportReport(workspaces WorkspaceStore, reports ReportStore, runSteps
 		w.WriteHeader(http.StatusOK)
 		if _, err := w.Write(body); err != nil {
 			logger.Warn("writing export response", slog.String("error", err.Error()))
+		}
+
+		// FEAT-026 event source: `export_ready` durable notification, written ONLY for exports
+		// actually served (after the write above). Best-effort by design — the download already
+		// happened; a notification-write failure is a missed convenience, never a reason to fail or
+		// retract the export (see NotificationCreator's doc comment).
+		if notifications != nil {
+			if err := notifications.Create(r.Context(), domain.Notification{
+				UserID:            claims.UserID,
+				Type:              domain.NotifyExportReady,
+				Message:           fmt.Sprintf("Your export of %q is ready to download.", report.Title),
+				RelatedEntityType: domain.RelatedReport,
+				RelatedEntityID:   report.ID,
+			}); err != nil {
+				logger.Error("creating export_ready notification",
+					slog.String("report_id", report.ID),
+					slog.String("error", err.Error()),
+				)
+			}
 		}
 	}
 }
@@ -296,6 +490,16 @@ func exportFilename(report domain.Report, format ExportFormat) string {
 	switch format {
 	case FormatCSV:
 		return slug + "-" + id + "-results.csv"
+	case FormatImage:
+		return slug + "-" + id + "-chart.svg"
+	case FormatPPTX:
+		return slug + "-" + id + ".pptx"
+	case FormatMarkdown:
+		return slug + "-" + id + ".md"
+	case FormatHTML:
+		return slug + "-" + id + ".html"
+	case FormatJSON:
+		return slug + "-" + id + ".json"
 	default:
 		return slug + "-" + id + ".pdf"
 	}
