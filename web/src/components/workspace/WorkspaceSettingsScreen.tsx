@@ -269,7 +269,7 @@ export function WorkspaceSettingsScreen({ workspaceId, userTier, userId }: Works
           <Card>
             <CardHeader
               title="Danger zone"
-              description="Permanently delete this workspace and every piece of derived state it owns — provably, with confirmation and a proof record (FEAT-043)."
+              description="Permanently delete this workspace and every piece of derived state it owns — provably, with confirmation and a proof record."
             />
             {dangerZone.status === "loading" ? (
               <Skeleton className="h-10 w-48" />
