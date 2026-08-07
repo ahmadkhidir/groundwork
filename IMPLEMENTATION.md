@@ -460,6 +460,21 @@ Three sequential passes landed the full authorized Phase 3 scope; each ended wit
 Docs pointer: bumped to `3c6af5b` in `6611de2` (already pushed to origin/main before the parent
 referenced it, per the submodule protocol).
 
+### Screen 13 — Workspace Settings: Phase-1 shell (`d8f1bdf`, 2026-08-07)
+
+The Settings route (`/workspaces/:id/settings`, screens/13) is now a real tabbed surface instead of
+the placeholder. Per the authorized scope it is a **Phase-1 shell**: the **Audit Log** tab is
+functional (a short explanation plus a button navigating to the full Egress/Audit Log screen at
+`routes.auditLog`, FEAT-042 — kept as its own route per the screen spec since the log is a
+filterable/paginated surface, not a settings form); the other four tabs render explicit later-phase
+states and **no fabricated controls** — Column Visibility (FEAT-010, Phase 5), Sharing
+(FEAT-045/FEAT-046, Phase 5), Usage (FEAT-047, Phase 5), Danger Zone (FEAT-043, Phase 4; the
+placeholder's "FEAT-043" there referred to the Danger Zone entry point, which per
+screens/14 is a modal on this screen — the card names it as the future location of the delete
+flow, it does not fake the flow). WAI-ARIA tablist/tab/tabpanel semantics with `aria-selected` and
+`hidden`. Web only, no server changes. Verification: `tsc --noEmit` + `eslint . --max-warnings=0`
+clean, `vitest run` 191/191 green (4 new tests).
+
 ### Phase 1 reopened for FEAT-048 / FEAT-049 (docs `ff8d5b2`, user-approved 2026-08-06) — CLOSED
 
 Phase 1 was reopened with two P0 features (FEAT-048 Single-Dataset Deletion, FEAT-049 Duplicate
