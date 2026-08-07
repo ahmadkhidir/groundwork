@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { ArrowLeft } from "lucide-react";
@@ -10,13 +10,21 @@ import { Skeleton } from "@/components/shared/Skeleton";
 import { ChartRenderer } from "./ChartRenderer";
 import { AccessibleDataTable } from "./AccessibleDataTable";
 import { ReconciliationNotice } from "./ReconciliationNotice";
+import { ProvenanceLinkedClaim } from "./ProvenanceLinkedClaim";
+import { ProvenancePanel } from "./ProvenancePanel";
 import {
   parseExecuteStep,
   type ExecuteStepOutput,
 } from "@/components/run/step-payloads";
 import { api, ApiError } from "@/lib/api-client";
 import { routes } from "@/lib/routes";
-import { isForkedReport, type Report, type Run, type Step } from "@/types/schema";
+import {
+  isForkedReport,
+  type ProvenanceLink,
+  type Report,
+  type Run,
+  type Step,
+} from "@/types/schema";
 
 export interface ReportViewScreenProps {
   workspaceId: string;
@@ -45,13 +53,21 @@ type ScreenState =
  * run's result data — the chart is a spec over the execute step's facts — so this screen fetches the
  * report AND its run's steps, then draws the chart first-party with ChartRenderer.
  *
- * Phase-3+ survivors are out of scope this wave: clickable provenance links, the export dialog, and
- * the follow-up (fork) affordance. The report renders read-only with a "View source run" link.
+ * Every traceable figure in the narrative is a Provenance-Linked Number (FEAT-030): clicking one
+ * opens the provenance panel (screens/10) via `?claim=:claimId` — the panel state is linkable and
+ * shareable, exactly as screens/10 requires.
  */
 export function ReportViewScreen({ workspaceId, reportId }: ReportViewScreenProps) {
   const router = useRouter();
   const [state, setState] = useState<ScreenState>({ status: "loading" });
   const loaded = useRef(false);
+
+  const openClaim = useCallback(
+    (link: ProvenanceLink) => {
+      router.push(`${routes.report(workspaceId, reportId)}?claim=${encodeURIComponent(link.id)}`);
+    },
+    [router, workspaceId, reportId],
+  );
 
   const load = useCallback(async () => {
     try {
@@ -156,9 +172,11 @@ export function ReportViewScreen({ workspaceId, reportId }: ReportViewScreenProp
       <ReconciliationNotice summary={report.reconciliation_summary} />
 
       <Card className="mt-6">
-        <p className="text-body-large whitespace-pre-line text-text-primary">
-          {report.narrative}
-        </p>
+        <ProvenanceLinkedClaim
+          narrative={report.narrative}
+          links={report.provenance_links}
+          onClaimClick={openClaim}
+        />
       </Card>
 
       <Card className="mt-6">
@@ -187,6 +205,12 @@ export function ReportViewScreen({ workspaceId, reportId }: ReportViewScreenProp
           View source run →
         </Link>
       </div>
+
+      {/* useSearchParams must sit inside a Suspense boundary during prerender (Next 16). The panel
+          itself renders nothing when no ?claim= is present, so the fallback is harmlessly empty. */}
+      <Suspense fallback={null}>
+        <ProvenancePanel workspaceId={workspaceId} reportId={reportId} />
+      </Suspense>
     </main>
   );
 }

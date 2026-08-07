@@ -55,13 +55,35 @@ type ChartSpecStepOutput struct {
 	ChartSpec ChartSpec `json:"chart_spec"`
 }
 
-// NarrateStepOutput is the parsed shape of the "narrate" step's Step.Output (FEAT-015).
+// NarrateStepOutput is the parsed shape of the "narrate" step's Step.Output (FEAT-015 + FEAT-030).
 //
 // Narrative is plain-language prose over ONLY the facts returned by execute — the model never sees
 // data outside the result set, and the payload it receives is built by model.BuildFactsPayload,
 // which applies the same R-016 filter to result values as BuildPayload applies to metadata.
+//
+// Claims (FEAT-030) is the model's structured map of every numeric statement in Narrative back to a
+// specific result cell: claim_text is the exact span, Column is the result-set column whose cell
+// backs the figure, RowIndex is the 0-based row within the executed result set. Claims is optional
+// — a deterministic validator re-checks each against the actual executed rows before any is
+// persisted, and one that names a column/row that does not exist (or a flagged column whose value
+// the model never saw) is dropped. This is the load-bearing half of FEAT-030 AC3: the model cannot
+// produce a link to a figure with no backing cell.
 type NarrateStepOutput struct {
-	Narrative string `json:"narrative"`
+	Narrative string           `json:"narrative"`
+	Claims    []NarrativeClaim `json:"claims,omitempty"`
+}
+
+// NarrativeClaim is one figure the model stated in the narrative, tied to the exact result cell it
+// claims to come from (FEAT-030). It is UNVALIDATED at parse time — internal/run's provenance
+// builder binds it back to the executed result set and only persists claims that resolve to a real
+// cell in a column the model actually saw (see Executor.buildProvenanceClaims).
+type NarrativeClaim struct {
+	// ClaimText is the exact text span in the narrative this claim corresponds to.
+	ClaimText string `json:"claim_text"`
+	// Column is the result column name whose single cell backs the stated figure.
+	Column string `json:"column"`
+	// RowIndex is the 0-based row within the executed result set holding that cell.
+	RowIndex int `json:"row_index"`
 }
 
 // StaticCheckWarning is one finding recorded by FEAT-028's static SQL analysis. It is surfaced in

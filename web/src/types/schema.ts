@@ -491,8 +491,8 @@ export interface Report {
   /** Plain-language answer, generated only from the run's result set — never from data in context. */
   narrative: string;
   chart_spec: ChartSpec;
-  /** Ids referencing {@link ProvenanceLink}. */
-  provenance_links: string[];
+  /** The report's claim-level provenance, expanded into full link objects (FEAT-030). */
+  provenance_links: ProvenanceLink[];
   reconciliation_summary: ReconciliationSummary;
   /** References another {@link Report} when forked by a compositional follow-up. Empty string if none. */
   parent_report_id?: string;
@@ -502,6 +502,8 @@ export interface Report {
 /**
  * Ties a specific number stated in a report's narrative to the exact query and rows that produced
  * it. This is the mechanism behind the product's core claim that every number is traceable.
+ *
+ * The report read endpoint expands each opaque id into one of these objects.
  */
 export interface ProvenanceLink {
   id: string;
@@ -513,8 +515,27 @@ export interface ProvenanceLink {
   stated_value: string;
   /** The exact SQL that produced this value. */
   source_query: string;
+  /** The result column whose cell backs the figure — enables "relevant cell highlighted" (screens/10). */
+  source_column: string;
   /** Identifiers of the specific result rows/cells backing the value. */
   source_row_ids: string[];
+}
+
+/** The backing result rows/cells for one claim (screens/10). `available=false` is the honest
+ * "this source data is no longer available" state, distinct from a fetch error. */
+export interface ProvenanceSource {
+  available: boolean;
+  columns?: string[];
+  /** The specific backing rows, formatted as display text, in `columns` order. */
+  rows?: string[][];
+  /** The column whose cell should be highlighted. */
+  highlight_column?: string;
+}
+
+/** GET /reports/:reportId/provenance/:claimId — the claim plus its reconstructed source rows. */
+export interface ProvenanceClaimDetail {
+  claim: ProvenanceLink & { run_id: string };
+  source: ProvenanceSource;
 }
 
 /**

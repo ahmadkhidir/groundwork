@@ -91,6 +91,18 @@ type ReportStore interface {
 	Create(ctx context.Context, report domain.Report) error
 }
 
+// ProvenanceStore persists and reads claim-level provenance links (FEAT-030). Satisfied by
+// postgres.ProvenanceRepository.
+//
+// The executor writes links in the same report-materialization path that writes the Report row (a
+// Report whose claims could not be persisted is a corrupt state, so WriteLinks failing there fails
+// the run). The API reads them back to serve the provenance-panel detail endpoint.
+type ProvenanceStore interface {
+	WriteLinks(ctx context.Context, workspaceID string, links []domain.ProvenanceLink) error
+	ListByReport(ctx context.Context, reportID string) ([]domain.ProvenanceLink, error)
+	GetByID(ctx context.Context, workspaceID, id string) (domain.ProvenanceLink, error)
+}
+
 // ObjectStore reads dataset files from object storage. Satisfied by storage.Client.
 type ObjectStore interface {
 	GetObject(ctx context.Context, key string) (io.ReadCloser, error)
@@ -143,6 +155,10 @@ type Executor struct {
 	hub *events.Hub
 	// cache, when wired (WithCache), enables determinism caching (FEAT-027).
 	cache orchestrator.CacheStore
+	// provenance, when wired (WithProvenance), persists the claim-level provenance links a run's
+	// narrate step produced (FEAT-030). Left nil in tests and paths that don't need link storage; a
+	// nil provenance store means claims resolve in-memory but are not persisted.
+	provenance ProvenanceStore
 
 	// Semantic-layer listers feed semantic.AssembleGroundingContext (FEAT-019's building block).
 	// Typed as the semantic package's own interfaces because that is exactly the contract
@@ -173,6 +189,13 @@ func WithEvents(hub *events.Hub) Option {
 // execute fresh (tests and keyless dev servers leave it unwired).
 func WithCache(cache orchestrator.CacheStore) Option {
 	return func(e *Executor) { e.cache = cache }
+}
+
+// WithProvenance wires the claim-level provenance store (FEAT-030) into report materialization. When
+// it is not wired, a run's resolved claims still produce a provenance_links array on the Report but
+// the backing links are not persisted (tests, dev without the store).
+func WithProvenance(store ProvenanceStore) Option {
+	return func(e *Executor) { e.provenance = store }
 }
 
 // NewExecutor constructs an Executor from its seams.
@@ -519,11 +542,12 @@ func (e *Executor) executePipeline(ctx context.Context, userID string, run domai
 		return
 	}
 
-	// narrate (FEAT-015) — plain-language prose over the execute facts only, never data outside the
-	// result set. The step's input is the execute output JSON, per features.md; architecture.md's
+	// narrate (FEAT-015/FEAT-030) — plain-language prose over the execute facts only, never data
+	// outside the result set, plus the model's structured claims mapping figures back to result
+	// cells. The step's input is the execute output JSON, per features.md; architecture.md's
 	// PipelineOrder places chart_spec before narrate.
 	narrateOutput, err := e.execStep(ctx, sc, domain.StepNarrate, executeOutput, log, func() (string, error) {
-		return e.runNarrate(ctx, sc, run, executeOut, log)
+		return e.runNarrate(ctx, sc, run, genSQL.SQL, reconcile, executeOut, log)
 	})
 	if err != nil {
 		log.Error("narrate step failed", slog.String("error", err.Error()))
@@ -537,9 +561,23 @@ func (e *Executor) executePipeline(ctx context.Context, userID string, run domai
 		return
 	}
 
+	// FEAT-030: resolve the model's proposed claims against the ACTUAL executed result set. A claim
+	// bound only if it names a model-evident column and a real row (see buildProvenanceClaims) — a
+	// number that cannot be traced to a cell is simply not back-linked, never presented as verified.
+	var links []domain.ProvenanceLink
+	if len(narrateOut.Claims) > 0 {
+		built, err := e.buildProvenanceClaims(ctx, sc.workspaceID, genSQL.SQL, executeOut, narrateOut.Claims)
+		if err != nil {
+			log.Error("building provenance claims", slog.String("error", err.Error()))
+			e.stepFailed(ctx, log, run)
+			return
+		}
+		links = built
+	}
+
 	// Report materialization (FEAT-014's completion boundary): a run whose steps all succeeded but
 	// whose Report could not be persisted is a corrupt state, so a failure here fails the run.
-	if err := e.createReport(ctx, sc, run, reconcile, chartOut.ChartSpec, narrateOut.Narrative); err != nil {
+	if err := e.createReport(ctx, sc, run, reconcile, chartOut.ChartSpec, narrateOut.Narrative, links); err != nil {
 		log.Error("creating report", slog.String("error", err.Error()))
 		e.stepFailed(ctx, log, run)
 		return
@@ -721,17 +759,33 @@ func (e *Executor) runChartSpec(ctx context.Context, sc stepContext, run domain.
 	return string(encoded), nil
 }
 
-// runNarrate executes the narrate step (FEAT-015): the model writes plain-language prose explaining
-// what the facts show. It narrates ONLY over the execute result set carried by the facts payload —
-// never over data outside the result set, and never over withheld column values (BuildFactsPayload
-// drops them before the payload is sealed).
-func (e *Executor) runNarrate(ctx context.Context, sc stepContext, run domain.Run, out domain.ExecuteStepOutput, log *slog.Logger) (string, error) {
+// runNarrate executes the narrate step (FEAT-015/FEAT-030): the model writes plain-language prose
+// explaining what the facts show, plus the structured claims mapping every figure back to a result
+// cell. It narrates ONLY over the execute result set carried by the facts payload — never over data
+// outside the result set, and never over withheld column values (BuildFactsPayload drops them before
+// the payload is sealed).
+//
+// sourceSQL is the exact SQL that produced the result set — the model never sees it; it is carried
+// separately so resolved claims can store it verbatim as their source query. reconcile carries
+// FEAT-029's measured exclusion warnings: when a filter dropped a significant share of rows, the
+// narrate prompt demands the model state the callout in prose, so the report "unprompted surfaces
+// that fact" (features.md FEAT-029 AC2) rather than only showing it in a side widget.
+func (e *Executor) runNarrate(ctx context.Context, sc stepContext, run domain.Run, sourceSQL string, reconcile domain.ReconciliationSummary, out domain.ExecuteStepOutput, log *slog.Logger) (string, error) {
 	payload, err := e.buildFactsPayload(ctx, sc.workspaceID, run.QuestionText, "", out)
 	if err != nil {
 		return "", err
 	}
 
-	raw, err := e.client.Complete(ctx, sc.workspaceID, sc.userID, narrateSystemPrompt, payload)
+	prompt := narrateSystemPrompt
+	if len(reconcile.ExclusionWarnings) > 0 {
+		// Reconciliation facts are aggregates, not rows — safe to put in the prompt (never the facts
+		// payload seam, which is sealed). The model is told to surface them plainly so the narrative
+		// carries the callout itself.
+		prompt += "\n\nRECONCILIATION — the query that produced the result set measured these exclusions. State them plainly in the narrative where they matter; do not bury them and do not invent others:\n- " +
+			strings.Join(reconcile.ExclusionWarnings, "\n- ")
+	}
+
+	raw, err := e.client.Complete(ctx, sc.workspaceID, sc.userID, prompt, payload)
 	if err != nil {
 		return "", err
 	}
@@ -822,6 +876,16 @@ func (e *Executor) runExecute(ctx context.Context, sc stepContext, handle engine
 	if err != nil {
 		return "", err
 	}
+
+	// FEAT-029: on top of the measure failure warnings, surface data-grounded exclusion warnings —
+	// a filter discarding a large share of measured rows, or a filter over a column the profiler
+	// proves is materially null. Pure computation over measured numbers; no extra engine query.
+	nullRates, err := e.nullRateByColumn(ctx, sc.workspaceID)
+	if err != nil {
+		return "", fmt.Errorf("reading column null rates for reconciliation: %w", err)
+	}
+	warnings = append(warnings, reconcileExclusionWarnings(sql, rowsIn, int64(out.RowCount), nullRates)...)
+
 	reconcile.RowsIn = rowsIn
 	reconcile.RowsOut = int64(out.RowCount)
 	reconcile.ExclusionWarnings = warnings
@@ -959,10 +1023,14 @@ func isIdentifierByte(b byte) bool {
 
 // createReport materializes the run's Report at completion (FEAT-014's assembly boundary). The
 // Report is fully self-contained: title derived from the question, the narrate step's narrative, the
-// chart_spec step's spec, an empty provenance_links array (FEAT-030 is Phase 3), and the measured
-// reconciliation summary. A run whose steps all succeeded but whose Report cannot be persisted is a
+// chart_spec step's spec, the measured reconciliation summary, and (FEAT-030) the resolved
+// provenance links. A run whose steps all succeeded but whose Report cannot be persisted is a
 // corrupt state, so this fails the run rather than being best-effort.
-func (e *Executor) createReport(ctx context.Context, sc stepContext, run domain.Run, reconcile domain.ReconciliationSummary, chart domain.ChartSpec, narrative string) error {
+func (e *Executor) createReport(ctx context.Context, sc stepContext, run domain.Run, reconcile domain.ReconciliationSummary, chart domain.ChartSpec, narrative string, links []domain.ProvenanceLink) error {
+	ids := make([]string, len(links))
+	for i := range links {
+		ids[i] = links[i].ID
+	}
 	report := domain.Report{
 		ID:                    uuid.NewString(),
 		WorkspaceID:           sc.workspaceID,
@@ -970,13 +1038,26 @@ func (e *Executor) createReport(ctx context.Context, sc stepContext, run domain.
 		Title:                 deriveReportTitle(run.QuestionText),
 		Narrative:             narrative,
 		ChartSpec:             chart,
-		ProvenanceLinks:       []string{},
+		ProvenanceLinks:       ids,
 		ReconciliationSummary: reconcile,
 		ParentReportID:        "",
 		CreatedAt:             time.Now().UTC(),
 	}
 	if err := e.reports.Create(ctx, report); err != nil {
 		return fmt.Errorf("persisting report: %w", err)
+	}
+
+	// FEAT-030: persist the resolved provenance links (report-scoped rows). A Report whose claims
+	// cannot be persisted is as corrupt as one whose narrative cannot — the links are the report's
+	// verification surface — so a write failure here fails the run too. When no provenance store is
+	// wired (tests/dev), the links simply stay in the report's ids array without backing rows.
+	if len(links) > 0 && e.provenance != nil {
+		for i := range links {
+			links[i].ReportID = report.ID
+		}
+		if err := e.provenance.WriteLinks(ctx, sc.workspaceID, links); err != nil {
+			return fmt.Errorf("persisting provenance links: %w", err)
+		}
 	}
 	return nil
 }
@@ -1278,19 +1359,29 @@ Rules:
 - title is a short, human-readable chart title that does not restate the entire question.
 Use ONLY column names exactly as they appear in the result set. Do not include markdown fences or any text outside the JSON object.`
 
-// narrateSystemPrompt frames the narrate step (FEAT-015): the model receives ONLY the executed
-// result set (the facts) plus the workspace's schema metadata — it narrates over the facts and
-// nothing else. Every stated number must be traceable to the result set (FEAT-030's eligibility),
-// and the prose must stand alone for someone who never sees the SQL or schema.
+// narrateSystemPrompt frames the narrate step (FEAT-015/FEAT-030): the model receives ONLY the
+// executed result set (the facts) plus the workspace's schema metadata — it narrates over the facts
+// and nothing else. Every stated number must be traceable to the result set, and the prose must
+// stand alone for someone who never sees the SQL or schema.
+//
+// Claims (FEAT-030): the model additionally maps each stated figure back to the exact result row and
+// column that produced it, so the product can make the figure clickable and verifiable. Row indexes
+// are 0-based positions within the "rows" arrays in the payload. A number stated WITHOUT a claim is
+// not back-linked; a number that gets a claim is only persisted if the executor can bind it to a
+// real cell (the deterministic validator re-checks everything).
 const narrateSystemPrompt = `You are the narrative step of a grounded analytics system. You are given the executed result set of a user's question: the actual data rows the query returned, alongside the workspace's schema metadata.
 
 Your job is to write a clear, plain-language answer to the user's question that explains what the data shows. The result set is the ONLY data you may reference — never invent, estimate, or reach for numbers that are not present in the rows you were given.
 
 Rules:
 - Write prose a non-technical reader can act on. No SQL, no column names as jargon, no schema terminology.
-- Every number you state must come from the provided result set, and each one should be stated so a reader could trace it back to a specific value (it will be eligible for provenance linking).
+- Every number you state must come from the provided result set, and each one should be stated so a reader could trace it back to a specific value.
 - If the result set contains values that a human should treat carefully (for example a null in a key cell or an obvious outlier), mention it plainly rather than glossing over it.
 - Keep the narrative focused and proportionate to the question. Do not pad.
 - Do not restate the raw table row by row; summarize, compare, and call out what matters.
 
-Respond with ONLY a JSON object of the form {"narrative": "..."} containing the narrative as a single string. Escape any embedded double quotes. Do not include markdown fences or any text outside the JSON object.`
+CLAIM MAPPING (verification mechanism):
+- For EVERY number you state in the narrative, add one claim to the "claims" array that names the exact result-set cell the number came from: claim_text is the exact narrative span containing the number, column is the result column name (exactly as in the "columns" array), row_index is the 0-based position of the row in the "rows" array that holds the cell.
+- Every stated number gets a claim; a number without a claim cannot be verified and will not be linkable. State only numbers you can map to a cell.
+
+Respond with ONLY a JSON object of the form {"narrative": "...", "claims": [{"claim_text": "...", "column": "...", "row_index": 0}]}. "claims" may be an empty array. Escape any embedded double quotes. Do not include markdown fences or any text outside the JSON object.`

@@ -112,6 +112,9 @@ func run(logger *slog.Logger) error {
 	stepRepo := postgres.NewStepRepository(pool)
 	// FEAT-014's Report Store is materialized by the executor and read by the report read endpoint.
 	reportRepo := postgres.NewReportRepository(pool)
+	// FEAT-030's claim-level provenance store: written by the executor at report materialization
+	// (WithProvenance) and read by the report/provenance endpoints. Same postgres repository both ways.
+	provenanceRepo := postgres.NewProvenanceRepository(pool)
 	modelClient := model.NewClient(cfg.AnthropicAPIKey, auditWriter, logger)
 	if cfg.AnthropicAPIKey == "" {
 		logger.Warn("ANTHROPIC_API_KEY is not set — FEAT-013 runs will fail at the model step")
@@ -125,7 +128,7 @@ func run(logger *slog.Logger) error {
 	runExecutor := runpkg.NewExecutor(
 		runRepo, stepRepo, datasetRepo, columnRepo, objectStore, engineProvider, auditWriter,
 		modelClient, reportRepo, relationshipRepo, metricDefinitionRepo, correctionRepo, logger,
-		runpkg.WithEvents(runEvents), runpkg.WithCache(runCacheRepo))
+		runpkg.WithEvents(runEvents), runpkg.WithCache(runCacheRepo), runpkg.WithProvenance(provenanceRepo))
 
 	deps := api.Dependencies{
 		AuthSecret: cfg.AuthSecret,
@@ -179,9 +182,11 @@ func run(logger *slog.Logger) error {
 		RunExecutor: runExecutor,
 		RunEvents:   runEvents,
 
-		// FEAT-014: report read endpoint (screens/09-report-view.md). Materialized by the executor;
-		// read here through the same ReportRepository instance.
-		Reports: reportRepo,
+		// FEAT-014/FEAT-030: report read endpoint (screens/09-report-view.md) + claim-level
+		// provenance (screens/10-provenance-panel.md). Materialized and written by the executor;
+		// read here through the same repository instances.
+		Reports:    reportRepo,
+		Provenance: provenanceRepo,
 	}
 
 	server := &http.Server{

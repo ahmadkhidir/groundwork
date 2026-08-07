@@ -35,6 +35,14 @@ const MaxUploadBytesDefault int64 = 500 * 1024 * 1024
 // truncation), and the narrate/chart_spec facts payloads share the same cap.
 const MaxExecuteRows = 10000
 
+// ReconcileExclusionShareThreshold is the share (0..1) of source rows a plain filter may discard
+// before the run records an unprompted exclusion warning and (via narrate) works the callout into
+// the narrative (FEAT-029 AC2, screens/09). 0.31 mirrors the product's canonical example — "excluded
+// 31% of rows where region was null" — so the mechanism fires around the exact case the docs lead
+// with. The warning is only ever computed over measured rows (rows_in/rows_out); it is never a
+// fabricated share.
+const ReconcileExclusionShareThreshold = 0.31
+
 // EngineIdleTimeoutDefault is how long a session engine may sit idle before shutdown.
 //
 // Per architecture.md, wake latency is dominated by compute provisioning rather than dataset size,

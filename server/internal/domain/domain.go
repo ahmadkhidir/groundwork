@@ -482,17 +482,23 @@ type Report struct {
 	CreatedAt      time.Time `json:"created_at"`
 }
 
-// ProvenanceLink ties a specific number stated in a report's narrative to the exact query and rows
-// that produced it. This is the mechanism behind the product's claim that every number is traceable.
+// ProvenanceLink ties one numeric claim stated in a Report's narrative to the exact result cell that
+// produced it (FEAT-030). Each row in the provenance_links table is one link; Report.ProvenanceLinks
+// carries its ids.
+//
+// ClaimText and StatedValue preserve what the reader saw, so the provenance panel can restate both.
+// SourceQuery is the exact SQL that produced the result set the cell came from (the run's executed
+// SQL). SourceColumn is the result column whose cell backs the figure — it exists so the Provenance
+// Panel can highlight the relevant cell (screens/10's "relevant cell highlighted"). SourceRowIDs
+// names the specific result rows backing the value (a row that aggregates a range may name several;
+// a plain cell names one) as 0-based positions within the executed result set.
 type ProvenanceLink struct {
-	ID       string `json:"id"`
-	ReportID string `json:"report_id"`
-	// ClaimText is the exact text span in the narrative this link corresponds to.
-	ClaimText string `json:"claim_text"`
-	// StatedValue is kept as a string to preserve exact display formatting (currency, percentage).
-	StatedValue string `json:"stated_value"`
-	SourceQuery string `json:"source_query"`
-	// SourceRowIDs identifies the specific result rows backing the value.
+	ID           string   `json:"id"`
+	ReportID     string   `json:"report_id"`
+	ClaimText    string   `json:"claim_text"`
+	StatedValue  string   `json:"stated_value"`
+	SourceQuery  string   `json:"source_query"`
+	SourceColumn string   `json:"source_column"`
 	SourceRowIDs []string `json:"source_row_ids"`
 }
 

@@ -18,6 +18,7 @@ const getMock = vi.mocked(api.get);
 const { pushMock } = vi.hoisted(() => ({ pushMock: vi.fn() }));
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: pushMock }),
+  useSearchParams: () => new URLSearchParams(),
 }));
 
 function report(overrides: Partial<Report> = {}): Report {

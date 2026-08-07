@@ -220,7 +220,23 @@ func (e *Executor) replayCacheHit(ctx context.Context, sc stepContext, run domai
 		return fmt.Errorf("parsing cached reconciliation summary: %w", err)
 	}
 
-	return e.createReport(ctx, sc, run, reconcile, chartSpecOut.ChartSpec, narrateOut.Narrative)
+	// FEAT-030: rebuild the provenance links of the cached run exactly as a fresh run would — resolve
+	// the cached narrate claims against the cached (replayed) execute result set, with the cached
+	// SQL as each claim's source query. A claim that does not bind is dropped, exactly as in the
+	// fresh path, so a replayed report's verification surface matches what it visibly promises.
+	var links []domain.ProvenanceLink
+	if len(narrateOut.Claims) > 0 {
+		var execDomain domain.ExecuteStepOutput
+		if err := json.Unmarshal([]byte(execOut), &execDomain); err != nil {
+			return fmt.Errorf("parsing cached execute output for provenance: %w", err)
+		}
+		links, err = e.buildProvenanceClaims(ctx, sc.workspaceID, rec.GenerateSQLOutput, execDomain, narrateOut.Claims)
+		if err != nil {
+			return err
+		}
+	}
+
+	return e.createReport(ctx, sc, run, reconcile, chartSpecOut.ChartSpec, narrateOut.Narrative, links)
 }
 
 // replayStep creates and immediately completes a step row carrying a cached output (FEAT-027

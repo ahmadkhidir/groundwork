@@ -2,8 +2,12 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"net/http"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -24,10 +28,35 @@ type ReportStore interface {
 	GetByRunID(ctx context.Context, workspaceID, runID string) (domain.Report, error)
 }
 
-// RegisterReportRoutes wires FEAT-014's report read endpoint onto r. Mounted under the
-// authenticated group by the caller (see api.go) like every other endpoint.
-func RegisterReportRoutes(r chi.Router, workspaces WorkspaceStore, reports ReportStore, logger *slog.Logger) {
-	r.Get("/workspaces/{workspaceId}/reports/{reportId}", handleGetReport(workspaces, reports, logger))
+// ProvenanceStore is the read seam the provenance endpoints depend on, satisfied by
+// internal/store/postgres.ProvenanceRepository — the same instance the executor writes links
+// through (run.WithProvenance).
+type ProvenanceStore interface {
+	ListByReport(ctx context.Context, reportID string) ([]domain.ProvenanceLink, error)
+	GetByID(ctx context.Context, workspaceID, id string) (domain.ProvenanceLink, error)
+}
+
+// ReportDetails is ReportStore's read seam, used only to expand a report's run for the provenance
+// panel (screens/10 needs the source rows, which are reconstructed from the run's persisted execute
+// step). Satisfied by postgres.RunRepository.
+//
+// GetByID is workspace-unaware here only in the sense that the provenance handler already proved
+// ownership of the report (and thus its run) before calling; the run is scoped by that same report.
+type ReportRunStore interface {
+	GetByID(ctx context.Context, id string) (domain.Run, error)
+}
+
+// RegisterReportRoutes wires FEAT-014's report read endpoint and FEAT-030's provenance endpoints
+// onto r. Mounted under the authenticated group by the caller (see api.go).
+//
+// provenance and runSteps may be nil: without them the report endpoint still serves the report with
+// provenance_links as the raw id array (no expansion), and the provenance-panel detail endpoint is
+// simply not registered.
+func RegisterReportRoutes(r chi.Router, workspaces WorkspaceStore, reports ReportStore, provenance ProvenanceStore, runSteps RunStepStore, logger *slog.Logger) {
+	r.Get("/workspaces/{workspaceId}/reports/{reportId}", handleGetReport(workspaces, reports, provenance, logger))
+	if provenance != nil && runSteps != nil {
+		r.Get("/workspaces/{workspaceId}/reports/{reportId}/provenance/{claimId}", handleGetProvenanceClaim(workspaces, reports, provenance, runSteps, logger))
+	}
 }
 
 // handleGetReport serves screens/09-report-view.md: GET /api/workspaces/:id/reports/:reportId.
@@ -35,7 +64,11 @@ func RegisterReportRoutes(r chi.Router, workspaces WorkspaceStore, reports Repor
 // The report is fully self-contained per architecture.md's Report Store — the viewer needs neither
 // the session engine nor live run state to render it (narrative, chart spec, reconciliation
 // summary, provenance links, parent link, timestamp all ride on the object itself).
-func handleGetReport(workspaces WorkspaceStore, reports ReportStore, logger *slog.Logger) http.HandlerFunc {
+//
+// When a provenance seam is wired, the report's provenance_links (stored as ids) are expanded into
+// full claim objects so the viewer can render each inline Provenance-Linked Number (screens/09) —
+// the shared component needs claim_text/claim stated_value, not opaque ids.
+func handleGetReport(workspaces WorkspaceStore, reports ReportStore, provenance ProvenanceStore, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
@@ -66,10 +99,230 @@ func handleGetReport(workspaces WorkspaceStore, reports ReportStore, logger *slo
 		if report.ReconciliationSummary.ExclusionWarnings == nil {
 			report.ReconciliationSummary.ExclusionWarnings = []string{}
 		}
+
+		links := []domain.ProvenanceLink{}
+		if provenance != nil && len(report.ProvenanceLinks) > 0 {
+			links, err = provenance.ListByReport(r.Context(), report.ID)
+			if err != nil {
+				// Link expansion is a presentation nicety, not the report's authority; a read failure
+				// serves the report with its id array rather than erroring the whole page.
+				logger.Warn("expanding provenance links", slog.String("report_id", report.ID), slog.String("error", err.Error()))
+				links = []domain.ProvenanceLink{}
+			}
+		}
 		if report.ProvenanceLinks == nil {
 			report.ProvenanceLinks = []string{}
 		}
 
-		respondJSON(w, http.StatusOK, map[string]any{"report": report})
+		// Add the run id to each link so the webpanel's "View full run" can route to the Run Viewer
+		// (screens/10) without a second fetch.
+		respondJSON(w, http.StatusOK, map[string]any{
+			"report": reportPayload{
+				ID:                    report.ID,
+				WorkspaceID:           report.WorkspaceID,
+				RunID:                 report.RunID,
+				Title:                 report.Title,
+				Narrative:             report.Narrative,
+				ChartSpec:             report.ChartSpec,
+				ProvenanceLinks:       links,
+				ReconciliationSummary: report.ReconciliationSummary,
+				ParentReportID:        report.ParentReportID,
+				CreatedAt:             report.CreatedAt,
+			},
+		})
+	}
+}
+
+// reportPayload is the report read endpoint's wire shape: the report's fields plus claim-level
+// provenance expanded from opaque ids into link objects, and the originating run id surfaced for the
+// provenance panel's "View full run" navigation.
+type reportPayload struct {
+	ID                    string                       `json:"id"`
+	WorkspaceID           string                       `json:"workspace_id"`
+	RunID                 string                       `json:"run_id"`
+	Title                 string                       `json:"title"`
+	Narrative             string                       `json:"narrative"`
+	ChartSpec             domain.ChartSpec             `json:"chart_spec"`
+	ProvenanceLinks       []domain.ProvenanceLink      `json:"provenance_links"`
+	ReconciliationSummary domain.ReconciliationSummary `json:"reconciliation_summary"`
+	ParentReportID        string                       `json:"parent_report_id,omitempty"`
+	CreatedAt             time.Time                    `json:"created_at"`
+}
+
+// provenanceDetail is the provenance-panel detail endpoint's response (screens/10):
+//
+//	claim:  the link (claim_text, stated_value, source_query, report id) plus run_id for "View full run"
+//	source: the backing result rows/cells, with available=false when the run's execute output no
+//	        longer holds the rows (an honest "This source data is no longer available" state, screens/10
+//	        — never a whole-page error, and never a fabricated row set).
+type provenanceDetail struct {
+	Claim  provenanceClaimPayload `json:"claim"`
+	Source provenanceSource       `json:"source"`
+}
+
+// provenanceClaimWire flattens claim + run_id.
+type provenanceClaimPayload struct {
+	ID           string   `json:"id"`
+	ReportID     string   `json:"report_id"`
+	RunID        string   `json:"run_id"`
+	ClaimText    string   `json:"claim_text"`
+	StatedValue  string   `json:"stated_value"`
+	SourceQuery  string   `json:"source_query"`
+	SourceColumn string   `json:"source_column"`
+	SourceRowIDs []string `json:"source_row_ids"`
+}
+
+// provenanceSource is the backing rows/cells for one claim. available=false means the execute output
+// is gone or does not contain the claimed rows — the honest "this source is no longer available"
+// state.
+type provenanceSource struct {
+	Available       bool       `json:"available"`
+	Columns         []string   `json:"columns,omitempty"`
+	Rows            [][]string `json:"rows,omitempty"`
+	HighlightColumn string     `json:"highlight_column,omitempty"`
+}
+
+// handleGetProvenanceClaim serves screens/10-provenance-panel.md:
+// GET /api/workspaces/:id/reports/:reportId/provenance/:claimId.
+//
+// It returns the claim's stated figure and source query plus the specific backing result rows/cells
+// (with the relevant column named for highlighting). The rows are reconstructed from the run's
+// persisted execute step output, so "View Full Run" and claim rendering need no live engine — and if
+// that output is gone, the distinct "source unavailable" state is returned rather than an error.
+func handleGetProvenanceClaim(workspaces WorkspaceStore, reports ReportStore, provenance ProvenanceStore, runSteps RunStepStore, logger *slog.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		claims, ok := requireClaims(w, r)
+		if !ok {
+			return
+		}
+
+		workspaceID := chi.URLParam(r, "workspaceId")
+		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+			return
+		}
+
+		reportID := chi.URLParam(r, "reportId")
+		report, err := reports.GetByID(r.Context(), workspaceID, reportID)
+		if err != nil {
+			respondJSON(w, http.StatusNotFound, map[string]string{"error": "Report not found.", "code": "not_found"})
+			return
+		}
+
+		claimID := chi.URLParam(r, "claimId")
+		link, err := provenance.GetByID(r.Context(), workspaceID, claimID)
+		if err != nil {
+			respondJSON(w, http.StatusNotFound, map[string]string{"error": "Claim not found.", "code": "not_found"})
+			return
+		}
+		if link.ReportID != report.ID {
+			respondJSON(w, http.StatusNotFound, map[string]string{"error": "Claim not found.", "code": "not_found"})
+			return
+		}
+
+		resp := provenanceDetail{
+			Claim: provenanceClaimPayload{
+				ID:           link.ID,
+				ReportID:     link.ReportID,
+				ClaimText:    link.ClaimText,
+				StatedValue:  link.StatedValue,
+				SourceQuery:  link.SourceQuery,
+				SourceColumn: link.SourceColumn,
+				SourceRowIDs: link.SourceRowIDs,
+			},
+		}
+		if link.SourceRowIDs == nil {
+			resp.Claim.SourceRowIDs = []string{}
+		}
+
+		// Load the run's persisted execute step and slice out the claimed rows, so the panel shows
+		// the exact cells that backed the number. If the execute output is gone or the rows no longer
+		// exist, source is honestly unavailable — not an error, and never fabricated.
+		runID := report.RunID
+		resp.Claim.RunID = runID
+		populateProvenanceSource(r, &resp, runSteps, runID, link)
+
+		respondJSON(w, http.StatusOK, map[string]any{"detail": resp})
+	}
+}
+
+// populateProvenanceSource fills detail.Source from the run's execute step output. It is honest
+// about the two fail cases: the run's execute step is not found (available=false), or the claimed
+// row is out of range (available=false). It never fabricates a row.
+func populateProvenanceSource(r *http.Request, detail *provenanceDetail, runSteps RunStepStore, runID string, link domain.ProvenanceLink) {
+	steps, err := runSteps.ListByRun(r.Context(), runID)
+	if err != nil {
+		detail.Source.Available = false
+		return
+	}
+
+	var executeOutput string
+	for _, st := range steps {
+		if st.StepName == domain.StepExecute {
+			executeOutput = st.Output
+			break
+		}
+	}
+	if executeOutput == "" {
+		detail.Source.Available = false
+		return
+	}
+
+	var exec domain.ExecuteStepOutput
+	if err := json.Unmarshal([]byte(executeOutput), &exec); err != nil {
+		detail.Source.Available = false
+		return
+	}
+
+	colIdx := -1
+	for i, name := range exec.Columns {
+		if strings.EqualFold(name, link.SourceColumn) {
+			colIdx = i
+			break
+		}
+	}
+	if colIdx < 0 {
+		detail.Source.Available = false
+		return
+	}
+
+	detail.Source.Columns = exec.Columns
+	detail.Source.HighlightColumn = link.SourceColumn
+	for _, id := range link.SourceRowIDs {
+		idx, err := strconv.Atoi(id)
+		if err != nil || idx < 0 || idx >= len(exec.Rows) {
+			detail.Source.Available = false
+			return
+		}
+		row := make([]string, 0, len(exec.Columns))
+		for _, v := range exec.Rows[idx] {
+			row = append(row, formatCell(v))
+		}
+		detail.Source.Rows = append(detail.Source.Rows, row)
+	}
+	detail.Source.Available = true
+}
+
+// formatCell renders an executed cell value as display text for the provenance panel, preserving
+// string formatting (currency, percent) and rendering nil as a readable "null" so a null cell is
+// honest rather than blank.
+func formatCell(v any) string {
+	if v == nil {
+		return ""
+	}
+	switch t := v.(type) {
+	case string:
+		return t
+	case bool:
+		if t {
+			return "true"
+		}
+		return "false"
+	case float64:
+		return strconv.FormatFloat(t, 'f', -1, 64)
+	case json.Number:
+		return t.String()
+	default:
+		b, _ := json.Marshal(t)
+		return string(b)
 	}
 }

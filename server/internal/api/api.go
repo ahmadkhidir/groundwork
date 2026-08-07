@@ -125,6 +125,11 @@ type Dependencies struct {
 	// contained fetch. Satisfied by postgres.ReportRepository, the same instance the executor uses
 	// to materialize reports on run completion.
 	Reports ReportStore
+	// Provenance backs FEAT-030's claim-level provenance — the report read endpoint expands a
+	// report's provenance_links ids into claim objects, and the provenance-panel detail endpoint
+	// (screens/10) serves a single claim's query and backing result rows. Satisfied by
+	// postgres.ProvenanceRepository, the same instance the executor wires via run.WithProvenance.
+	Provenance ProvenanceStore
 }
 
 // Server wires configuration and dependencies into an http.Handler.
@@ -257,9 +262,11 @@ func (s *Server) routes() {
 					RegisterRunRoutes(r, s.deps.Workspaces, s.deps.Runs, s.deps.RunSteps, s.deps.Reports, s.deps.SemanticCorrections, s.deps.RunExecutor, s.deps.RunEvents, s.logger)
 				}
 
-				// FEAT-014: read a completed run's materialized Report — screens/09-report-view.md.
+				// FEAT-014/FEAT-030: read a completed run's materialized Report (and, with the
+				// provenance seam wired, expand its claim-level provenance links and serve the
+				// provenance-panel detail endpoint) — screens/09-report-view.md, screens/10.
 				if s.deps.Reports != nil {
-					RegisterReportRoutes(r, s.deps.Workspaces, s.deps.Reports, s.logger)
+					RegisterReportRoutes(r, s.deps.Workspaces, s.deps.Reports, s.deps.Provenance, s.deps.RunSteps, s.logger)
 				}
 			})
 		}
