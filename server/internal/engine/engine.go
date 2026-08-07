@@ -110,4 +110,16 @@ type Provider interface {
 	// This is what the UI polls to render the status pill, so it must never itself trigger a wake —
 	// otherwise merely looking at a workspace would bill engine-seconds.
 	Status(ctx context.Context, workspaceID string) (Status, error)
+
+	// Drop tears down and forgets a workspace's engine state entirely, for a workspace that is
+	// being deleted (FEAT-043's deletion cascade: "DuckDB snapshots/engine state").
+	//
+	// Drop is idempotent: a workspace with no session, or one whose engine already idled out, drops
+	// cleanly rather than erroring. Any leased handle for the workspace becomes invalid — the
+	// deletion cascade guarantees no run is in flight for a workspace being deleted, but callers
+	// must not Acquire after Drop or the workspace's state is resurrected behind the cascade's back.
+	//
+	// The workspace's status mirror (engine_status column) is reset to sleeping so the workspace's
+	// row reflects that its engine is gone before the row itself is deleted.
+	Drop(workspaceID string) error
 }

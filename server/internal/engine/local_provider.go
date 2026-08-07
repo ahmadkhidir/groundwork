@@ -318,6 +318,59 @@ func (p *LocalProvider) Status(ctx context.Context, workspaceID string) (Status,
 	return StatusSleeping, nil
 }
 
+// Drop implements Provider: tears down and forgets a workspace's engine state for a workspace being
+// deleted (FEAT-043's cascade).
+//
+// The session is removed from the provider's map FIRST, so no new Acquire can reopen it behind the
+// cascade's back; then the idle timer is stopped and the connection closed. A concurrently held
+// handle's next Query/Exec reads db == nil and fails with "no longer live" — the correct post-
+// deletion behavior, and the deletion cascade guarantees no run is in flight for the workspace being
+// deleted anyway.
+//
+// Idempotent: a workspace that never acquired an engine, or whose engine already idled out, has
+// nothing to drop and returns nil, so a retried deletion cascade does not fail on an already-dropped
+// workspace.
+func (p *LocalProvider) Drop(workspaceID string) error {
+	if workspaceID == "" {
+		return fmt.Errorf("engine: workspaceID is required")
+	}
+
+	p.mu.Lock()
+	s, ok := p.sessions[workspaceID]
+	if ok {
+		delete(p.sessions, workspaceID)
+	}
+	p.mu.Unlock()
+
+	if !ok {
+		return nil
+	}
+
+	s.cancelIdleTimer()
+
+	s.mu.Lock()
+	var db *sql.DB
+	if s.db != nil {
+		db = s.db
+		s.db = nil
+	}
+	notify := s.notify
+	s.mu.Unlock()
+
+	if db != nil {
+		if err := db.Close(); err != nil {
+			p.logger.Error("closing dropped engine", slog.String("workspace_id", workspaceID), slog.String("error", err.Error()))
+		}
+	}
+	// Notified AFTER releasing s.mu — same hygiene as teardown: the hook may call back into this
+	// Provider (e.g. a test asserting Status), and Status takes p.mu, never s.mu, so there is no
+	// lock-ordering hazard.
+	if notify != nil {
+		notify(workspaceID, StatusSleeping)
+	}
+	return nil
+}
+
 // localHandle is the Handle LocalProvider hands out. Not safe for concurrent use by multiple
 // callers, per Handle's doc comment — the session's semaphore is what enforces that at the Provider
 // level; a Handle instance itself does no additional locking of its own.

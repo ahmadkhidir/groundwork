@@ -1,11 +1,18 @@
 "use client";
 
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import Link from "next/link";
-import { ArrowLeft } from "lucide-react";
+import { useRouter } from "next/navigation";
+import { ArrowLeft, Trash2 } from "lucide-react";
 import { Card, CardHeader } from "@/components/ui/Card";
-import { buttonClassNames } from "@/components/ui/Button";
+import { Button, buttonClassNames } from "@/components/ui/Button";
+import { Skeleton } from "@/components/shared/Skeleton";
+import { ErrorState } from "@/components/shared/ErrorState";
+import { api } from "@/lib/api-client";
 import { routes } from "@/lib/routes";
+import type { DeletionRecord, Workspace } from "@/types/schema";
+import { WorkspaceDeleteModal } from "./WorkspaceDeleteModal";
+import { storeDeletionProof } from "./DeletedProofScreen";
 
 export interface WorkspaceSettingsScreenProps {
   workspaceId: string;
@@ -47,20 +54,89 @@ function LaterPhaseCard({
   );
 }
 
+/** The single-workspace GET's payload shape; only the name is needed here for the confirm-by-typing gate. */
+interface GetWorkspaceResponse {
+  workspace: Workspace;
+}
+
+/** The DELETE /v1/workspaces/:id response: the surviving DeletionRecord proof, per screens/14. */
+interface DeleteWorkspaceResponse {
+  deletion: DeletionRecord;
+}
+
+type DangerZoneState =
+  | { status: "loading" }
+  | { status: "loaded"; name: string }
+  | { status: "error"; message: string };
+
 /**
  * Screen 13: Workspace Settings (screens/13-workspace-settings.md).
  *
- * Phase-1 shell, per the authorized scope: the screen is a real tabbed surface, and the Audit Log
- * tab is functional (FEAT-042, Phase 1) — a short explanatory line plus a button that navigates to
- * the full Egress / Audit Log screen (kept as its own route per the screen spec, not a tab body,
- * since the log is a filterable, paginated surface rather than a settings form).
+ * The Audit Log tab is functional (FEAT-042 — a short explanatory line plus a button navigating to
+ * the full Egress / Audit Log screen, kept as its own route per the screen spec). The Danger Zone
+ * tab is the real FEAT-043 delete flow: it loads the workspace name (the confirm-by-typing gate's
+ * match value), and "Delete Workspace" opens the screens/14 confirmation modal — explicit scope,
+ * type-the-name-to-confirm, honest Executing state, and navigation to the Deletion Proof page on
+ * success. The remaining tabs (Column Visibility FEAT-010, Sharing FEAT-045/FEAT-046, Usage
+ * FEAT-047) are Phase 5 features and render an explicit later-phase state instead of a fake or
+ * half-wired control.
  *
- * The remaining tabs (Column Visibility FEAT-010, Sharing FEAT-045/FEAT-046, Usage FEAT-047,
- * Danger Zone FEAT-043) are Phase 4–5 features outside the authorized scope. Each renders an
- * explicit later-phase state instead of a fake or half-wired control.
+ * Read-only shared members never see the Danger Zone at all — that hiding (FEAT-045, Phase 5) is
+ * enforced by the API's owner-only 404 in any case; this screen is only reachable by owners today.
  */
 export function WorkspaceSettingsScreen({ workspaceId }: WorkspaceSettingsScreenProps) {
+  const router = useRouter();
   const [tab, setTab] = useState<SettingsTab>("audit-log");
+  const [dangerZone, setDangerZone] = useState<DangerZoneState>({ status: "loading" });
+  const [deleteModalOpen, setDeleteModalOpen] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
+  // Lazy per tab, matching screens/13's Data Flow ("each tab's data loads independently... to avoid
+  // fetching sharing/usage data before the user opens those tabs"): the workspace name is only
+  // fetched when the Danger Zone is opened, from the click handler rather than an effect.
+  const loadWorkspaceName = useCallback(async () => {
+    setDangerZone({ status: "loading" });
+    try {
+      const res = await api.get<GetWorkspaceResponse>(`/v1/workspaces/${workspaceId}`);
+      setDangerZone({ status: "loaded", name: res.workspace.name });
+    } catch (error) {
+      setDangerZone({
+        status: "error",
+        message:
+          error instanceof Error ? error.message : "Something went wrong. Try again.",
+      });
+    }
+  }, [workspaceId]);
+
+  const selectTab = (next: SettingsTab) => {
+    setTab(next);
+    if (next === "danger-zone" && dangerZone.status === "loading") {
+      void loadWorkspaceName();
+    }
+  };
+
+  const handleDelete = useCallback(async () => {
+    if (dangerZone.status !== "loaded") return;
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      const res = await api.delete<DeleteWorkspaceResponse>(
+        `/v1/workspaces/${workspaceId}`,
+      );
+      // Carry the proof to the Deletion Proof page; survives a refresh of that page in this tab.
+      storeDeletionProof(workspaceId, res.deletion);
+      router.push(routes.deletionProof(workspaceId));
+    } catch (error) {
+      // Flow 5 Alternate Path B: no false success. The modal stays open with the server's message
+      // (which names the failed category) and the confirm-by-typing state intact, so the user can
+      // retry — the workspace was not deleted.
+      setDeleting(false);
+      setDeleteError(
+        error instanceof Error ? error.message : "Something went wrong. Try again.",
+      );
+    }
+  }, [workspaceId, dangerZone, router]);
 
   return (
     <main id="main-content" className="mx-auto w-full max-w-3xl p-8">
@@ -88,7 +164,7 @@ export function WorkspaceSettingsScreen({ workspaceId }: WorkspaceSettingsScreen
             id={`settings-tab-${id}`}
             aria-selected={tab === id}
             aria-controls={`settings-panel-${id}`}
-            onClick={() => setTab(id)}
+            onClick={() => selectTab(id)}
             className={
               tab === id
                 ? "border-b-2 border-primary px-3 py-2 text-body font-medium text-text-primary"
@@ -172,11 +248,45 @@ export function WorkspaceSettingsScreen({ workspaceId }: WorkspaceSettingsScreen
         hidden={tab !== "danger-zone"}
         className="mt-6"
       >
-        <LaterPhaseCard
-          feature="Danger zone"
-          description="Workspace deletion with confirmation and proof (FEAT-043)."
-          phase="Phase 4"
-        />
+        <Card>
+          <CardHeader
+            title="Danger zone"
+            description="Permanently delete this workspace and every piece of derived state it owns — provably, with confirmation and a proof record (FEAT-043)."
+          />
+          {dangerZone.status === "loading" ? (
+            <Skeleton className="h-10 w-48" />
+          ) : dangerZone.status === "error" ? (
+            <ErrorState onRetry={() => void loadWorkspaceName()} />
+          ) : (
+            <div className="mt-4 flex flex-col items-start justify-between gap-4 sm:flex-row sm:items-center">
+              <p className="max-w-md text-body-small text-text-secondary">
+                Deleting is irreversible: object store contents, the semantic layer, reports and
+                conversation history, query caches, and logs are all destroyed in one cascade.
+              </p>
+              <Button
+                variant="destructive"
+                onClick={() => {
+                  setDeleteError(null);
+                  setDeleteModalOpen(true);
+                }}
+              >
+                <Trash2 size={16} aria-hidden="true" />
+                Delete Workspace
+              </Button>
+            </div>
+          )}
+        </Card>
+
+        {dangerZone.status === "loaded" && (
+          <WorkspaceDeleteModal
+            open={deleteModalOpen}
+            workspaceName={dangerZone.name}
+            onCancel={() => setDeleteModalOpen(false)}
+            onConfirm={() => void handleDelete()}
+            loading={deleting}
+            error={deleteError ?? undefined}
+          />
+        )}
       </div>
     </main>
   );

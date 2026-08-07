@@ -115,6 +115,10 @@ func run(logger *slog.Logger) error {
 	// FEAT-030's claim-level provenance store: written by the executor at report materialization
 	// (WithProvenance) and read by the report/provenance endpoints. Same postgres repository both ways.
 	provenanceRepo := postgres.NewProvenanceRepository(pool)
+	// FEAT-043's deletion-proof read side: the deletion_records table deliberately survives the
+	// workspace it describes, so this repository is the only store that can be read AFTER a
+	// workspace is gone (screens/14's follow-up proof GET).
+	deletionRecordRepo := postgres.NewDeletionRecordRepository(pool)
 	modelClient := model.NewClient(cfg.AnthropicAPIKey, auditWriter, logger)
 	if cfg.AnthropicAPIKey == "" {
 		logger.Warn("ANTHROPIC_API_KEY is not set — FEAT-013 runs will fail at the model step")
@@ -187,6 +191,21 @@ func run(logger *slog.Logger) error {
 		// read here through the same repository instances.
 		Reports:    reportRepo,
 		Provenance: provenanceRepo,
+
+		// FEAT-035/FEAT-036: report export audit entries, written in the same handler that serves
+		// the export bytes (screens/11-export-dialog.md). Same auditWriter as ConfirmationAudit.
+		ExportAudit: auditWriter,
+
+		// FEAT-043 (One-Workspace-One-Delete Cascade): objectStore deletes every object under the
+		// workspace's key prefix; engineProvider drops the workspace's session-scoped engine state
+		// (engine.Drop, added with this feature); workspaceRepo runs the database half of the
+		// cascade; deletionRecordRepo reads the surviving proof; auditWriter writes the cascade's
+		// own audit entry before the workspace's log rows are destroyed (screens/14).
+		WorkspaceCascadeObjects:  objectStore,
+		WorkspaceEngineDropper:   engineProvider,
+		WorkspaceDeletionCascade: workspaceRepo,
+		WorkspaceDeletionProofs:  deletionRecordRepo,
+		WorkspaceDeletionAudit:   auditWriter,
 	}
 
 	server := &http.Server{

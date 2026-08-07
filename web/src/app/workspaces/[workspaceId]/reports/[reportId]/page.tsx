@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { ReportViewScreen } from "@/components/report/ReportViewScreen";
+import { auth } from "@/auth";
 
 export const metadata: Metadata = { title: "Report" };
 
@@ -8,5 +9,16 @@ export default async function Page(props: PageProps<"/workspaces/[workspaceId]/r
   // params is a Promise in Next 16; synchronous access was removed.
   const { workspaceId, reportId } = await props.params;
 
-  return <ReportViewScreen workspaceId={workspaceId} reportId={reportId} />;
+  // The user's tier rides on the session as a display concern only (web/src/auth.ts). The Export
+  // Dialog uses it to render tier-gated format rows (screens/11); the authoritative gate is always
+  // enforced server-side on the export endpoint via UserTierLookup.
+  const session = await auth();
+
+  return (
+    <ReportViewScreen
+      workspaceId={workspaceId}
+      reportId={reportId}
+      userTier={session?.user?.tier}
+    />
+  );
 }

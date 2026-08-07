@@ -14,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 // Client is a thin wrapper around the AWS S3 SDK, pointed at either MinIO (local) or Cloudflare R2
@@ -118,6 +119,52 @@ func (c *Client) DeleteObject(ctx context.Context, key string) error {
 	})
 	if err != nil {
 		return fmt.Errorf("storage: deleting object %q: %w", key, err)
+	}
+	return nil
+}
+
+// DeleteObjectsByPrefix removes every object whose key starts with prefix — the workspace-scope
+// sweep FEAT-043's deletion cascade drives ("object store contents"). Object storage has no foreign
+// keys and does not cascade on its own (the FEAT-048 lesson), so a workspace's objects are removed
+// by an explicit prefix sweep, never assumed to disappear with the workspace row.
+//
+// Listing is paginated (ListObjectsV2) and deletion is batched (DeleteObjects, up to 1000 keys per
+// call) so a large workspace does not require one DeleteObject round-trip per file. A prefix with no
+// objects is not an error: the workspace may never have uploaded anything, and the cascade must be
+// idempotent so a retried deletion does not fail on an already-empty prefix.
+func (c *Client) DeleteObjectsByPrefix(ctx context.Context, prefix string) error {
+	var continuationToken *string
+	for {
+		listOut, err := c.s3.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(c.bucket),
+			Prefix:            aws.String(prefix),
+			ContinuationToken: continuationToken,
+		})
+		if err != nil {
+			return fmt.Errorf("storage: listing objects under %q: %w", prefix, err)
+		}
+
+		if len(listOut.Contents) > 0 {
+			identifiers := make([]types.ObjectIdentifier, 0, len(listOut.Contents))
+			for _, obj := range listOut.Contents {
+				if obj.Key != nil {
+					identifiers = append(identifiers, types.ObjectIdentifier{Key: obj.Key})
+				}
+			}
+			if len(identifiers) > 0 {
+				if _, err := c.s3.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+					Bucket: aws.String(c.bucket),
+					Delete: &types.Delete{Objects: identifiers, Quiet: aws.Bool(true)},
+				}); err != nil {
+					return fmt.Errorf("storage: deleting objects under %q: %w", prefix, err)
+				}
+			}
+		}
+
+		if !aws.ToBool(listOut.IsTruncated) || listOut.NextContinuationToken == nil {
+			break
+		}
+		continuationToken = listOut.NextContinuationToken
 	}
 	return nil
 }

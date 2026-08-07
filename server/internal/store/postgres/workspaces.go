@@ -152,6 +152,158 @@ func (r *WorkspaceRepository) EngineStatusHook(logger *slog.Logger) engine.Statu
 	}
 }
 
+// DeleteSemanticLayer removes every semantic-layer row for workspaceID — candidate joins,
+// relationships, corrections, metric definitions, columns, and datasets — as FEAT-043's
+// "semantic layer" cascade category (features.md FEAT-043: "semantic layer rows (metric definitions,
+// corrections, relationships, columns, datasets)" plus "profiling statistics", which live on the
+// columns and candidate joins deleted here).
+//
+// The deletes run children-before-parents (candidate joins/relationships before columns, columns
+// before datasets) inside ONE transaction so each statement does real work and the migration 00001
+// ON DELETE CASCADE network — which deletes rows and deletes the workspace itself — stays the
+// safety net, never the primary mechanism. A failed category leaves the workspace row intact, so the
+// deletion handler can abort and the user can retry.
+func (r *WorkspaceRepository) DeleteSemanticLayer(ctx context.Context, workspaceID string) error {
+	err := r.withTx(ctx, func(tx pgx.Tx) error {
+		stmts := []string{
+			`DELETE FROM candidate_joins WHERE workspace_id = $1`,
+			`DELETE FROM relationships WHERE workspace_id = $1`,
+			`DELETE FROM corrections WHERE workspace_id = $1`,
+			`DELETE FROM metric_definitions WHERE workspace_id = $1`,
+			`DELETE FROM columns WHERE workspace_id = $1`,
+			`DELETE FROM datasets WHERE workspace_id = $1`,
+		}
+		for _, stmt := range stmts {
+			if _, err := tx.Exec(ctx, stmt, workspaceID); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("deleting semantic layer rows: %w", err)
+	}
+	return nil
+}
+
+// DeleteReportsAndConversation removes every report-and-conversation row for workspaceID —
+// provenance links, report shares, steps, reports, and runs — as FEAT-043's
+// "reports_and_conversation" cascade category ("reports + provenance + report_shares + conversation
+// history (runs, steps)").
+//
+// Children-before-parents in one transaction: provenance links and report shares before reports,
+// steps and reports before runs. Deleting the runs last also cascade-removes this workspace's
+// run_cache rows via run_cache.source_run_id (migration 00008), so the explicit query-caches step
+// that follows confirms an already-empty table — both paths are idempotent.
+func (r *WorkspaceRepository) DeleteReportsAndConversation(ctx context.Context, workspaceID string) error {
+	err := r.withTx(ctx, func(tx pgx.Tx) error {
+		stmts := []string{
+			`DELETE FROM provenance_links WHERE workspace_id = $1`,
+			`DELETE FROM report_shares WHERE workspace_id = $1`,
+			`DELETE FROM steps WHERE workspace_id = $1`,
+			`DELETE FROM reports WHERE workspace_id = $1`,
+			`DELETE FROM runs WHERE workspace_id = $1`,
+		}
+		for _, stmt := range stmts {
+			if _, err := tx.Exec(ctx, stmt, workspaceID); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("deleting reports and conversation rows: %w", err)
+	}
+	return nil
+}
+
+// DeleteQueryCaches removes every run_cache row for workspaceID — FEAT-043's "query_caches" cascade
+// category. In practice this is usually a no-op: the runs delete (DeleteReportsAndConversation)
+// already cascade-removed the workspace's cache rows via run_cache.source_run_id's ON DELETE CASCADE
+// (migration 00008). The explicit step is still part of the cascade so the "query caches destroyed"
+// claim rests on an executed statement, not on an assumption about another step's cascade.
+func (r *WorkspaceRepository) DeleteQueryCaches(ctx context.Context, workspaceID string) error {
+	_, err := r.pool.Exec(ctx, `DELETE FROM run_cache WHERE workspace_id = $1`, workspaceID)
+	if err != nil {
+		return fmt.Errorf("deleting query caches: %w", err)
+	}
+	return nil
+}
+
+// DeleteAuditLog removes every audit_log_entries row for workspaceID — FEAT-043's "logs" cascade
+// category. The deletion handler calls this ONLY after writing the cascade's own audit entry (see
+// api/workspace_delete.go): order matters, because on success this statement destroys that entry too,
+// and the workspace's surviving proof is deletion_records, not the audit log (screens/17: "the audit
+// log itself is destroyed in the deletion cascade").
+func (r *WorkspaceRepository) DeleteAuditLog(ctx context.Context, workspaceID string) error {
+	_, err := r.pool.Exec(ctx, `DELETE FROM audit_log_entries WHERE workspace_id = $1`, workspaceID)
+	if err != nil {
+		return fmt.Errorf("deleting audit log rows: %w", err)
+	}
+	return nil
+}
+
+// DeleteWithProof removes the workspace row and writes its deletion proof atomically — the final
+// step of FEAT-043's cascade, and the ONLY write path for a DeletionRecord.
+//
+// Atomicity is load-bearing: a proof row that exists while its workspace still exists would be a
+// false deletion record, and a workspace deleted without a proof would be an unprovable deletion.
+// Running both in one transaction means a failure of either rolls back the other, so a retry starts
+// from a consistent state. The workspace row delete is what triggers migration 00001's ON DELETE
+// CASCADE network — the database-enforced safety net that destroys any workspace-keyed row the
+// explicit per-category steps above missed.
+//
+// Returns ErrWorkspaceNotFound when the workspace row is already gone (a concurrent deletion won the
+// race); the transaction rolls back, so no proof row is written for a workspace this call did not
+// delete. deletion_records has no FK to workspaces (migration 00001's deliberate exception), so the
+// proof survives the row it describes.
+func (r *WorkspaceRepository) DeleteWithProof(ctx context.Context, workspaceID string, proof domain.DeletionRecord) error {
+	err := r.withTx(ctx, func(tx pgx.Tx) error {
+		cats := make([]string, len(proof.DeletedCategories))
+		for i, c := range proof.DeletedCategories {
+			cats[i] = string(c)
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO deletion_records (id, workspace_id, initiated_by, deleted_categories, completed_at)
+			 VALUES ($1, $2, $3, $4, $5)`,
+			proof.ID, proof.WorkspaceID, proof.InitiatedBy, cats, proof.CompletedAt,
+		); err != nil {
+			return err
+		}
+		tag, err := tx.Exec(ctx, `DELETE FROM workspaces WHERE id = $1`, workspaceID)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrWorkspaceNotFound
+		}
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, ErrWorkspaceNotFound) {
+			return ErrWorkspaceNotFound
+		}
+		return fmt.Errorf("deleting workspace with proof: %w", err)
+	}
+	return nil
+}
+
+// withTx runs fn inside a transaction, committing on success and rolling back on any error (including
+// a sentinel error fn returns deliberately, like ErrWorkspaceNotFound — the deferred Rollback is a
+// no-op on an already-committed or already-aborted transaction, and harmless otherwise).
+func (r *WorkspaceRepository) withTx(ctx context.Context, fn func(tx pgx.Tx) error) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 // rowScanner is satisfied by both pgx.Row and pgx.Rows, letting scanWorkspace serve GetByID and
 // ListByOwner without duplicating the column list.
 type rowScanner interface {

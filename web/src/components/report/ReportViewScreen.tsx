@@ -4,6 +4,7 @@ import { Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { ArrowLeft } from "lucide-react";
+import { Button, buttonClassNames } from "@/components/ui/Button";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { ErrorState } from "@/components/shared/ErrorState";
 import { Skeleton } from "@/components/shared/Skeleton";
@@ -12,6 +13,7 @@ import { AccessibleDataTable } from "./AccessibleDataTable";
 import { ReconciliationNotice } from "./ReconciliationNotice";
 import { ProvenanceLinkedClaim } from "./ProvenanceLinkedClaim";
 import { ProvenancePanel } from "./ProvenancePanel";
+import { ExportDialog } from "./ExportDialog";
 import {
   parseExecuteStep,
   type ExecuteStepOutput,
@@ -24,11 +26,18 @@ import {
   type Report,
   type Run,
   type Step,
+  type SubscriptionTier,
 } from "@/types/schema";
 
 export interface ReportViewScreenProps {
   workspaceId: string;
   reportId: string;
+  /**
+   * The user's tier for DISPLAY (which Export Dialog format rows are locked). Display-only — the
+   * authoritative tier gate is server-side via UserTierLookup, never a client-claimed tier. When the
+   * page does not pass one, the Export Dialog defaults to the most restrictive (Free) display.
+   */
+  userTier?: SubscriptionTier;
 }
 
 interface GetReportResponse {
@@ -46,18 +55,24 @@ type ScreenState =
   | { status: "error"; message: string };
 
 /**
- * Screen 9: Report View (screens/09-report-view.md) — FEAT-017 (first-party chart rendering).
+ * Screen 9: Report View (screens/09-report-view.md) — FEAT-017 (first-party chart rendering),
+ * FEAT-035/036 entry point (Export → the Export Dialog via `?export=` URL state, mirroring the
+ * `?claim=` provenance panel), and FEAT-041 (mobile-responsive report viewing).
  *
  * Renders the narrated, charted answer to a question with reconciliation transparency. The report
  * object is fully self-contained (architecture.md's Report Store), but rendering its chart needs the
  * run's result data — the chart is a spec over the execute step's facts — so this screen fetches the
  * report AND its run's steps, then draws the chart first-party with ChartRenderer.
  *
+ * Layout per screens/09: mobile gets a bottom action bar ("Export" + "Ask a follow-up") with 44px
+ * touch targets and a full-width chart; web gets the reading column beside a persistent side action
+ * panel (Export, Ask a follow-up, View source run).
+ *
  * Every traceable figure in the narrative is a Provenance-Linked Number (FEAT-030): clicking one
  * opens the provenance panel (screens/10) via `?claim=:claimId` — the panel state is linkable and
  * shareable, exactly as screens/10 requires.
  */
-export function ReportViewScreen({ workspaceId, reportId }: ReportViewScreenProps) {
+export function ReportViewScreen({ workspaceId, reportId, userTier }: ReportViewScreenProps) {
   const router = useRouter();
   const [state, setState] = useState<ScreenState>({ status: "loading" });
   const loaded = useRef(false);
@@ -68,6 +83,12 @@ export function ReportViewScreen({ workspaceId, reportId }: ReportViewScreenProp
     },
     [router, workspaceId, reportId],
   );
+
+  const openExport = useCallback(() => {
+    // URL state, exactly like the provenance panel: the Export Dialog is linkable and survives
+    // reload (routes.reportExport builds ?export=1; QueryParam.Export owns the parameter name).
+    router.push(routes.reportExport(workspaceId, reportId));
+  }, [router, workspaceId, reportId]);
 
   const load = useCallback(async () => {
     try {
@@ -141,75 +162,153 @@ export function ReportViewScreen({ workspaceId, reportId }: ReportViewScreenProp
   }
 
   const { report, executeResult } = state;
+  // The report "has a chart" for the Export Dialog's purposes when the execute facts exist — the
+  // same condition ChartRenderer uses to draw anything at all. A narrative-only report is the
+  // screens/11 edge case that omits the (Phase 5) Image row; this phase it only varies the PDF row
+  // description.
+  const hasChart = executeResult !== null;
 
   return (
-    <main id="main-content" className="mx-auto w-full max-w-3xl p-8">
-      <nav aria-label="Report navigation" className="mb-4">
-        <Link
-          href={routes.workspace(workspaceId)}
-          className="inline-flex items-center gap-1 text-body-small text-text-secondary hover:text-text-primary"
+    <main
+      id="main-content"
+      className="mx-auto w-full max-w-6xl px-4 py-6 pb-24 lg:px-8 lg:py-8 lg:pb-8"
+    >
+      <div className="lg:flex lg:items-start lg:gap-8">
+        {/* Reading column: the narrative is the primary reading surface, so its column stays at a
+            legible measure even though the outer container widened to host the side panel. */}
+        <div className="min-w-0 flex-1 lg:max-w-3xl">
+          <nav aria-label="Report navigation" className="mb-4">
+            <Link
+              href={routes.workspace(workspaceId)}
+              className="inline-flex items-center gap-1 text-body-small text-text-secondary hover:text-text-primary"
+            >
+              <ArrowLeft size={14} aria-hidden="true" />
+              Back to workspace
+            </Link>
+          </nav>
+
+          <header className="mb-6">
+            <h1 className="text-h1 text-text-primary">{report.title}</h1>
+            <p className="mt-1 text-caption uppercase tracking-wide text-text-secondary">
+              {new Date(report.created_at).toLocaleDateString()}
+            </p>
+            {isForkedReport(report) && report.parent_report_id && (
+              <Link
+                href={routes.report(workspaceId, report.parent_report_id)}
+                className="mt-1 inline-block text-body-small text-provenance hover:text-provenance"
+              >
+                Forked from an earlier report →
+              </Link>
+            )}
+          </header>
+
+          <ReconciliationNotice summary={report.reconciliation_summary} />
+
+          <Card className="mt-6">
+            <ProvenanceLinkedClaim
+              narrative={report.narrative}
+              links={report.provenance_links}
+              onClaimClick={openClaim}
+            />
+          </Card>
+
+          <Card className="mt-6">
+            <CardHeader title={report.chart_spec.title || "Result"} />
+            <ChartRenderer spec={report.chart_spec} result={executeResult} />
+            {executeResult && (
+              <details className="mt-4">
+                <summary className="cursor-pointer text-body-small text-text-secondary hover:text-text-primary">
+                  View as table
+                </summary>
+                <div className="mt-3">
+                  <AccessibleDataTable
+                    result={executeResult}
+                    caption={`Data for ${report.chart_spec.title || "this chart"}`}
+                  />
+                </div>
+              </details>
+            )}
+          </Card>
+
+          {/* "View source run" for mobile/tablet (the web side panel carries it on lg+). */}
+          <div className="mt-4 lg:hidden">
+            <Link
+              href={routes.run(workspaceId, report.run_id)}
+              className="inline-flex items-center gap-1 text-body-small text-provenance hover:text-provenance"
+            >
+              View source run →
+            </Link>
+          </div>
+        </div>
+
+        {/* Persistent side action panel (web): screens/09's web layout. Sticky so the actions stay
+            reachable while the report scrolls. */}
+        <aside
+          data-testid="report-action-panel"
+          aria-label="Report actions"
+          className="hidden w-64 shrink-0 lg:block"
         >
-          <ArrowLeft size={14} aria-hidden="true" />
-          Back to workspace
-        </Link>
-      </nav>
-
-      <header className="mb-6">
-        <h1 className="text-h1 text-text-primary">{report.title}</h1>
-        <p className="mt-1 text-caption uppercase tracking-wide text-text-secondary">
-          {new Date(report.created_at).toLocaleDateString()}
-        </p>
-        {isForkedReport(report) && report.parent_report_id && (
-          <Link
-            href={routes.report(workspaceId, report.parent_report_id)}
-            className="mt-1 inline-block text-body-small text-provenance hover:text-provenance"
-          >
-            Forked from an earlier report →
-          </Link>
-        )}
-      </header>
-
-      <ReconciliationNotice summary={report.reconciliation_summary} />
-
-      <Card className="mt-6">
-        <ProvenanceLinkedClaim
-          narrative={report.narrative}
-          links={report.provenance_links}
-          onClaimClick={openClaim}
-        />
-      </Card>
-
-      <Card className="mt-6">
-        <CardHeader title={report.chart_spec.title || "Result"} />
-        <ChartRenderer spec={report.chart_spec} result={executeResult} />
-        {executeResult && (
-          <details className="mt-4">
-            <summary className="cursor-pointer text-body-small text-text-secondary hover:text-text-primary">
-              View as table
-            </summary>
-            <div className="mt-3">
-              <AccessibleDataTable
-                result={executeResult}
-                caption={`Data for ${report.chart_spec.title || "this chart"}`}
-              />
-            </div>
-          </details>
-        )}
-      </Card>
-
-      <div className="mt-4">
-        <Link
-          href={routes.run(workspaceId, report.run_id)}
-          className="inline-flex items-center gap-1 text-body-small text-provenance hover:text-provenance"
-        >
-          View source run →
-        </Link>
+          <div className="sticky top-6 space-y-2">
+            <Button
+              variant="primary"
+              className="w-full justify-start"
+              onClick={openExport}
+            >
+              Export
+            </Button>
+            <Link
+              href={routes.workspace(workspaceId)}
+              className={buttonClassNames("outline", "w-full justify-start")}
+            >
+              {/* screens/09's "Ask a follow-up" affordance. Report-scoped forking (FEAT-021) is a
+                  Phase 5 feature; this phase routes it to the existing Ask panel on Workspace Home,
+                  which is the working question-asking path. */}
+              Ask a follow-up
+            </Link>
+            <Link
+              href={routes.run(workspaceId, report.run_id)}
+              className={buttonClassNames("ghost", "w-full justify-start")}
+            >
+              View source run
+            </Link>
+          </div>
+        </aside>
       </div>
 
-      {/* useSearchParams must sit inside a Suspense boundary during prerender (Next 16). The panel
-          itself renders nothing when no ?claim= is present, so the fallback is harmlessly empty. */}
+      {/* Mobile bottom action bar (screens/09): fixed, with 44px touch targets via .touch-target. */}
+      <div
+        data-testid="report-mobile-actions"
+        className="fixed inset-x-0 bottom-0 z-40 border-t border-border bg-surface p-3 md:hidden"
+      >
+        <div className="mx-auto flex w-full max-w-3xl gap-3">
+          <Button variant="primary" touchTarget className="flex-1" onClick={openExport}>
+            Export
+          </Button>
+          <Button
+            variant="outline"
+            touchTarget
+            className="flex-1"
+            onClick={() => router.push(routes.workspace(workspaceId))}
+          >
+            {/* screens/09's mobile "Ask a follow-up". Report-scoped forking (FEAT-021) is Phase 5;
+                this phase routes to the existing Ask panel on Workspace Home. */}
+            Ask a follow-up
+          </Button>
+        </div>
+      </div>
+
+      {/* useSearchParams must sit inside a Suspense boundary during prerender (Next 16). The panels
+          render nothing when their URL params are absent, so the fallbacks are harmlessly empty. */}
       <Suspense fallback={null}>
         <ProvenancePanel workspaceId={workspaceId} reportId={reportId} />
+      </Suspense>
+      <Suspense fallback={null}>
+        <ExportDialog
+          workspaceId={workspaceId}
+          reportId={reportId}
+          tier={userTier}
+          hasChart={hasChart}
+        />
       </Suspense>
     </main>
   );

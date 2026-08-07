@@ -91,9 +91,44 @@ func (r *ReportRepository) GetByRunID(ctx context.Context, workspaceID, runID st
 	))
 }
 
-// scanReport decodes the shared report row shape selected by GetByID and GetByRunID. The reports
-// table stores chart_spec and reconciliation_summary as JSONB; provenance links live in their own
-// table (FEAT-030), so this wave always materializes an empty array rather than a JSON null.
+// ListByWorkspace returns the workspace's most recent reports, ordered by created_at DESC and
+// capped at limit. Backs FEAT-034's Recent Reports panel (screens/04-workspace-home.md) — the
+// workspace home shows up to 10. Backed by idx_reports_workspace (migration 00001).
+//
+// Workspace scoping lives in the SQL (WHERE workspace_id = $1), the same non-enumeration stance as
+// GetByID: a caller can only ever list reports from workspaces it already owns, because the handler
+// proves ownership before calling and the store never queries across workspace ids.
+func (r *ReportRepository) ListByWorkspace(ctx context.Context, workspaceID string, limit int) ([]domain.Report, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT id, workspace_id, run_id, title, narrative, chart_spec, reconciliation_summary,
+		        parent_report_id, created_at
+		 FROM reports WHERE workspace_id = $1
+		 ORDER BY created_at DESC LIMIT $2`,
+		workspaceID, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("listing reports: %w", err)
+	}
+	defer rows.Close()
+
+	out := []domain.Report{}
+	for rows.Next() {
+		report, err := r.scanReport(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, report)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating reports: %w", err)
+	}
+	return out, nil
+}
+
+// scanReport decodes the shared report row shape selected by GetByID, GetByRunID, and
+// ListByWorkspace. The reports table stores chart_spec and reconciliation_summary as JSONB;
+// provenance links live in their own table (FEAT-030), so this wave always materializes an empty
+// array rather than a JSON null.
 func (r *ReportRepository) scanReport(row pgx.Row) (domain.Report, error) {
 	var (
 		report         domain.Report

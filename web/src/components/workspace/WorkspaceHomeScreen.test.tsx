@@ -95,6 +95,11 @@ describe("WorkspaceHomeScreen", () => {
       if (path.includes("/semantic-layer/summary")) {
         return { relationship_count: 0, metric_definition_count: 0 };
       }
+      // RecentReportsPanel (FEAT-034) issues its own /reports fetch; it must not consume a step of
+      // the workspace status sequence.
+      if (path.includes("/reports")) {
+        return { reports: [] };
+      }
       const workspace = workspaceSequence[Math.min(workspaceFetchCount, workspaceSequence.length - 1)];
       workspaceFetchCount += 1;
       return { workspace };
@@ -117,6 +122,11 @@ describe("WorkspaceHomeScreen", () => {
     getMock.mockImplementation(async (path: string) => {
       if (path.includes("/semantic-layer/summary")) {
         return { relationship_count: 0, metric_definition_count: 0 };
+      }
+      // RecentReportsPanel (FEAT-034) issues its own /reports fetch; it must not consume a step of
+      // the workspace status sequence.
+      if (path.includes("/reports")) {
+        return { reports: [] };
       }
       workspaceFetchCount += 1;
       if (workspaceFetchCount === 1) return { workspace: workspaceWith(EngineStatus.Ready) };
@@ -149,6 +159,10 @@ describe("WorkspaceHomeScreen", () => {
     getMock.mockImplementation(async (path: string) => {
       if (path.includes("/semantic-layer/summary")) {
         return { relationship_count: 12, metric_definition_count: 4 };
+      }
+      // RecentReportsPanel (FEAT-034) issues its own /reports fetch; give it its real empty shape.
+      if (path.includes("/reports")) {
+        return { reports: [] };
       }
       return { workspace: workspaceWith(EngineStatus.Ready) };
     });

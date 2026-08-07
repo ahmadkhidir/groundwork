@@ -1,8 +1,9 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ReportViewScreen } from "./ReportViewScreen";
 import { ApiError, api } from "@/lib/api-client";
-import type { Report } from "@/types/schema";
+import { SubscriptionTier, type Report } from "@/types/schema";
 
 vi.mock("@/lib/api-client", async () => {
   const actual =
@@ -15,10 +16,14 @@ vi.mock("@/lib/api-client", async () => {
 
 const getMock = vi.mocked(api.get);
 
-const { pushMock } = vi.hoisted(() => ({ pushMock: vi.fn() }));
+const { pushMock, replaceMock, searchParamsState } = vi.hoisted(() => ({
+  pushMock: vi.fn(),
+  replaceMock: vi.fn(),
+  searchParamsState: { current: new URLSearchParams() },
+}));
 vi.mock("next/navigation", () => ({
-  useRouter: () => ({ push: pushMock }),
-  useSearchParams: () => new URLSearchParams(),
+  useRouter: () => ({ push: pushMock, replace: replaceMock }),
+  useSearchParams: () => searchParamsState.current,
 }));
 
 function report(overrides: Partial<Report> = {}): Report {
@@ -54,13 +59,31 @@ const EXECUTE_STEP = {
   }),
 };
 
+async function renderLoadedScreen(props?: Partial<React.ComponentProps<typeof ReportViewScreen>>) {
+  getMock.mockImplementation(async (path: string) => {
+    if (path.includes("/reports/")) return { report: report() };
+    return { run: { id: "run-1" }, steps: [EXECUTE_STEP] };
+  });
+  const utils = render(
+    <ReportViewScreen
+      workspaceId="ws-1"
+      reportId="report-1"
+      {...props}
+    />,
+  );
+  await screen.findByRole("heading", { level: 1, name: "Customers by region" });
+  return utils;
+}
+
 describe("ReportViewScreen", () => {
   beforeEach(() => {
     getMock.mockReset();
     pushMock.mockReset();
+    replaceMock.mockReset();
+    searchParamsState.current = new URLSearchParams();
   });
 
-  it("renders the report title, narrative, chart, and source-run link once loaded", async () => {
+  it("renders the report title, narrative, chart, and source-run links once loaded", async () => {
     getMock.mockImplementation(async (path: string) => {
       if (path.includes("/reports/")) return { report: report() };
       return { run: { id: "run-1" }, steps: [EXECUTE_STEP] };
@@ -70,10 +93,13 @@ describe("ReportViewScreen", () => {
     await screen.findByRole("heading", { level: 1, name: "Customers by region" });
     expect(screen.getByText(/North leads the count/)).toBeInTheDocument();
     expect(screen.getByTestId("chart-renderer")).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: /View source run/ })).toHaveAttribute(
-      "href",
-      "/workspaces/ws-1/runs/run-1",
-    );
+    // "View source run" exists twice: the reading-column link (mobile/tablet) and the web side
+    // action panel. Both must route to the source run.
+    const sourceRunLinks = screen.getAllByRole("link", { name: /View source run/ });
+    expect(sourceRunLinks.length).toBeGreaterThan(0);
+    for (const link of sourceRunLinks) {
+      expect(link).toHaveAttribute("href", "/workspaces/ws-1/runs/run-1");
+    }
     // The data table hides behind a closed disclosure until opened.
     const disclosure = screen.getByText("View as table").closest("details");
     expect(disclosure?.open).toBe(false);
@@ -152,5 +178,45 @@ describe("ReportViewScreen", () => {
 
     await screen.findByRole("heading", { level: 1, name: "Customers by region" });
     expect(screen.getByText(/North leads the count/)).toBeInTheDocument();
+  });
+
+  it("opens the Export Dialog via ?export= URL state from the web action panel", async () => {
+    await renderLoadedScreen();
+    const panel = screen.getByTestId("report-action-panel");
+    await userEvent.click(within(panel).getByRole("button", { name: "Export" }));
+    expect(pushMock).toHaveBeenCalledWith(
+      "/workspaces/ws-1/reports/report-1?export=1",
+    );
+  });
+
+  it("renders the mobile bottom action bar with Export and Ask a follow-up", async () => {
+    await renderLoadedScreen();
+    const bar = screen.getByTestId("report-mobile-actions");
+    const exportButton = within(bar).getByRole("button", { name: "Export" });
+    const followUpButton = within(bar).getByRole("button", { name: "Ask a follow-up" });
+    // FEAT-041: 44px touch targets on mobile (the .touch-target utility guarantees the hit area).
+    expect(exportButton.className).toContain("touch-target");
+    expect(followUpButton.className).toContain("touch-target");
+  });
+
+  it("renders the Export Dialog when ?export= is in the URL", async () => {
+    searchParamsState.current = new URLSearchParams("export=1");
+    await renderLoadedScreen();
+    expect(
+      screen.getByRole("heading", { name: "Export report" }),
+    ).toBeInTheDocument();
+  });
+
+  it("does not render the Export Dialog without the export param", async () => {
+    await renderLoadedScreen();
+    expect(
+      screen.queryByRole("heading", { name: "Export report" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("passes the display tier through to the Export Dialog (Pro unlocks Excel/CSV)", async () => {
+    searchParamsState.current = new URLSearchParams("export=1");
+    await renderLoadedScreen({ userTier: SubscriptionTier.Pro });
+    expect(screen.getByRole("radio", { name: /Excel\/CSV/ })).toBeInTheDocument();
   });
 });

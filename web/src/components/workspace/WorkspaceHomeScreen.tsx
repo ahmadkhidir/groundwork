@@ -188,7 +188,7 @@ export function WorkspaceHomeScreen({ workspaceId }: WorkspaceHomeScreenProps) {
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-[2fr_1fr]">
         <div>
           <h2 className="mb-2 text-h3 text-text-primary">Recent reports</h2>
-          <RecentReportsPanel />
+          <RecentReportsPanel workspaceId={workspaceId} />
         </div>
         <div className="hidden flex-col gap-6 lg:flex">
           <SemanticLayerSummaryPanel workspaceId={workspaceId} />

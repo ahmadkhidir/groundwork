@@ -23,9 +23,15 @@ import (
 //
 // GetByRunID backs the GET run response's report_id (FEAT-018): the run viewer uses it to auto-
 // navigate to the report a completed run materialized.
+//
+// ListByWorkspace backs FEAT-034's recent-reports list (screens/04-workspace-home.md): the
+// workspace home's "recent reports" section orders a workspace's reports most-recent-first (by
+// created_at), capped at limit. The store scopes by workspace in SQL, so the list never leaks a
+// report from a workspace the caller does not own.
 type ReportStore interface {
 	GetByID(ctx context.Context, workspaceID, id string) (domain.Report, error)
 	GetByRunID(ctx context.Context, workspaceID, runID string) (domain.Report, error)
+	ListByWorkspace(ctx context.Context, workspaceID string, limit int) ([]domain.Report, error)
 }
 
 // ProvenanceStore is the read seam the provenance endpoints depend on, satisfied by
@@ -46,16 +52,102 @@ type ReportRunStore interface {
 	GetByID(ctx context.Context, id string) (domain.Run, error)
 }
 
-// RegisterReportRoutes wires FEAT-014's report read endpoint and FEAT-030's provenance endpoints
-// onto r. Mounted under the authenticated group by the caller (see api.go).
+// RegisterReportRoutes wires FEAT-014's report read endpoint, FEAT-034's recent-reports list
+// endpoint, and FEAT-030's provenance endpoints onto r. Mounted under the authenticated group by
+// the caller (see api.go).
 //
 // provenance and runSteps may be nil: without them the report endpoint still serves the report with
 // provenance_links as the raw id array (no expansion), and the provenance-panel detail endpoint is
 // simply not registered.
 func RegisterReportRoutes(r chi.Router, workspaces WorkspaceStore, reports ReportStore, provenance ProvenanceStore, runSteps RunStepStore, logger *slog.Logger) {
+	r.Get("/workspaces/{workspaceId}/reports", handleListReports(workspaces, reports, logger))
 	r.Get("/workspaces/{workspaceId}/reports/{reportId}", handleGetReport(workspaces, reports, provenance, logger))
 	if provenance != nil && runSteps != nil {
 		r.Get("/workspaces/{workspaceId}/reports/{reportId}/provenance/{claimId}", handleGetProvenanceClaim(workspaces, reports, provenance, runSteps, logger))
+	}
+}
+
+// List-limit bounds for handleListReports. FEAT-034's recent-reports section is capped at 10 by the
+// screen spec ("reports?limit=10"); the max clamp stops a pathological limit from pulling the whole
+// table into one Workspace Home render.
+const (
+	reportsDefaultLimit = 10
+	reportsMaxLimit     = 100
+)
+
+// publicReport is the recent-reports list endpoint's wire shape: everything the Workspace Home
+// report card needs to render (title, timestamp) and link to Report View (id, run id), without the
+// report's heavy self-contained payload (narrative, chart spec, provenance, reconciliation) the
+// read endpoint serves on demand. Mirrors workspaces.go's publicWorkspace slim-view convention.
+type publicReport struct {
+	ID          string `json:"id"`
+	WorkspaceID string `json:"workspace_id"`
+	RunID       string `json:"run_id"`
+	Title       string `json:"title"`
+	CreatedAt   string `json:"created_at"`
+}
+
+func toPublicReport(report domain.Report) publicReport {
+	return publicReport{
+		ID:          report.ID,
+		WorkspaceID: report.WorkspaceID,
+		RunID:       report.RunID,
+		Title:       report.Title,
+		CreatedAt:   report.CreatedAt.Format(time.RFC3339),
+	}
+}
+
+// reportsLimit reads the ?limit= query parameter for the recent-reports list, defaulting to 10
+// (screens/04-workspace-home.md's "reports?limit=10") and clamping to reportsMaxLimit so the value
+// is always a bounded positive integer regardless of what the client sends.
+func reportsLimit(r *http.Request) int {
+	limit := reportsDefaultLimit
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	if limit > reportsMaxLimit {
+		limit = reportsMaxLimit
+	}
+	return limit
+}
+
+// handleListReports serves screens/04-workspace-home.md's Recent Reports panel:
+// GET /api/workspaces/:id/reports?limit=10.
+//
+// Returns the workspace's most recent reports (created_at DESC) as a slim list — each entry carries
+// just enough for the card to render its title, timestamp, and Report View link. Full report
+// payloads remain the read endpoint's job, so this list stays cheap even for a workspace with many
+// reports. Ownership is enforced here (requireWorkspaceOwnership) and the store scopes by workspace
+// again in SQL, the same non-enumeration stance as every other read endpoint.
+func handleListReports(workspaces WorkspaceStore, reports ReportStore, logger *slog.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		claims, ok := requireClaims(w, r)
+		if !ok {
+			return
+		}
+
+		workspaceID := chi.URLParam(r, "workspaceId")
+		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+			return
+		}
+
+		list, err := reports.ListByWorkspace(r.Context(), workspaceID, reportsLimit(r))
+		if err != nil {
+			logger.Error("listing reports", slog.String("error", err.Error()))
+			respondJSON(w, http.StatusInternalServerError, map[string]string{
+				"error": "Something went wrong. Try again.",
+				"code":  "internal_error",
+			})
+			return
+		}
+
+		out := make([]publicReport, 0, len(list))
+		for _, report := range list {
+			out = append(out, toPublicReport(report))
+		}
+		respondJSON(w, http.StatusOK, map[string]any{"reports": out})
 	}
 }
 

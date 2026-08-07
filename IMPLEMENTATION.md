@@ -358,13 +358,13 @@ loaded via `next/font` and bound to `--font-display`, `--font-body`, `--font-mon
 | **1 — Foundation: Workspace, Ingest & Trust** | FEAT-001 ✅ 002 ✅ 003 ✅ 004 ✅ 005 ✅ 006 ✅ 007 ✅ 008 ✅ 009 ✅ 011 ✅ 042 ✅ 044 ✅ 048 ✅ 049 ✅ | **Complete** — reopened for FEAT-048/049 by docs `ff8d5b2` (2026-08-06) and closed by this wave; see below |
 | **2 — Core Grounded Answer Loop** | FEAT-013 ✅, 014 ✅, 015 ✅, 016 ✅, 017 ✅, 018 ✅, 019 ✅, 020 ✅ | **Complete** — Waves 1–5 landed (FEAT-020 in Wave 5) |
 | **3 — Trust & Observability** | FEAT-022 ✅ 023 ✅ 024 ✅ 027 ✅ 028 ✅ 029 ✅ 030 ✅ | **Complete** — Pass 1 (FEAT-022/023/027) in `01d7c34`+`2c2e08a`, Pass 2 (FEAT-024/028) in `f408a40`, Pass 3 (FEAT-029/030) in `6611de2` |
-| **4 — Reports & Delivery** | FEAT-034, 035, 036, 041, 043 | Not started |
+| **4 — Reports & Delivery** | FEAT-034 ✅ 035 ✅ 036 ✅ 041 ✅ 043 ✅ | **Complete** — see "Phase 4" note below |
 | **5 — Polish & Expansion** | FEAT-010, 012, 021, 025, 026, 031, 032, 033, 037, 038, 039, 040, 045, 046, 047 | Not started |
 
-> **Current authorized scope: Foundation + Phases 1, 2 and 3** (Phases 1–2 user-approved 2026-08-05,
+> **Current authorized scope: Foundation + Phases 1, 2, 3 and 4** (Phases 1–2 user-approved 2026-08-05,
 > with the four phase-boundary assumptions recorded under "Phase 2 boundary assumptions" below; Phase
-> 3 user-authorized 2026-08-07). Phases 4–5 are documented but not authorized. Do not begin a later
-> phase without explicit approval.
+> 3 user-authorized 2026-08-07; Phase 4 user-authorized 2026-08-07). Phase 5 is documented but not
+> authorized. Do not begin a later phase without explicit approval.
 >
 > **FEAT-019 (Semantic Layer Storage) landed in Phase 2's Wave 1**, as a solo pass (no parallel
 > dispatch) — see the "FEAT-019 — Semantic Layer Storage" note below for what shipped and what it
@@ -459,6 +459,68 @@ Three sequential passes landed the full authorized Phase 3 scope; each ended wit
 
 Docs pointer: bumped to `3c6af5b` in `6611de2` (already pushed to origin/main before the parent
 referenced it, per the submodule protocol).
+
+### Phase 4 — Reports & Delivery (FEAT-034/035/036/041/043), user-authorized 2026-08-07 — CLOSED
+
+Phase 4 shipped in one parallel dispatch of three Worker-Mode subagents, assembled and verified by
+the orchestrator. Server `make vet` + `make test` + `gofmt -l` clean; web `tsc --noEmit` +
+`eslint . --max-warnings=0` + `vitest run` 221/221 + `next build` all green.
+
+- **FEAT-034 — Reports as First-Class Versioned Objects.** `GET /v1/workspaces/:id/reports?limit=N`
+  (default 10, clamp 100) served by a new `ReportStore.ListByWorkspace` (postgres, `created_at DESC`,
+  `idx_reports_workspace`) and a slim `publicReport` wire shape (id/run_id/title/created_at — never
+  narrative/chart_spec, mirroring `publicWorkspace`). `RecentReportsPanel` on Workspace Home now
+  fetches and renders the list with all four screens/04 states (loading skeleton / empty "Your reports
+  will appear here." / loaded card rows linking to Report View / inline panel-scoped error), with
+  `truncate` for long titles.
+- **FEAT-035 — PDF Export.** Server-generated A4 PDF (`github.com/go-pdf/fpdf v0.9.0`, pure Go, core
+  fonts — no headless browser, no client print dialog): title + generated date, narrative, a vector
+  chart mirroring ChartRenderer's geometry and the branding chart palette (the one documented
+  light-mode token mirror in Go, since a PDF is a file artifact with no CSS theme), reconciliation
+  notice, source-run footer. Honest degradation to narrative + a "no longer available" note when the
+  execute output is gone. Works with the engine asleep (FEAT-035 AC3) — everything comes from the
+  Report Store + persisted steps.
+- **FEAT-036 — Excel/CSV Export.** `GET /v1/workspaces/:id/reports/:reportId/export?format=csv`
+  serves the persisted execute step output as RFC 4180 CSV (same facts the in-app chart/table draw
+  from, so "matches exactly what was shown" holds); null cells export empty. Tier gate is enforced
+  server-side via `UserTierLookup` (PDF Free/Pro/Team; CSV Pro/Team; Free → 403 `upgrade_required`),
+  and every export writes an `export` audit entry via the existing `audit.Writer.WriteExport`
+  fail-closed before bytes are served.
+- **FEAT-041 — Mobile-Responsive Report Viewing.** `ReportViewScreen` reflows per screens/09: mobile
+  bottom action bar ("Export" + "Ask a follow-up", 44px `.touch-target`), full-width chart; web keeps
+  the reading column beside a persistent side action panel (Export, Ask a follow-up, View source run).
+- **FEAT-043 — One-Workspace-One-Delete Cascade.** `DELETE /v1/workspaces/:id` — a single handler
+  driving, in `domain.AllDeletedCategories` order: object store prefix sweep
+  (`storage.Client.DeleteObjectsByPrefix`, new — paginated ListObjectsV2 + batched DeleteObjects),
+  engine teardown (`engine.Provider.Drop`, new on LocalProvider: idempotent, closes the session's
+  connection and forgets it), semantic layer (children-first in one tx), reports/conversation
+  (provenance, shares, steps, reports, runs), query caches (`run_cache`), then logs (the cascade's own
+  audit entry is written BEFORE the workspace's audit rows are destroyed — order matters), and LAST
+  the workspace row atomically with its `DeletionRecord` (`DeleteWithProof`, one tx — a failed tx
+  rolls back so no false proof can exist). Any failure returns 500 `deletion_partial_failed` naming
+  the failed category with `workspace_intact: true` (Flow 5 Alternate Path B — never a false success;
+  every step idempotent, so retry is safe). `GET /v1/workspaces/:id/deletion` reads the surviving
+  proof (authorized against `initiated_by`, since the workspace is gone). Web: Workspace Settings
+  Danger Zone is the real flow — `WorkspaceDeleteModal` (explicit scope bullets, type-the-name-to-
+  confirm gate, honest Executing state, inline named-category error on partial failure) → success
+  navigates to the new `DeletedProofScreen` at `/workspaces/:id/deleted` (sessionStorage carry +
+  follow-up GET; never fabricates proof; itemized checkmarks + completion timestamp + Back to
+  Workspaces). Read-only members get the API's owner-only 404.
+- **Assembly (orchestrator-applied shared seams):** `api.go` `Dependencies` + route wiring for export
+  and workspace-delete; `main.go` wires `ExportAudit`, the five FEAT-043 seams (objectStore,
+  engineProvider, workspaceRepo, deletionRecordRepo, auditWriter); `storage.go`
+  `DeleteObjectsByPrefix`; `engine` `Drop`; the report page threads `userTier` from the session
+  (display-only; server is authoritative); `WorkspaceHomeScreen` passes `workspaceId` to
+  `RecentReportsPanel` (+ its test's mock dispatch).
+- **Assumptions recorded:** Excel/CSV row produces CSV (RFC 4180, zero new deps) — XLSX behind the
+  same `format=` seam later; the Upgrade Prompt link targets Workspace Settings (no billing/upgrade
+  route exists yet — Stripe is the Phase 4 monetization milestone, deferred); "Ask a follow-up"
+  routes to Workspace Home's Ask panel (report-scoped forking is FEAT-021, Phase 5); notifications
+  referencing a deleted workspace are user-scoped and not part of the 5-category cascade (matches the
+  docs, which expect deletion-retry notifications to exist).
+- **Doc tensions routed to product-shaper (not fixed):** none blocking. The `deletion` audit entry
+  itself is destroyed with the workspace's log rows (its surviving proof is `deletion_records`), which
+  screens/17's "audit log destroyed in the deletion cascade" documents.
 
 ### Screen 13 — Workspace Settings: Phase-1 shell (`d8f1bdf`, 2026-08-07)
 

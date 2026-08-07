@@ -130,6 +130,26 @@ type Dependencies struct {
 	// (screens/10) serves a single claim's query and backing result rows. Satisfied by
 	// postgres.ProvenanceRepository, the same instance the executor wires via run.WithProvenance.
 	Provenance ProvenanceStore
+
+	// ExportAudit records FEAT-035/FEAT-036's report exports as `export` audit entries (FEAT-042),
+	// written in the same handler that serves the export bytes — screens/11-export-dialog.md.
+	// Satisfied by internal/audit.Writer, the same instance behind ConfirmationAudit.
+	ExportAudit ExportAuditWriter
+
+	// FEAT-043 (One-Workspace-One-Delete Cascade) — screens/14-deletion-confirmation-proof.md.
+	// WorkspaceCascadeObjects deletes every object under the workspace's key prefix (satisfied by
+	// internal/storage.Client); WorkspaceEngineDropper tears down the workspace's session-scoped
+	// engine state (satisfied by engine.Provider once it implements Drop — nil until then skips
+	// engine teardown); WorkspaceDeletionCascade runs the database half of the cascade (satisfied
+	// by postgres.WorkspaceRepository's delete methods); WorkspaceDeletionProofs reads the
+	// surviving proof record (satisfied by postgres.DeletionRecordRepository);
+	// WorkspaceDeletionAudit writes the cascade's own audit entry before the log rows are destroyed
+	// (satisfied by internal/audit.Writer).
+	WorkspaceCascadeObjects  WorkspaceCascadeObjectDeleter
+	WorkspaceEngineDropper   WorkspaceEngineDropper
+	WorkspaceDeletionCascade WorkspaceDeletionStore
+	WorkspaceDeletionProofs  DeletionProofStore
+	WorkspaceDeletionAudit   WorkspaceDeletionAuditWriter
 }
 
 // Server wires configuration and dependencies into an http.Handler.
@@ -267,6 +287,22 @@ func (s *Server) routes() {
 				// provenance-panel detail endpoint) — screens/09-report-view.md, screens/10.
 				if s.deps.Reports != nil {
 					RegisterReportRoutes(r, s.deps.Workspaces, s.deps.Reports, s.deps.Provenance, s.deps.RunSteps, s.logger)
+				}
+
+				// FEAT-035/FEAT-036: report export (PDF, Excel/CSV) — screens/11-export-dialog.md.
+				// Every collaborator is required: the tier gate must never be skippable, so the
+				// routes only register when all of them are wired.
+				if s.deps.Reports != nil && s.deps.RunSteps != nil && s.deps.Users != nil && s.deps.ExportAudit != nil {
+					RegisterExportRoutes(r, s.deps.Workspaces, s.deps.Reports, s.deps.RunSteps, s.deps.Users, s.deps.ExportAudit, s.logger)
+				}
+
+				// FEAT-043: one-workspace-one-delete cascade + deletion proof read —
+				// screens/14-deletion-confirmation-proof.md.
+				if s.deps.WorkspaceCascadeObjects != nil && s.deps.WorkspaceDeletionCascade != nil &&
+					s.deps.WorkspaceDeletionProofs != nil && s.deps.WorkspaceDeletionAudit != nil {
+					RegisterWorkspaceDeleteRoute(r, s.deps.Workspaces, s.deps.WorkspaceCascadeObjects,
+						s.deps.WorkspaceEngineDropper, s.deps.WorkspaceDeletionCascade,
+						s.deps.WorkspaceDeletionProofs, s.deps.WorkspaceDeletionAudit, s.logger)
 				}
 			})
 		}
