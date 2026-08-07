@@ -73,6 +73,7 @@ type fakeRunExecutor struct {
 	userIDs []string
 	runs    []domain.Run
 	sqls    []string
+	resumed []string
 }
 
 func (f *fakeRunExecutor) Submit(userID string, run domain.Run) {
@@ -90,6 +91,15 @@ func (f *fakeRunExecutor) SubmitWithSQL(userID string, run domain.Run, sql strin
 	f.userIDs = append(f.userIDs, userID)
 	f.runs = append(f.runs, run)
 	f.sqls = append(f.sqls, sql)
+}
+
+// Resume records the resume request (FEAT-022); the real executor runs a goroutine, so asserting the
+// request reached it is the handler test's boundary.
+func (f *fakeRunExecutor) Resume(userID string, runID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.userIDs = append(f.userIDs, userID)
+	f.resumed = append(f.resumed, runID)
 }
 
 func (f *fakeRunExecutor) submitted() []domain.Run {

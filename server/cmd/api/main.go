@@ -19,6 +19,7 @@ import (
 	"github.com/ahmadkhidir/groundwork/server/internal/auth"
 	"github.com/ahmadkhidir/groundwork/server/internal/config"
 	"github.com/ahmadkhidir/groundwork/server/internal/engine"
+	"github.com/ahmadkhidir/groundwork/server/internal/events"
 	"github.com/ahmadkhidir/groundwork/server/internal/ingest"
 	"github.com/ahmadkhidir/groundwork/server/internal/model"
 	runpkg "github.com/ahmadkhidir/groundwork/server/internal/run"
@@ -115,9 +116,16 @@ func run(logger *slog.Logger) error {
 	if cfg.AnthropicAPIKey == "" {
 		logger.Warn("ANTHROPIC_API_KEY is not set — FEAT-013 runs will fail at the model step")
 	}
+	// FEAT-023's live run-event fan-out and FEAT-027's determinism cache are wired together here: the
+	// executor publishes to the hub (WithEvents) and the same hub serves the run stream endpoint;
+	// the cache repository is what lets an identical later run replay persisted outputs instead of
+	// re-asking the model (WithCache).
+	runEvents := events.NewHub()
+	runCacheRepo := postgres.NewRunCacheRepository(pool)
 	runExecutor := runpkg.NewExecutor(
 		runRepo, stepRepo, datasetRepo, columnRepo, objectStore, engineProvider, auditWriter,
-		modelClient, reportRepo, relationshipRepo, metricDefinitionRepo, correctionRepo, logger)
+		modelClient, reportRepo, relationshipRepo, metricDefinitionRepo, correctionRepo, logger,
+		runpkg.WithEvents(runEvents), runpkg.WithCache(runCacheRepo))
 
 	deps := api.Dependencies{
 		AuthSecret: cfg.AuthSecret,
@@ -169,6 +177,7 @@ func run(logger *slog.Logger) error {
 		Runs:        runRepo,
 		RunSteps:    stepRepo,
 		RunExecutor: runExecutor,
+		RunEvents:   runEvents,
 
 		// FEAT-014: report read endpoint (screens/09-report-view.md). Materialized by the executor;
 		// read here through the same ReportRepository instance.

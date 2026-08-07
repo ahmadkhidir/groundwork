@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RunViewerScreen } from "./RunViewerScreen";
 import { ApiError, api } from "@/lib/api-client";
@@ -20,6 +20,32 @@ const { pushMock, routerMock } = vi.hoisted(() => {
 vi.mock("next/navigation", () => ({
   useRouter: () => routerMock,
 }));
+
+// FEAT-023: the viewer subscribes to an SSE stream (EventSource). jsdom has no EventSource, so a
+// minimal mock stands in — it records instances and lets tests push a message at one.
+class MockEventSource {
+  static instances: MockEventSource[] = [];
+  readonly url: string;
+  onopen: ((ev: Event) => unknown) | null = null;
+  onmessage: ((ev: MessageEvent) => unknown) | null = null;
+  onerror: ((ev: Event) => unknown) | null = null;
+  close = vi.fn();
+
+  constructor(url: string) {
+    this.url = url;
+    MockEventSource.instances.push(this);
+  }
+}
+vi.stubGlobal("EventSource", MockEventSource);
+
+function stream(index = 0): MockEventSource {
+  return MockEventSource.instances[index];
+}
+
+function emit(index: number, data: string): void {
+  const source = MockEventSource.instances[index];
+  source.onmessage?.({ data } as unknown as MessageEvent);
+}
 
 const getMock = vi.mocked(api.get);
 const postMock = vi.mocked(api.post);
@@ -69,6 +95,7 @@ describe("RunViewerScreen", () => {
     getMock.mockReset();
     postMock.mockReset();
     pushMock.mockReset();
+    MockEventSource.instances.length = 0;
   });
 
   afterEach(() => {
@@ -149,32 +176,54 @@ describe("RunViewerScreen", () => {
     await screen.findByText("How many customers per region?");
   });
 
-  it("polls while the run is live and stops once it reaches a terminal status", async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    let fetchCount = 0;
-    const sequence: Array<{ status: RunStatus; steps: Step[] }> = [
-      { status: "running", steps: [step("plan", { status: "complete" }), step("generate_sql", { status: "running" })] },
-      { status: "running", steps: [step("plan", { status: "complete" }), step("generate_sql", { status: "complete" }), step("execute", { status: "running" })] },
-      { status: "complete", steps: completeRunSteps() },
-    ];
-    getMock.mockImplementation(async () => {
-      const item = sequence[Math.min(fetchCount, sequence.length - 1)];
-      fetchCount += 1;
-      return { run: run(item.status), steps: item.steps };
+  it("streams live DAG transitions and stops at a terminal status (FEAT-023)", async () => {
+    getMock.mockResolvedValue({
+      run: run("running"),
+      steps: [step("plan", { status: "complete" }), step("generate_sql", { status: "running" })],
     });
-
     render(<RunViewerScreen workspaceId="ws-1" runId="run-1" />);
-    await vi.waitFor(() =>
-      expect(screen.getAllByText("Running").length).toBeGreaterThan(0),
+    await screen.findByText("How many customers per region?");
+
+    // The viewer opens an SSE stream for the run.
+    const source = stream(0);
+    expect(source.url).toContain("/v1/workspaces/ws-1/runs/run-1/stream");
+
+    // generate_sql completes over the stream with its output.
+    emit(
+      0,
+      JSON.stringify({
+        type: "step.completed",
+        step_name: "generate_sql",
+        step_status: "complete",
+        output: JSON.stringify({ sql: SQL_TEXT }),
+      }),
     );
+    await screen.findByText(SQL_TEXT);
 
-    await vi.advanceTimersByTimeAsync(1_000);
-    await vi.advanceTimersByTimeAsync(1_000);
-    await vi.waitFor(() => expect(screen.getByText(SQL_TEXT)).toBeInTheDocument());
+    // A step absent from the initial snapshot is added live.
+    emit(
+      0,
+      JSON.stringify({ type: "step.started", step_name: "execute", step_status: "running" }),
+    );
+    await waitFor(() => expect(screen.getAllByText("Running").length).toBeGreaterThan(0));
+    expect(screen.getByText("Execute")).toBeInTheDocument();
 
-    const stoppedAt = fetchCount;
-    await vi.advanceTimersByTimeAsync(5_000);
-    expect(fetchCount).toBe(stoppedAt);
+    // run.status complete ends the live run; without a report_id the viewer stays put (no navigation).
+    emit(0, JSON.stringify({ type: "run.status", status: "complete" }));
+    await waitFor(() => expect(pushMock).not.toHaveBeenCalled());
+  });
+
+  it("surfaces a determinism-cache hit with the cached-from-run reference (FEAT-027)", async () => {
+    getMock.mockResolvedValue({ run: run("running"), steps: [] });
+    render(<RunViewerScreen workspaceId="ws-1" runId="run-1" />);
+    await screen.findByText("How many customers per region?");
+
+    emit(0, JSON.stringify({ type: "cache.hit", cached_run_id: "run-9" }));
+
+    expect(
+      await screen.findByText(/answered instantly from a prior identical run/i),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/cached from run run-9/i)).toBeInTheDocument();
   });
 
   it("auto-navigates to the report on completion when a report_id is attached (FEAT-018)", async () => {

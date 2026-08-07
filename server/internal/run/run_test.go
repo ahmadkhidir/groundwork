@@ -123,6 +123,35 @@ func (f *fakeStepStore) Fail(_ context.Context, id, reason string) error {
 	return errors.New("step not found")
 }
 
+func (f *fakeStepStore) ListByRun(_ context.Context, runID string) ([]domain.Step, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]domain.Step, 0)
+	for _, st := range f.steps {
+		if st.RunID == runID {
+			out = append(out, st)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeStepStore) Reset(_ context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := range f.steps {
+		if f.steps[i].ID == id {
+			if f.steps[i].Status == domain.StepComplete {
+				return errors.New("step not claimable")
+			}
+			f.steps[i].Status = domain.StepRunning
+			f.steps[i].Output = ""
+			f.steps[i].CompletedAt = nil
+			return nil
+		}
+	}
+	return errors.New("step not found")
+}
+
 func (f *fakeStepStore) all() []domain.Step {
 	f.mu.Lock()
 	defer f.mu.Unlock()

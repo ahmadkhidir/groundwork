@@ -2,6 +2,9 @@ package api
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -11,6 +14,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/ahmadkhidir/groundwork/server/internal/domain"
+	"github.com/ahmadkhidir/groundwork/server/internal/events"
 )
 
 // RunStore is the create/get seam RegisterRunRoutes depends on for runs, satisfied by
@@ -36,9 +40,14 @@ type RunStepStore interface {
 // SubmitWithSQL is FEAT-018's Phase 2 boundary: an edited query starts a NEW run whose generate_sql
 // step is seeded with the user's SQL (see internal/run's executeSeeded). Both entry points return
 // immediately.
+//
+// Resume (FEAT-022) restarts a previously-failed/interrupted run from its first unfinished step; the
+// executor's step machine replays completed work and reclaims an incomplete step, so it can never
+// double-execute a step. It returns immediately.
 type RunExecutor interface {
 	Submit(userID string, run domain.Run)
 	SubmitWithSQL(userID string, run domain.Run, sql string)
+	Resume(userID string, runID string)
 }
 
 // RegisterRunRoutes wires FEAT-013's endpoints onto r. reports backs the GET run response's
@@ -49,9 +58,17 @@ type RunExecutor interface {
 // SemanticCorrectionStore the semantic layer routes use (api.go's SemanticCorrections seam) and may
 // be nil when the semantic layer is not wired (e.g. minimal run-route tests) — capture is skipped,
 // never an error.
-func RegisterRunRoutes(r chi.Router, workspaces WorkspaceStore, runs RunStore, steps RunStepStore, reports ReportStore, corrections SemanticCorrectionStore, executor RunExecutor, logger *slog.Logger) {
+//
+// hub, when non-nil, backs FEAT-023's live run-event stream (a "run.status"/step event subscription
+// that streams the run's in-progress DAG transitions to the Run Viewer over SSE) and FEAT-022's
+// resume endpoint.
+func RegisterRunRoutes(r chi.Router, workspaces WorkspaceStore, runs RunStore, steps RunStepStore, reports ReportStore, corrections SemanticCorrectionStore, executor RunExecutor, hub *events.Hub, logger *slog.Logger) {
 	r.Post("/workspaces/{workspaceId}/runs", handleCreateRun(workspaces, runs, corrections, executor, logger))
 	r.Get("/workspaces/{workspaceId}/runs/{runId}", handleGetRun(workspaces, runs, steps, reports, logger))
+	if hub != nil {
+		r.Get("/workspaces/{workspaceId}/runs/{runId}/stream", handleStreamRun(workspaces, runs, hub, logger))
+		r.Post("/workspaces/{workspaceId}/runs/{runId}/resume", handleResumeRun(workspaces, runs, executor, logger))
+	}
 }
 
 // createRunRequest is the POST body for asking a question: screens/04-workspace-home.md's Ask panel,
@@ -262,5 +279,146 @@ func handleGetRun(workspaces WorkspaceStore, runs RunStore, steps RunStepStore, 
 			"steps":     stepList,
 			"report_id": reportID,
 		})
+	}
+}
+
+// handleStreamRun serves FEAT-023's live run-event stream:
+// GET /api/workspaces/:id/runs/:runId/stream.
+//
+// The response is a persistent SSE stream (text/event-stream). On connect the handler replays the
+// run's CURRENT persisted state as events (one event per step's status, then a run.status event), so
+// a viewer joining mid-run renders state immediately; it then subscribes to the in-process event hub
+// and forwards each live transition. Events carry no SSE `event:` field, so the browser's generic
+// `onmessage` handler receives them as JSON text (see web/src/lib/api-client.ts subscribeToStream).
+//
+// The stream is best-effort and explicitly not load-bearing: the durable source of truth is the
+// persisted runs/steps the GET endpoint reads, so any disconnect (or this stream's 60s request
+// timeout, an accepted Pass-1 limitation) is repaired by the viewer re-reading state and
+// reconnecting. A stream.end event is sent after the run reaches a terminal state so the viewer can
+// stop listening.
+func handleStreamRun(workspaces WorkspaceStore, runs RunStore, hub *events.Hub, logger *slog.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		claims, ok := requireClaims(w, r)
+		if !ok {
+			return
+		}
+
+		workspaceID := chi.URLParam(r, "workspaceId")
+		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+			return
+		}
+
+		runID := chi.URLParam(r, "runId")
+		run, err := runs.GetByID(r.Context(), runID)
+		if err != nil || run.WorkspaceID != workspaceID {
+			respondJSON(w, http.StatusNotFound, map[string]string{
+				"error": "Run not found.",
+				"code":  "not_found",
+			})
+			return
+		}
+
+		ch, unsubscribe := hub.Subscribe(runID)
+		defer unsubscribe()
+
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			respondJSON(w, http.StatusInternalServerError, map[string]string{
+				"error": "Streaming unsupported.",
+				"code":  "internal_error",
+			})
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.WriteHeader(http.StatusOK)
+
+		// 1. Replay the persisted snapshot so a mid-run reconnect renders current state instantly.
+		snapshot := []events.Event{{Type: events.TypeRunStatus, RunID: run.ID, Status: string(run.Status)}}
+		for _, line := range snapshot {
+			writeSSE(w, flusher, line)
+		}
+
+		// 2. If the run is already terminal, there will be no live events; signal the end.
+		if run.Status.IsTerminal() {
+			writeSSE(w, flusher, events.Event{Type: events.TypeStreamEnd, RunID: run.ID})
+			return
+		}
+
+		// 3. Forward live events until the run is terminal or the client disconnects.
+		for {
+			select {
+			case ev := <-ch:
+				writeSSE(w, flusher, ev)
+				if ev.Type == events.TypeRunStatus {
+					status := domain.RunStatus(ev.Status)
+					if status.IsTerminal() {
+						writeSSE(w, flusher, events.Event{Type: events.TypeStreamEnd, RunID: run.ID})
+						return
+					}
+					if status == domain.RunFailed {
+						logger.Info("stream: run failed")
+						return
+					}
+				}
+			case <-r.Context().Done():
+				return
+			}
+		}
+	}
+}
+
+func writeSSE(w io.Writer, flusher http.Flusher, ev events.Event) {
+	b, err := json.Marshal(ev)
+	if err != nil {
+		return
+	}
+	fmt.Fprintf(w, "data: %s\n\n", b)
+	flusher.Flush()
+}
+
+// handleResumeRun serves FEAT-022's resume endpoint:
+// POST /api/workspaces/:id/runs/:runId/resume.
+//
+// It restarts a failed or interrupted run from its first unfinished step. The step machine's
+// idempotency+skip guarantees make this safe: completed steps are replayed, the first non-completed
+// one is reclaimed, and a run already being executed concurrently is rejected with 409 rather than
+// double-driven. A truly completed run is also rejected — there is nothing honest to resume.
+func handleResumeRun(workspaces WorkspaceStore, runs RunStore, executor RunExecutor, logger *slog.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		claims, ok := requireClaims(w, r)
+		if !ok {
+			return
+		}
+
+		workspaceID := chi.URLParam(r, "workspaceId")
+		if _, ok := requireWorkspaceOwnership(w, r, workspaces, claims.UserID, workspaceID); !ok {
+			return
+		}
+
+		runID := chi.URLParam(r, "runId")
+		run, err := runs.GetByID(r.Context(), runID)
+		if err != nil || run.WorkspaceID != workspaceID {
+			respondJSON(w, http.StatusNotFound, map[string]string{
+				"error": "Run not found.",
+				"code":  "not_found",
+			})
+			return
+		}
+
+		// Only a terminal-bad or interrupted run is resumable. As for resume, a queued/waking/running
+		// run is already being driven by the executor; re-entering it would race live execution.
+		switch run.Status {
+		case domain.RunFailed, domain.RunHalted:
+			executor.Resume(claims.UserID, runID)
+			respondJSON(w, http.StatusAccepted, map[string]any{"status": "resumed", "run_id": runID})
+		default:
+			respondJSON(w, http.StatusConflict, map[string]string{
+				"error": "This run is already finished or in progress and cannot be resumed.",
+				"code":  "run_not_resumable",
+			})
+		}
 	}
 }

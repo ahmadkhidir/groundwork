@@ -17,6 +17,7 @@ import (
 	"github.com/ahmadkhidir/groundwork/server/internal/auth"
 	"github.com/ahmadkhidir/groundwork/server/internal/authsession"
 	"github.com/ahmadkhidir/groundwork/server/internal/config"
+	"github.com/ahmadkhidir/groundwork/server/internal/events"
 	"github.com/ahmadkhidir/groundwork/server/internal/ingest"
 )
 
@@ -115,6 +116,10 @@ type Dependencies struct {
 	Runs        RunStore
 	RunSteps    RunStepStore
 	RunExecutor RunExecutor
+	// RunEvents backs FEAT-023's live run-event stream. When non-nil it is the in-process fan-out the
+	// executor publishes to (WithEvents) and the stream endpoint subscribes to; the executor + stream
+	// are only wired together when this is set in main.go.
+	RunEvents *events.Hub
 
 	// Reports backs FEAT-014's report read endpoint — screens/09-report-view.md's single self-
 	// contained fetch. Satisfied by postgres.ReportRepository, the same instance the executor uses
@@ -249,7 +254,7 @@ func (s *Server) routes() {
 				// FEAT-013: ask-a-question run lifecycle — create a run and watch it execute.
 				// screens/04-workspace-home.md, screens/08-run-viewer.md.
 				if s.deps.Runs != nil && s.deps.RunSteps != nil && s.deps.RunExecutor != nil {
-					RegisterRunRoutes(r, s.deps.Workspaces, s.deps.Runs, s.deps.RunSteps, s.deps.Reports, s.deps.SemanticCorrections, s.deps.RunExecutor, s.logger)
+					RegisterRunRoutes(r, s.deps.Workspaces, s.deps.Runs, s.deps.RunSteps, s.deps.Reports, s.deps.SemanticCorrections, s.deps.RunExecutor, s.deps.RunEvents, s.logger)
 				}
 
 				// FEAT-014: read a completed run's materialized Report — screens/09-report-view.md.

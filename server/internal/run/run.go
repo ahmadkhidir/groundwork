@@ -33,7 +33,9 @@ import (
 	"github.com/ahmadkhidir/groundwork/server/internal/config"
 	"github.com/ahmadkhidir/groundwork/server/internal/domain"
 	"github.com/ahmadkhidir/groundwork/server/internal/engine"
+	"github.com/ahmadkhidir/groundwork/server/internal/events"
 	"github.com/ahmadkhidir/groundwork/server/internal/model"
+	"github.com/ahmadkhidir/groundwork/server/internal/orchestrator"
 	"github.com/ahmadkhidir/groundwork/server/internal/semantic"
 	"github.com/ahmadkhidir/groundwork/server/internal/storage"
 )
@@ -47,9 +49,13 @@ type RunStore interface {
 	UpdateStatus(ctx context.Context, id string, status domain.RunStatus) error
 }
 
-// StepStore persists step rows. Satisfied by postgres.StepRepository.
+// StepStore persists step rows. Satisfied by postgres.StepRepository. It is deliberately the same
+// width as orchestrator.StepStore — the executor hands this seam to the orchestrator engine, which
+// drives the per-step claim/persist/replay loop (FEAT-022).
 type StepStore interface {
+	ListByRun(ctx context.Context, runID string) ([]domain.Step, error)
 	Create(ctx context.Context, workspaceID string, step domain.Step) error
+	Reset(ctx context.Context, id string) error
 	Complete(ctx context.Context, id, output string) error
 	Fail(ctx context.Context, id, reason string) error
 }
@@ -118,12 +124,37 @@ type Executor struct {
 	reports  ReportStore
 	logger   *slog.Logger
 
+	// engine is the durable step machine (internal/orchestrator) this seam drives: it owns step
+	// persistence, resume-skip, and per-step live event emission. Built in NewExecutor/rebuildEngine.
+	engine *orchestrator.Engine
+	// hub, when wired (WithEvents), receives the run-status and cache events this seam publishes —
+	// the same hub the SSE run-event stream subscribes to (FEAT-023).
+	hub *events.Hub
+	// cache, when wired (WithCache), enables determinism caching (FEAT-027).
+	cache orchestrator.CacheStore
+
 	// Semantic-layer listers feed semantic.AssembleGroundingContext (FEAT-019's building block).
 	// Typed as the semantic package's own interfaces because that is exactly the contract
 	// AssembleGroundingContext consumes; the same postgres repositories satisfy them.
 	relationships semantic.RelationshipLister
 	metrics       semantic.MetricDefinitionLister
 	corrections   semantic.CorrectionLister
+}
+
+// Option configures an Executor at construction. Options run before the internal step engine is
+// built, so a WithEvents/WithCache option's effects are wired into it.
+type Option func(*Executor)
+
+// WithEvents wires the executor to a live-event hub (FEAT-023): run-status, step, and cache events
+// are published to hub's per-run fan-out, which the SSE run-event stream endpoint subscribes to.
+func WithEvents(hub *events.Hub) Option {
+	return func(e *Executor) { e.hub = hub }
+}
+
+// WithCache enables determinism caching (FEAT-027) against the given store. Without it, runs always
+// execute fresh (tests and keyless dev servers leave it unwired).
+func WithCache(cache orchestrator.CacheStore) Option {
+	return func(e *Executor) { e.cache = cache }
 }
 
 // NewExecutor constructs an Executor from its seams.
@@ -141,8 +172,9 @@ func NewExecutor(
 	metrics semantic.MetricDefinitionLister,
 	corrections semantic.CorrectionLister,
 	logger *slog.Logger,
+	opts ...Option,
 ) *Executor {
-	return &Executor{
+	e := &Executor{
 		runs:          runs,
 		steps:         steps,
 		datasets:      datasets,
@@ -157,6 +189,38 @@ func NewExecutor(
 		metrics:       metrics,
 		corrections:   corrections,
 	}
+	for _, opt := range opts {
+		opt(e)
+	}
+	e.rebuildEngine()
+	return e
+}
+
+// rebuildEngine (re)builds the durable step machine with the executor's current seams and emitter.
+func (e *Executor) rebuildEngine() {
+	e.engine = orchestrator.NewEngine(e.steps, emitFunc(e.publish), e.logger)
+}
+
+// publish fans a live event out to the hub's subscribers for runID, if a hub is wired. Safe to call
+// with a nil hub (tests).
+func (e *Executor) publish(runID string, ev events.Event) {
+	if e.hub != nil {
+		e.hub.Publish(runID, ev)
+	}
+}
+
+// emitFunc adapts Executor.publish to orchestrator.Emitter.
+type emitFunc func(runID string, ev events.Event)
+
+func (f emitFunc) Publish(runID string, ev events.Event) { f(runID, ev) }
+
+// setRunStatus persists a run-status transition and publishes it to the live stream (FEAT-023).
+func (e *Executor) setRunStatus(ctx context.Context, log *slog.Logger, runID string, status domain.RunStatus) error {
+	if err := e.runs.UpdateStatus(ctx, runID, status); err != nil {
+		return err
+	}
+	e.publish(runID, events.Event{Type: events.TypeRunStatus, RunID: runID, Status: string(status)})
+	return nil
 }
 
 // Submit starts run's background execution.
@@ -183,36 +247,65 @@ func (e *Executor) SubmitWithSQL(userID string, run domain.Run, sql string) {
 	go e.executeSeeded(context.Background(), userID, run, sql)
 }
 
-// stepContext carries the identity fields every step write needs.
+// stepContext carries the identity fields every step write needs, plus the resume ledger of already-
+// completed steps loaded at the top of a pipeline run.
 type stepContext struct {
 	runID       string
 	workspaceID string
 	userID      string
+	// ledger maps stepName → the run's most recent persisted row for that name: a COMPLETED step is
+	// replayed by the step machine, a failed/stale row is reclaimed — a resumed run picks up from
+	// its first unfinished step instead of re-running (and double-executing) prior work (FEAT-022).
+	ledger map[domain.StepName]domain.Step
 }
 
 // execute advances run through its pipeline: wake the engine, plan, generate_sql, execute, then a
 // single terminal status. It is the normal (model-driven) path; see executeSeeded for FEAT-018.
 func (e *Executor) execute(ctx context.Context, userID string, run domain.Run) {
-	e.executePipeline(ctx, userID, run, nil)
+	e.executePipeline(ctx, userID, run, nil, true)
 }
 
 // executeSeeded is the FEAT-018 path: the run's generate_sql step is seeded with the user's edited
-// SQL instead of being produced by plan + the model.
+// SQL instead of being produced by plan + the model. includePlan is false (no plan step row).
 func (e *Executor) executeSeeded(ctx context.Context, userID string, run domain.Run, sql string) {
-	e.executePipeline(ctx, userID, run, &sql)
+	e.executePipeline(ctx, userID, run, &sql, false)
 }
 
 // executePipeline advances run through its pipeline to a single terminal status. seedSQL is nil for
 // a normal run (plan → model generate_sql) and non-nil for FEAT-018's edited-SQL path (generate_sql
-// seeded directly, plan skipped entirely). Every branch that cannot continue marks the run failed.
-func (e *Executor) executePipeline(ctx context.Context, userID string, run domain.Run, seedSQL *string) {
+// seeded directly, plan skipped entirely). includePlan is true for a normal run (a plan step exists)
+// and false for a seeded run or for a resume whose plan step was never persisted (it has already
+// completed generate_sql). Every branch that cannot continue marks the run failed (FEAT-022: the
+// pipeline is idempotent+resumable — every step is skipped when a completed row already exists, so
+// re-entering it (Resume) replays done work and only executes from the first unfinished step).
+func (e *Executor) executePipeline(ctx context.Context, userID string, run domain.Run, seedSQL *string, includePlan bool) {
 	log := e.logger.With(slog.String("run_id", run.ID), slog.String("workspace_id", run.WorkspaceID))
 	sc := stepContext{runID: run.ID, workspaceID: run.WorkspaceID, userID: userID}
+
+	// Determinism cache fast-path (FEAT-027): if a deterministically-identical run already completed
+	// (same question, same schema, and — for edited SQL — same seed), replay its persisted outputs
+	// and finish WITHOUT waking the engine or asking the model. Caching is best-effort: any hash
+	// failure or store error logs and falls through to a normal execution.
+	if e.cache != nil {
+		if e.tryCacheHit(ctx, sc, userID, run, seedSQL, log) {
+			return
+		}
+	}
+
+	// Load the resume ledger before any step work: already-completed steps (from a prior interrupted
+	// run, or this run's own cache reply) are replayed by EnsureStep, never re-executed.
+	completed, err := e.engine.Load(ctx, run.ID)
+	if err != nil {
+		log.Error("loading completed steps", slog.String("error", err.Error()))
+		e.failRun(ctx, log, run.ID)
+		return
+	}
+	sc.ledger = completed
 
 	// Waking is reported BEFORE Acquire blocks: screens/04-workspace-home.md and 08-run-viewer.md
 	// specify that a question submitted while the engine is sleeping queues and shows "Waking
 	// engine..." — the engine queued run announcing the wake it is about to cause.
-	if err := e.runs.UpdateStatus(ctx, run.ID, domain.RunWaking); err != nil {
+	if err := e.setRunStatus(ctx, log, run.ID, domain.RunWaking); err != nil {
 		log.Error("marking run waking", slog.String("error", err.Error()))
 		e.failRun(ctx, log, run.ID)
 		return
@@ -236,15 +329,17 @@ func (e *Executor) executePipeline(ctx context.Context, userID string, run domai
 		}
 	}()
 
-	if err := e.runs.UpdateStatus(ctx, run.ID, domain.RunRunning); err != nil {
+	if err := e.setRunStatus(ctx, log, run.ID, domain.RunRunning); err != nil {
 		log.Error("marking run running", slog.String("error", err.Error()))
 		e.failRun(ctx, log, run.ID)
 		return
 	}
 
 	// The generate_sql step's input differs by path: the plan output when the model plans it, the
-	// empty string when the user's edited SQL is the plan. The rest of the pipeline is identical.
+	// empty string when the user's edited SQL is the plan (or when a resume continues past plan).
+	// The rest of the pipeline is identical.
 	var generateSQLOutput string
+	var planOutput string
 	if seedSQL != nil {
 		// FEAT-018 seeded path: no plan step row and no model generate_sql call. The user's exact
 		// edited SQL is persisted as the generate_sql step output, so the Run Viewer and the Report
@@ -258,37 +353,40 @@ func (e *Executor) executePipeline(ctx context.Context, userID string, run domai
 			return
 		}
 	} else {
-		// plan
-		planOutput, err := e.execStep(ctx, sc, domain.StepPlan, "", log, func() (string, error) {
-			return e.runPlan(ctx, sc, run, log)
-		})
-		if err != nil {
-			log.Error("plan step failed", slog.String("error", err.Error()))
-			e.failRun(ctx, log, run.ID)
-			return
-		}
-
+		// plan — only when this execution owns a plan step. Resuming a seeded run (or a run
+		// interrupted after generate_sql) must not fabricate a plan row that never existed.
 		var plan domain.PlanStepOutput
-		if err := json.Unmarshal([]byte(planOutput), &plan); err != nil {
-			log.Error("parsing plan output", slog.String("error", err.Error()))
-			e.failRun(ctx, log, run.ID)
-			return
-		}
-
-		// FEAT-033 boundary (Phase 2 form): an ambiguous or unanswerable question fails the run
-		// with a plain-language reason rather than proceeding to generate_sql on a guess. The
-		// reason lives in the completed plan step's output, where the Run Viewer reads it verbatim.
-		if !plan.Answerable {
-			reason := plan.Reason
-			if strings.TrimSpace(reason) == "" {
-				reason = "This question couldn't be answered from the available data."
+		if includePlan {
+			planOutput, err = e.execStep(ctx, sc, domain.StepPlan, "", log, func() (string, error) {
+				return e.runPlan(ctx, sc, run, log)
+			})
+			if err != nil {
+				log.Error("plan step failed", slog.String("error", err.Error()))
+				e.failRun(ctx, log, run.ID)
+				return
 			}
-			log.Info("run failed: question not answerable", slog.String("reason", reason))
-			e.failRun(ctx, log, run.ID)
-			return
+
+			if err := json.Unmarshal([]byte(planOutput), &plan); err != nil {
+				log.Error("parsing plan output", slog.String("error", err.Error()))
+				e.failRun(ctx, log, run.ID)
+				return
+			}
+
+			// FEAT-033 boundary (Phase 2 form): an ambiguous or unanswerable question fails the run
+			// with a plain-language reason rather than proceeding to generate_sql on a guess. The
+			// reason lives in the completed plan step's output, where the Run Viewer reads it verbatim.
+			if !plan.Answerable {
+				reason := plan.Reason
+				if strings.TrimSpace(reason) == "" {
+					reason = "This question couldn't be answered from the available data."
+				}
+				log.Info("run failed: question not answerable", slog.String("reason", reason))
+				e.failRun(ctx, log, run.ID)
+				return
+			}
 		}
 
-		// generate_sql
+		// generate_sql — if already completed (a resume after a crash), EnsureStep replays its output.
 		generateSQLOutput, err = e.execStep(ctx, sc, domain.StepGenerateSQL, planOutput, log, func() (string, error) {
 			return e.runGenerateSQL(ctx, sc, run, plan, log)
 		})
@@ -366,7 +464,17 @@ func (e *Executor) executePipeline(ctx context.Context, userID string, run domai
 		return
 	}
 
-	if err := e.runs.UpdateStatus(ctx, run.ID, domain.RunComplete); err != nil {
+	// Determinism cache (FEAT-027): persist this successful run's outputs under a
+	// determinism-identical key so a later identical run short-circuits model+engine entirely. The
+	// run is already materially complete (report persisted), so a cache write failure is best-effort:
+	// log it and complete anyway rather than failing a finished run on secondary bookkeeping.
+	if e.cache != nil {
+		if err := e.rememberCache(ctx, sc, run, seedSQL, planOutput, generateSQLOutput, executeOutput, chartSpecOutput, narrateOutput, reconcile); err != nil {
+			log.Warn("persisting run cache", slog.String("error", err.Error()))
+		}
+	}
+
+	if err := e.setRunStatus(ctx, log, run.ID, domain.RunComplete); err != nil {
 		log.Error("marking run complete", slog.String("error", err.Error()))
 		e.failRun(ctx, log, run.ID)
 		return
@@ -375,9 +483,9 @@ func (e *Executor) executePipeline(ctx context.Context, userID string, run domai
 }
 
 // failRun marks a run failed. Variadic messages are logged (not persisted — a failed run's visible
-// reason lives in the failed step's output); failRun with no message logs only the transition.
+// reason lives in the failed step's output); the transition is published to the live stream.
 func (e *Executor) failRun(ctx context.Context, log *slog.Logger, runID string, messages ...string) {
-	if err := e.runs.UpdateStatus(ctx, runID, domain.RunFailed); err != nil {
+	if err := e.setRunStatus(ctx, log, runID, domain.RunFailed); err != nil {
 		log.Error("marking run failed", slog.String("error", err.Error()))
 		return
 	}
@@ -386,12 +494,11 @@ func (e *Executor) failRun(ctx context.Context, log *slog.Logger, runID string, 
 	}
 }
 
-// execStep wraps one pipeline step: persist the step row (running), run work, then persist either
-// its completed output or its failure. The returned string is the JSON-encoded output on success.
-//
-// The idempotency key is runID:stepName — deterministic per (run, step), which is exactly what makes
-// retry safe in a later wave: re-executing the same step on the same run would collide on the
-// table's UNIQUE constraint instead of running twice.
+// execStep runs one pipeline step THROUGH the orchestrator step machine (FEAT-022): if a completed
+// step for (run, step) already exists, its output is replayed and work is NOT re-run; otherwise work
+// is performed, the step claimed, and settled. The idempotency key is runID:stepName — deterministic
+// per (run, step), which is exactly what makes retry+resume safe: re-entering the same step either
+// replays the persisted output or collides on the table's UNIQUE constraint instead of running twice.
 func (e *Executor) execStep(
 	ctx context.Context,
 	sc stepContext,
@@ -400,32 +507,14 @@ func (e *Executor) execStep(
 	log *slog.Logger,
 	work func() (string, error),
 ) (string, error) {
-	now := time.Now().UTC()
-	step := domain.Step{
-		ID:             uuid.NewString(),
+	output, _, err := e.engine.EnsureStep(ctx, sc.ledger, orchestrator.Call{
 		RunID:          sc.runID,
+		WorkspaceID:    sc.workspaceID,
 		StepName:       stepName,
-		Status:         domain.StepRunning,
 		Input:          input,
 		IdempotencyKey: fmt.Sprintf("%s:%s", sc.runID, stepName),
-		StartedAt:      &now,
-	}
-	if err := e.steps.Create(ctx, sc.workspaceID, step); err != nil {
-		return "", fmt.Errorf("persisting %s step: %w", stepName, err)
-	}
-
-	output, err := work()
-	if err != nil {
-		if failErr := e.steps.Fail(ctx, step.ID, err.Error()); failErr != nil {
-			log.Error("persisting step failure", slog.String("step", string(stepName)), slog.String("error", failErr.Error()))
-		}
-		return "", err
-	}
-
-	if err := e.steps.Complete(ctx, step.ID, output); err != nil {
-		return "", fmt.Errorf("persisting %s output: %w", stepName, err)
-	}
-	return output, nil
+	}, work)
+	return output, err
 }
 
 // runPlan executes the plan step: build the workspace's payload, ask the model whether the question

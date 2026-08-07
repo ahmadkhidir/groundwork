@@ -13,6 +13,10 @@ import (
 // ErrStepNotFound is returned when no step matches the given id.
 var ErrStepNotFound = errors.New("step not found")
 
+// ErrStepNotClaimable is returned by Reset when the row is already complete — a completed step is
+// never re-claimed for a retry.
+var ErrStepNotClaimable = errors.New("step not claimable")
+
 // StepRepository persists and retrieves individual DAG steps (FEAT-013, Phase 2).
 //
 // Steps are created by internal/run's executor in status "running" the moment their work is about
@@ -120,6 +124,35 @@ func (r *StepRepository) Fail(ctx context.Context, id, reason string) error {
 	)
 	if err != nil {
 		return fmt.Errorf("failing step: %w", err)
+	}
+	return nil
+}
+
+// Reset re-claims an existing non-completed step row for an idempotent retry (FEAT-022's resume +
+// retry: orchestrator re-enters a failed/halted/stale-running step through the SAME row so its
+// UNIQUE idempotency_key is never violated). It flips the row back to a fresh running attempt —
+// status, started_at, and lease fields reset, attempt_count bumped, output/completed_at cleared.
+//
+// A completed row is never reset; Reset returns ErrStepNotClaimable for it (a concurrent
+// re-dispatch racing a completion must not clobber a persisted output).
+func (r *StepRepository) Reset(ctx context.Context, id string) error {
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE steps
+		    SET status = 'running',
+		        attempt_count = attempt_count + 1,
+		        output = '',
+		        completed_at = NULL,
+		        lease_holder = '',
+		        lease_expires_at = NULL,
+		        started_at = now()
+		  WHERE id = $1 AND status <> 'complete'`,
+		id,
+	)
+	if err != nil {
+		return fmt.Errorf("resetting step: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrStepNotClaimable
 	}
 	return nil
 }

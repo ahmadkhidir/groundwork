@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { ArrowLeft } from "lucide-react";
+import { ArrowLeft, Sparkles } from "lucide-react";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { StatusPill, runStatusPill } from "@/components/ui/StatusPill";
 import { ErrorState } from "@/components/shared/ErrorState";
@@ -16,9 +16,15 @@ import {
   parseGenerateSQLStep,
   parsePlanStep,
 } from "./step-payloads";
-import { api, ApiError } from "@/lib/api-client";
+import { api, ApiError, subscribeToStream } from "@/lib/api-client";
 import { routes } from "@/lib/routes";
-import { RunStatus, isTerminalRunStatus, type Run, type Step } from "@/types/schema";
+import {
+  RunStatus,
+  type Run,
+  type Step,
+  type StepName,
+  type StepStatus,
+} from "@/types/schema";
 
 export interface RunViewerScreenProps {
   workspaceId: string;
@@ -36,46 +42,64 @@ interface GetRunResponse {
   report_id?: string | null;
 }
 
-/**
- * How often the Run Viewer re-fetches run + steps while the run is live.
- *
- * Not a server/config threshold (IMPLEMENTATION.md §5 rule 12 scopes those to server-enforced
- * behavior) — this is a client-only refresh cadence for the Phase 2 viewer. The Phase 2 boundary
- * ships polling instead of the live event channel screens/08-run-viewer.md describes, because the
- * stream is Phase 3 work; polling against GET /v1/workspaces/:id/runs/:runId keeps the same
- * "viewer attached to server-side state" contract.
- */
-const RUN_POLL_INTERVAL_MS = 1_000;
-
 type ScreenState =
   | { status: "loading" }
   | { status: "loaded"; run: Run; steps: Step[]; reportId: string | null }
   | { status: "error"; message: string };
 
 /**
- * Screen 8: Run Viewer (screens/08-run-viewer.md) — FEAT-013's viewer, Phase 2 form.
+ * FEAT-023's live run-event stream types (server/internal/events). Events carry sparse fields and are
+ * written JSON-only (no SSE `event:` channel), so the browser's generic `onmessage` handler receives
+ * each as JSON text.
+ */
+type StreamEventType =
+  | "run.status"
+  | "step.started"
+  | "step.completed"
+  | "step.failed"
+  | "step.halted"
+  | "cache.hit"
+  | "stream.end";
+
+interface StreamEvent {
+  type: StreamEventType;
+  run_id?: string;
+  status?: RunStatus;
+  step_name?: StepName;
+  step_id?: string;
+  step_status?: StepStatus;
+  output?: string;
+  cached_run_id?: string;
+}
+
+/**
+ * Screen 8: Run Viewer (screens/08-run-viewer.md) — FEAT-013's viewer, live-stream form (FEAT-023).
  *
- * Renders a run's live state from the persisted run + steps: a status pill, the step feed on the
- * left, and the always-visible generated SQL plus the executed result set on the right. Polls until
- * the run reaches a terminal status, then stops.
+ * Renders a run's state from the persisted run + steps, opening an SSE stream
+ * (GET /v1/workspaces/:id/runs/:runId/stream) so each DAG transition pushes in as it happens instead
+ * of being polled. The stream is best-effort — the durable source of truth is the persisted rows the
+ * initial (and any reconnect-time) GET reads — so a dropped or timed-out connection (the server's 60s
+ * request ceiling, an accepted Pass-1 limitation) is an EventSource auto-reconnect, never a lost
+ * update.
  *
- * Phase 2 boundary (IMPLEMENTATION.md "Phase 2 boundary assumptions"): halt, amend, and "Resume from
- * here" (FEAT-022/024) and the Clarifying Question Prompt's interactive surface (FEAT-033) are later
- * phases. This viewer is watch-only for the current run, with FEAT-018's one editing affordance:
- * the generated SQL is editable and "Run edited query" starts a NEW run seeded with that SQL (never
- * mutating this one). On completion the viewer auto-navigates to the run's report when one exists.
+ * Phase 2 boundary: halt, amend, and "Resume from here" (FEAT-022/024) and the Clarifying Question
+ * surface (FEAT-033) are later. The viewer is watch-only for the current run with FEAT-018's one
+ * editing affordance: the generated SQL is editable and "Run edited query" starts a NEW run seeded
+ * with that SQL. On completion the viewer auto-navigates to the run's report when one exists. A run
+ * answered from determinism cache (FEAT-027) is surfaced with a "cached from run" affordance so a
+ * replayed answer is never mistaken for freshly computed.
  */
 export function RunViewerScreen({ workspaceId, runId }: RunViewerScreenProps) {
   const router = useRouter();
   const [state, setState] = useState<ScreenState>({ status: "loading" });
-  const stopPolling = useRef(false);
-  // Whether at least one fetch has landed a loaded state, used so a transient poll failure keeps the
-  // last-known state on screen instead of flashing the error state (the same pattern as
-  // WorkspaceHomeScreen's lastKnownWorkspace ref).
+  // Whether at least one read has landed a loaded state, so a transient fetch failure keeps the
+  // last-known state on screen instead of flashing the error state.
   const loaded = useRef(false);
-  // Guards the completion auto-navigate so it fires once per mount (screens/08-run-viewer.md's
-  // "assemble completes → auto-navigate to Report View").
+  // Guards the completion auto-navigate so it fires once per mount.
   const navigatedToReport = useRef(false);
+  // The prior run a determinism-cache hit was replayed from (the SSE cache.hit's cached_run_id), for
+  // the "answered from cache" banner. Null on a fresh execution.
+  const [cachedFrom, setCachedFrom] = useState<string | null>(null);
   // Busy state while "Run edited query" is submitting the new run.
   const [submittingEdit, setSubmittingEdit] = useState(false);
 
@@ -92,12 +116,8 @@ export function RunViewerScreen({ workspaceId, runId }: RunViewerScreenProps) {
         reportId,
       });
       loaded.current = true;
-      if (isTerminalRunStatus(response.run.status)) {
-        stopPolling.current = true;
-      }
       // FEAT-018 auto-navigate: a run that completed materialized a report, and the viewer follows
-      // the user there (screens/08-run-viewer.md Data Flow step 4). No report_id yet (running, or a
-      // test double without the reports seam) → stay and keep showing live state.
+      // the user there.
       if (
         response.run.status === RunStatus.Complete &&
         reportId &&
@@ -107,11 +127,7 @@ export function RunViewerScreen({ workspaceId, runId }: RunViewerScreenProps) {
         router.push(routes.report(workspaceId, reportId));
       }
     } catch (error) {
-      // A failed poll after a successful load is a transient hiccup between polls: keep the
-      // last-known state on screen and let the next interval retry, rather than flashing the error
-      // state or freezing the view.
       if (loaded.current) return;
-      stopPolling.current = true;
       const message =
         error instanceof ApiError
           ? error.message
@@ -120,8 +136,8 @@ export function RunViewerScreen({ workspaceId, runId }: RunViewerScreenProps) {
     }
   }, [router, workspaceId, runId]);
 
-  // FEAT-018: "Run edited query" starts a NEW run seeded with the edited SQL (IMPLEMENTATION.md's
-  // Phase 2 boundary) and hands the user to its viewer. The current run is never mutated.
+  // FEAT-018: "Run edited query" starts a NEW run seeded with the edited SQL and hands the user to
+  // its viewer. The current run is never mutated.
   const handleRunEdited = useCallback(
     async (sql: string) => {
       const trimmed = sql.trim();
@@ -137,8 +153,8 @@ export function RunViewerScreen({ workspaceId, runId }: RunViewerScreenProps) {
         );
         router.push(routes.run(workspaceId, nextRun.id));
       } catch {
-        // A failed submission leaves the user on the viewer with the edit intact; the server's
-        // 4xx body would otherwise be surfaced by a dedicated error surface in a later wave.
+        // A failed submission leaves the user on the viewer with the edit intact; the server's 4xx
+        // body would otherwise be surfaced by a dedicated error surface in a later wave.
       } finally {
         setSubmittingEdit(false);
       }
@@ -146,20 +162,97 @@ export function RunViewerScreen({ workspaceId, runId }: RunViewerScreenProps) {
     [router, workspaceId, state],
   );
 
+  // Apply one live event to the loaded state. Runs resolve to per-step upserts by step name, so an
+  // out-of-order or duplicated event never double-counts a transition.
+  const applyStreamEvent = useCallback(
+    (ev: StreamEvent) => {
+      switch (ev.type) {
+        case "run.status": {
+          const status = ev.status;
+          if (!status) return;
+          setState((prev) =>
+            prev.status === "loaded" && prev.run.status !== status
+              ? { ...prev, run: { ...prev.run, status } }
+              : prev,
+          );
+          // On completion, refresh once to pick up the materialized report_id and auto-navigate.
+          if (status === RunStatus.Complete) void load();
+          break;
+        }
+        case "cache.hit":
+          if (ev.cached_run_id) setCachedFrom(ev.cached_run_id);
+          break;
+        case "step.started":
+        case "step.completed":
+        case "step.failed":
+        case "step.halted": {
+          if (!ev.step_name || !ev.step_status) return;
+          const name = ev.step_name;
+          setState((prev) => {
+            if (prev.status !== "loaded") return prev;
+            const existing = prev.steps.find((s) => s.step_name === name);
+            if (existing) {
+              return {
+                ...prev,
+                steps: prev.steps.map((s) =>
+                  s.step_name === name
+                    ? { ...s, status: ev.step_status!, output: ev.output ?? s.output }
+                    : s,
+                ),
+              };
+            }
+            return {
+              ...prev,
+              steps: [
+                ...prev.steps,
+                {
+                  id: ev.step_id || `${prev.run.id}:${name}`,
+                  run_id: prev.run.id,
+                  step_name: name,
+                  status: ev.step_status!,
+                  output: ev.output || undefined,
+                  idempotency_key: "",
+                } as Step,
+              ],
+            };
+          });
+          break;
+        }
+        default:
+          break;
+      }
+    },
+    [load],
+  );
+
   useEffect(() => {
-    stopPolling.current = false;
     loaded.current = false;
     navigatedToReport.current = false;
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setCachedFrom(null);
     // Mount-triggered async fetch; see WorkspaceHomeScreen.tsx for why this eslint rule is
     // suppressed here.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     void load();
 
-    const interval = setInterval(() => {
-      if (!stopPolling.current) void load();
-    }, RUN_POLL_INTERVAL_MS);
-    return () => clearInterval(interval);
-  }, [load]);
+    // Live stream (FEAT-023). EventSource auto-reconnects on error; the server sends stream.end
+    // after the run reaches a terminal state, and each run.status event also lets us stop watching.
+    const unsubscribe = subscribeToStream(
+      `/v1/workspaces/${workspaceId}/runs/${runId}/stream`,
+      {
+        onMessage: (data) => {
+          try {
+            applyStreamEvent(JSON.parse(data) as StreamEvent);
+          } catch {
+            // Ignore a malformed message; the stream re-runs on the next reconnect.
+          }
+        },
+        onError: () => {
+          // EventSource reconnects automatically; the durable GET remains the source of truth.
+        },
+      },
+    );
+    return () => unsubscribe();
+  }, [workspaceId, runId, load, applyStreamEvent]);
 
   if (state.status === "error") {
     return (
@@ -167,7 +260,8 @@ export function RunViewerScreen({ workspaceId, runId }: RunViewerScreenProps) {
         <ErrorState
           description={state.message}
           onRetry={() => {
-            stopPolling.current = false;
+            loaded.current = false;
+            setCachedFrom(null);
             void load();
           }}
           onGoBack={() => router.push(routes.workspace(workspaceId))}
@@ -191,9 +285,8 @@ export function RunViewerScreen({ workspaceId, runId }: RunViewerScreenProps) {
   const runPill = run ? runStatusPill(run.status) : null;
   const question = run?.question_text ?? "";
 
-  // Phase 2 form of the Clarification Needed state (screens/08): the plan step completed saying the
-  // question is not answerable, so the run failed — surface the reason as a banner, since no step
-  // row carries a failure message.
+  // Phase 2 form of the Clarification Needed state: the plan step completed saying the question is
+  // not answerable, so the run failed — surface the reason as a banner.
   const notAnswerable =
     run?.status === RunStatus.Failed &&
     plan !== null &&
@@ -237,6 +330,20 @@ export function RunViewerScreen({ workspaceId, runId }: RunViewerScreenProps) {
         </p>
       )}
 
+      {cachedFrom && (
+        <div
+          role="status"
+          className="mb-4 flex items-center gap-2 rounded-md border border-provenance bg-provenance/12 p-3 text-body-small text-text-primary"
+        >
+          <Sparkles size={16} className="shrink-0 text-provenance" aria-hidden="true" />
+          <p>
+            Answered instantly from a prior identical run
+            {cachedFrom ? <span className="text-provenance"> (cached from run {cachedFrom.slice(0, 8)}…)</span> : null}.
+            This is a replayed answer, not freshly computed.
+          </p>
+        </div>
+      )}
+
       {reportId && run?.status === RunStatus.Complete && (
         <Link
           href={routes.report(workspaceId, reportId)}
@@ -277,11 +384,9 @@ export function RunViewerScreen({ workspaceId, runId }: RunViewerScreenProps) {
             />
           </Card>
 
-          {/* Screen 15's entry point (screens/15-semantic-layer.md): "Run Viewer — link after a
-              correction is saved during a run." A seeded run produced by "Run edited query" has no
-              plan step (FEAT-018's path) and generated SQL — that is exactly a run whose edited
-              query was captured as a durable correction (FEAT-020), so the Corrections tab is the
-              next stop. */}
+          {/* Screen 15's entry point: "Run Viewer — link after a correction is saved during a run." A
+              seeded run produced by "Run edited query" has no plan step (FEAT-018) and generated SQL —
+              that is exactly a run whose edited query was captured as a durable correction (FEAT-020). */}
           {run && !planStep && generateSQL && (
             <Link
               href={routes.semanticLayer(workspaceId)}
