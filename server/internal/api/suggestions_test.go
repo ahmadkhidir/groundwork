@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -42,20 +43,27 @@ func (f *fakeSuggestionSource) Metrics(_ context.Context, _ string) ([]domain.Me
 }
 
 // newTestSuggestionsRouter mirrors RegisterSuggestionRoutes' wiring without api.go's Dependencies.
-// engine/model nil by default — the smart route is registered only when both are wired.
+// engine/model/objects nil by default — the smart route is registered only when all are wired.
 func newTestSuggestionsRouter(workspaces WorkspaceStore, members MemberLookupStore, source SuggestionSource) http.Handler {
-	return newTestSuggestionsRouterWithSmart(workspaces, members, source, nil, nil, newFakeUserTierLookup())
+	return newTestSuggestionsRouterWithSmart(workspaces, members, source, nil, nil, nil, newFakeUserTierLookup())
 }
 
-func newTestSuggestionsRouterWithSmart(workspaces WorkspaceStore, members MemberLookupStore, source SuggestionSource, engineProvider SuggestionEngineProvider, modelClient SmartSuggestionModel, users UserTierLookup) http.Handler {
+func newTestSuggestionsRouterWithSmart(workspaces WorkspaceStore, members MemberLookupStore, source SuggestionSource, engineProvider SuggestionEngineProvider, modelClient SmartSuggestionModel, objects ObjectGetter, users UserTierLookup) http.Handler {
 	r := chi.NewRouter()
 	r.Route("/v1", func(r chi.Router) {
 		r.Group(func(r chi.Router) {
 			r.Use(authsession.RequireAuth(testAuthSecret))
-			RegisterSuggestionRoutes(r, workspaces, members, users, source, engineProvider, modelClient, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			RegisterSuggestionRoutes(r, workspaces, members, users, source, engineProvider, modelClient, objects, slog.New(slog.NewTextHandler(io.Discard, nil)))
 		})
 	})
 	return r
+}
+
+// fakeObjectGetter returns a dummy reader for any object key.
+type fakeObjectGetter struct{}
+
+func (f *fakeObjectGetter) GetObject(_ context.Context, _ string) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader("dummy parquet bytes")), nil
 }
 
 func TestListSuggestionsServesDeterministicMetadataOnlyQuestions(t *testing.T) {
@@ -179,7 +187,7 @@ func TestSmartSuggestionsRejectsFreeTierBeforeAnyWork(t *testing.T) {
 	users := newFakeUserTierLookup() // defaults to Free
 	engineProvider := &fakeSmartEngine{}
 	modelClient := &fakeSmartModel{text: `["What is the total amount?"]`}
-	router := newTestSuggestionsRouterWithSmart(workspaces, newFakeMemberLookupStore(), &fakeSuggestionSource{}, engineProvider, modelClient, users)
+	router := newTestSuggestionsRouterWithSmart(workspaces, newFakeMemberLookupStore(), &fakeSuggestionSource{}, engineProvider, modelClient, &fakeObjectGetter{}, users)
 
 	req := authedRequest(t, http.MethodPost, "/v1/workspaces/ws-1/suggestions/smart", nil, "user-1", domain.TierFree)
 	rec := httptest.NewRecorder()
@@ -210,7 +218,7 @@ func TestSmartSuggestionsGeneratesForProUser(t *testing.T) {
 			{ID: "c-2", DatasetID: "ds-1", Name: "customer_id", InferredType: domain.TypeString},
 		},
 	}
-	router := newTestSuggestionsRouterWithSmart(workspaces, newFakeMemberLookupStore(), src, engineProvider, modelClient, users)
+	router := newTestSuggestionsRouterWithSmart(workspaces, newFakeMemberLookupStore(), src, engineProvider, modelClient, &fakeObjectGetter{}, users)
 
 	req := authedRequest(t, http.MethodPost, "/v1/workspaces/ws-1/suggestions/smart", nil, "user-1", domain.TierPro)
 	rec := httptest.NewRecorder()
@@ -245,7 +253,7 @@ func TestSmartSuggestionsSurfacesEngineUnavailable(t *testing.T) {
 	users := newFakeUserTierLookup()
 	users.tiers["user-1"] = domain.TierTeam
 	engineProvider := &fakeSmartEngine{err: engine.ErrEngineUnavailable}
-	router := newTestSuggestionsRouterWithSmart(workspaces, newFakeMemberLookupStore(), &fakeSuggestionSource{}, engineProvider, &fakeSmartModel{}, users)
+	router := newTestSuggestionsRouterWithSmart(workspaces, newFakeMemberLookupStore(), &fakeSuggestionSource{}, engineProvider, &fakeSmartModel{}, &fakeObjectGetter{}, users)
 
 	req := authedRequest(t, http.MethodPost, "/v1/workspaces/ws-1/suggestions/smart", nil, "user-1", domain.TierTeam)
 	rec := httptest.NewRecorder()
@@ -265,7 +273,7 @@ func TestSmartSuggestionsSurfacesModelFailure(t *testing.T) {
 	router := newTestSuggestionsRouterWithSmart(workspaces, newFakeMemberLookupStore(), &fakeSuggestionSource{
 		datasets: []domain.Dataset{{ID: "ds-1", OriginalFilename: "x.csv", IngestStatus: domain.IngestComplete}},
 		columns:  []domain.Column{{ID: "c-1", DatasetID: "ds-1", Name: "amount", InferredType: domain.TypeNumber}},
-	}, &fakeSmartEngine{}, modelClient, users)
+	}, &fakeSmartEngine{}, modelClient, &fakeObjectGetter{}, users)
 
 	req := authedRequest(t, http.MethodPost, "/v1/workspaces/ws-1/suggestions/smart", nil, "user-1", domain.TierPro)
 	rec := httptest.NewRecorder()

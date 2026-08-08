@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"net/http"
 
@@ -13,6 +14,13 @@ import (
 	"github.com/ahmadkhidir/groundwork/server/internal/run"
 	"github.com/ahmadkhidir/groundwork/server/internal/suggestions"
 )
+
+// ObjectGetter downloads an object's bytes, satisfied by internal/storage.Client. The smart
+// generation handler needs it to attach the engine views it profiles (run.PrepareViews downloads
+// each dataset's normalized Parquet to a temp file first).
+type ObjectGetter interface {
+	GetObject(ctx context.Context, key string) (io.ReadCloser, error)
+}
 
 // SuggestionSource is the persistence seam GET /workspaces/:id/suggestions depends on — the same
 // four listers suggestions.Generate reads, satisfied by the postgres repositories. Defined here
@@ -42,11 +50,11 @@ type SuggestionEngineProvider interface {
 
 // RegisterSuggestionRoutes wires FEAT-050's deterministic read and FEAT-051's smart-generation
 // endpoint onto r. The smart endpoint is registered only when every collaborator it needs is
-// wired (users, engine, model) — otherwise only the deterministic strip exists.
-func RegisterSuggestionRoutes(r chi.Router, workspaces WorkspaceStore, members MemberLookupStore, users UserTierLookup, source SuggestionSource, engineProvider SuggestionEngineProvider, modelClient SmartSuggestionModel, logger *slog.Logger) {
+// wired (users, engine, model, objects) — otherwise only the deterministic strip exists.
+func RegisterSuggestionRoutes(r chi.Router, workspaces WorkspaceStore, members MemberLookupStore, users UserTierLookup, source SuggestionSource, engineProvider SuggestionEngineProvider, modelClient SmartSuggestionModel, objects ObjectGetter, logger *slog.Logger) {
 	r.Get("/workspaces/{workspaceId}/suggestions", handleListSuggestions(workspaces, members, source, logger))
-	if users != nil && engineProvider != nil && modelClient != nil {
-		r.Post("/workspaces/{workspaceId}/suggestions/smart", handleSmartSuggestions(workspaces, members, users, source, engineProvider, modelClient, logger))
+	if users != nil && engineProvider != nil && modelClient != nil && objects != nil {
+		r.Post("/workspaces/{workspaceId}/suggestions/smart", handleSmartSuggestions(workspaces, members, users, source, engineProvider, modelClient, objects, logger))
 	}
 }
 
@@ -96,6 +104,7 @@ func handleSmartSuggestions(
 	source SuggestionSource,
 	engineProvider SuggestionEngineProvider,
 	modelClient SmartSuggestionModel,
+	objects ObjectGetter,
 	logger *slog.Logger,
 ) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -155,7 +164,9 @@ func handleSmartSuggestions(
 			return
 		}
 
-		// Wake → profile (FEAT-051's honest latency: the engine must actually run queries).
+		// Wake → attach the dataset views → profile (FEAT-051's honest latency: the engine must
+		// actually run queries). Engine views are session-scoped and reference temp files, so they
+		// are created here (idempotently) and their temp files cleaned up after profiling.
 		handle, err := engineProvider.Acquire(r.Context(), workspaceID)
 		if err != nil {
 			if err == engine.ErrEngineUnavailable {
@@ -169,7 +180,20 @@ func handleSmartSuggestions(
 			respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "Something went wrong. Try again.", "code": "internal_error"})
 			return
 		}
+		cleanups, viewErr := run.PrepareViews(r.Context(), handle, workspaceID, datasets, objects)
+		if viewErr != nil {
+			releaseErr := engineProvider.Release(handle)
+			if releaseErr != nil {
+				logger.Error("releasing engine after view attach failure", slog.String("error", releaseErr.Error()))
+			}
+			logger.Error("attaching engine views for smart suggestions", slog.String("error", viewErr.Error()))
+			respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "Something went wrong. Try again.", "code": "internal_error"})
+			return
+		}
 		profiles, profileErr := suggestions.Profile(r.Context(), handle, datasets, columns)
+		for _, done := range cleanups {
+			done()
+		}
 		releaseErr := engineProvider.Release(handle)
 		if profileErr != nil {
 			logger.Error("profiling for smart suggestions", slog.String("error", profileErr.Error()))

@@ -107,6 +107,9 @@ type Dependencies struct {
 	// and only the deterministic strip exists.
 	SuggestionEngine SuggestionEngineProvider
 	SuggestionModel  SmartSuggestionModel
+	// SuggestionObjects downloads a workspace's normalized Parquet so the smart-generation handler
+	// can attach the engine views it profiles (FEAT-051). Satisfied by storage.Client.
+	SuggestionObjects ObjectGetter
 
 	// Datasets... below back FEAT-048 (Single-Dataset Deletion) — screens/04-workspace-home.md's
 	// Datasets panel and the shared Delete Confirmation Modal's data source — and FEAT-049's
@@ -359,7 +362,7 @@ func (s *Server) routes() {
 				// plus the Pro/Team-gated smart generation (engine profile + one model call).
 				if s.deps.Suggestions != nil {
 					RegisterSuggestionRoutes(r, s.deps.Workspaces, s.deps.MemberLookup, s.deps.Users, s.deps.Suggestions,
-						s.deps.SuggestionEngine, s.deps.SuggestionModel, s.logger)
+						s.deps.SuggestionEngine, s.deps.SuggestionModel, s.deps.SuggestionObjects, s.logger)
 				}
 
 				// FEAT-013: ask-a-question run lifecycle — create a run and watch it execute.

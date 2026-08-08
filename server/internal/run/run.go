@@ -1271,12 +1271,22 @@ func (e *Executor) prepareViews(ctx context.Context, handle engine.Handle, works
 	if err != nil {
 		return nil, fmt.Errorf("listing datasets for views: %w", err)
 	}
+	return PrepareViews(ctx, handle, workspaceID, datasets, e.objects)
+}
 
+// PrepareViews is the exported form of the executor's view-attachment step: download every complete
+// dataset's normalized Parquet to a temp file and CREATE OR REPLACE VIEW it under the canonical
+// table name, so any engine-handle consumer outside a run (FEAT-051's smart-generation profiling)
+// queries the same views the executor teaches the model.
+//
+// Views are session-scoped and reference the downloaded temp files, so callers MUST run the
+// returned cleanups once profiling is done. CREATE OR REPLACE makes re-attachment idempotent.
+func PrepareViews(ctx context.Context, handle engine.Handle, workspaceID string, datasets []domain.Dataset, objects ObjectStore) (cleanups []func(), err error) {
 	for _, ds := range datasets {
 		if ds.IngestStatus != domain.IngestComplete {
 			continue
 		}
-		path, cleanup, err := e.downloadToTemp(ctx, storage.NormalizedDatasetKey(workspaceID, ds.ID), ".parquet")
+		path, cleanup, err := downloadToTemp(ctx, objects, storage.NormalizedDatasetKey(workspaceID, ds.ID), ".parquet")
 		if err != nil {
 			// Run the cleanups accumulated so far so a partial failure does not litter temp files.
 			for _, done := range cleanups {
@@ -1303,8 +1313,8 @@ func (e *Executor) prepareViews(ctx context.Context, handle engine.Handle, works
 
 // downloadToTemp copies object key into a fresh temp file and returns its path and a cleanup func
 // that closes and removes it. Mirrors the ingest pipeline's private helper (see prepareViews's doc).
-func (e *Executor) downloadToTemp(ctx context.Context, key, ext string) (string, func(), error) {
-	reader, err := e.objects.GetObject(ctx, key)
+func downloadToTemp(ctx context.Context, objects ObjectStore, key, ext string) (string, func(), error) {
+	reader, err := objects.GetObject(ctx, key)
 	if err != nil {
 		return "", nil, fmt.Errorf("downloading %s: %w", key, err)
 	}

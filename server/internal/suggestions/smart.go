@@ -139,13 +139,23 @@ func Profile(ctx context.Context, h profiler, datasets []domain.Dataset, columns
 }
 
 // ParseModelResponse parses FEAT-051's model output: a JSON array of suggestion strings. It
+// tolerates markdown code fences the model sometimes wraps the JSON in (```json ... ```), and
 // enforces the "never invent entities" rule by rejecting any suggestion that references no known
 // safe entity (a safe column name or a defined metric name) — the same candidate-set discipline
 // FEAT-050's automated test applies, now applied to the model's output.
 func ParseModelResponse(text string, safeColumnNames []string, metricNames []string) ([]string, error) {
 	var suggestions []string
 	if err := json.Unmarshal([]byte(strings.TrimSpace(text)), &suggestions); err != nil {
-		return nil, fmt.Errorf("parsing smart suggestion response: %w", err)
+		// The model occasionally wraps the array in markdown fences; strip a ```json ... ```
+		// (or ``` ... ```) block and retry before giving up.
+		if fenced := stripCodeFence(text); fenced != "" {
+			if err2 := json.Unmarshal([]byte(fenced), &suggestions); err2 == nil {
+				err = nil
+			}
+		}
+		if err != nil {
+			return nil, fmt.Errorf("parsing smart suggestion response: %w", err)
+		}
 	}
 
 	known := make(map[string]bool)
@@ -185,6 +195,25 @@ func ParseModelResponse(text string, safeColumnNames []string, metricNames []str
 		out = out[:maxSuggestions]
 	}
 	return out, nil
+}
+
+// stripCodeFence extracts the content of a ```lang ... ``` or ``` ... ``` fenced block, or returns
+// "" when the text is not fenced. Fences are the model's most common JSON-wrapping habit; without
+// this, a fenced response is unparseable even though its content is valid JSON.
+func stripCodeFence(text string) string {
+	s := strings.TrimSpace(text)
+	if !strings.HasPrefix(s, "```") {
+		return ""
+	}
+	first := strings.Index(s, "\n")
+	if first < 0 {
+		return ""
+	}
+	last := strings.LastIndex(s, "```")
+	if last <= first {
+		return ""
+	}
+	return strings.TrimSpace(s[first+1 : last])
 }
 
 // normalizeEntity lowercases and collapses separators so entity matching is case/underscore-robust.

@@ -113,6 +113,17 @@ func TestParseModelResponseRejectsGarbage(t *testing.T) {
 	}
 }
 
+func TestParseModelResponseToleratesMarkdownFences(t *testing.T) {
+	text := "```json\n[\"What is the total total amount?\", \"What are the most common customer id values?\"]\n```"
+	got, err := ParseModelResponse(text, []string{"total_amount", "customer_id"}, nil)
+	if err != nil {
+		t.Fatalf("ParseModelResponse() error = %v on a fenced response", err)
+	}
+	if len(got) != 2 {
+		t.Errorf("got %v, want both fenced questions", got)
+	}
+}
+
 func TestProfileSurfacesQueryError(t *testing.T) {
 	h := &fakeProfiler{err: errors.New("engine query failed")}
 	_, err := Profile(context.Background(), h,

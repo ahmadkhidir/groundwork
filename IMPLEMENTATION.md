@@ -1110,6 +1110,25 @@ Both shipped in one slice, FEAT-050 first. Verification: server `make vet` + `ma
 - **Model package extension:** `Payload` gains a third sealed constructor (`BuildSuggestionsPayload`) and a `suggestions` wire task — still the only path to `Client.Complete`, so R-016's type-level enforcement holds for the new call.
 - **Live verification:** FEAT-050 fully green end to end (strip renders 9 chips, PII column never referenced, click fills input, no overflow, light+dark). FEAT-051's live check exercised the real engine/model path and verified the honest-failure ACs (button → in-flight → error → deterministic strip intact); the seeded verification dataset had no engine view (it bypassed ingest), so the success path is pinned by unit tests rather than a live model call — in production every complete dataset's view exists because ingest created it.
 - **`run.TableNameForDataset`** exported so profiling queries the exact views the executor teaches the model.
+
+**Follow-up (committed after FEAT-051): smart generation now attaches the engine views it profiles.**
+The smart handler no longer assumes a freshly acquired engine session can see the workspace's
+dataset views (engine views are session-scoped and reference temp files). `handleSmartSuggestions`
+downloads every complete dataset's normalized Parquet via the new `run.PrepareViews` — the executor's
+own view-attachment step, exported (and `downloadToTemp` refactored to a package function) so any
+engine-handle consumer outside a run attaches the same canonical views the model is taught — then
+profiles and cleans the temp files up immediately after (idempotent via `CREATE OR REPLACE VIEW`).
+This closes the original note's "seeded verification dataset had no engine view" limitation: the
+success path works for any complete dataset, not only ones whose views a long-lived engine session
+happens to hold. `ParseModelResponse` additionally tolerates the model wrapping the JSON array in
+markdown code fences (json-fenced or plain), retrying the parse on the fenced content before giving
+up (`stripCodeFence`, pinned by a new test). The smart route now registers only when the object
+getter is wired too, guarded in `RegisterSuggestionRoutes` like engine/model. Verification: server
+`make vet` + `make test` (all packages) + `make build` + `gofmt -l` clean; web `tsc --noEmit` +
+`eslint` + `vitest run` 326/326 + `next build` green (the one vitest failure in the first run was
+CPU contention from running the cgo-heavy Go suite concurrently; the file passes in isolation and
+the full suite is green alone). Also in this wave: a dev-only `allowedDevOrigins` entry
+(`192.168.0.111`) in `web/next.config.ts` for LAN-device verification of the mobile UI.
 | ~~**FEAT-007's "name-and-type-only exposure to the model" has NO ENFORCEMENT POINT**~~ — **Closed in Phase 2 Wave 2 (FEAT-013)** | Detection, user override, `pii_reviewed_at`, and the `pii_override` audit entry made a reviewed-and-cleared column distinguishable from a never-flagged one; FEAT-013 (this wave) made `pii_flag`/`excluded_from_model` govern egress at runtime by routing every model call through the one shared `model.BuildPayload` → `model.Client.Complete` seam, which reduces any flagged/excluded column to name-and-type only. The old gap text ("no payload builder exists until FEAT-013") no longer holds: `internal/model/payload_test.go` pins the wire-level filter and `client_test.go` pins egress-before-call (fail-closed), closing `risk_log.md` R-016. | **done** |
 | **FEAT-009's accepted joins land directly in `relationships`, not a full semantic layer** | FEAT-019 (Semantic Layer Storage — listing, editing, using relationships as query-planning grounding) is Phase 2 and not authorized this wave. `internal/store/postgres.RelationshipRepository` is deliberately `Create`-only; there is no read/update/delete surface, and no UI beyond ingest confirmation shows a relationship once created. This is intentional under-scoping, not a gap. | FEAT-019 (Phase 2) |
 | **Rejected-join resurrection is guarded by (dataset filename, column name), not a content hash** | `CandidateJoinRepository.ExistsRejectedForNamePair` matches on original filename + column name, since nothing in `docs/` defines a stronger notion of "the same file" across re-ingests. Renaming a file, or uploading a genuinely different file that happens to share both a name and a column name, are both outside this heuristic's guarantee. Verified live against a real re-ingest (see Wave 5's report) that the literal scenario in FEAT-009's acceptance criterion works. | Product (if a stronger identity is wanted) |

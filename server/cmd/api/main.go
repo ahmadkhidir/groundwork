@@ -234,8 +234,9 @@ func run(logger *slog.Logger) error {
 			relationships: relationshipRepo,
 			metrics:       metricDefinitionRepo,
 		},
-		SuggestionEngine: engineProvider,
-		SuggestionModel:  modelClient,
+		SuggestionEngine:  engineProvider,
+		SuggestionModel:   modelClient,
+		SuggestionObjects: objectStore,
 
 		// FEAT-048 (single-dataset deletion) and FEAT-049 (duplicate-filename detection). Same
 		// datasetRepo/relationshipRepo/objectStore/auditWriter instances as above, satisfying the
