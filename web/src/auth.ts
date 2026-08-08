@@ -1,6 +1,9 @@
 import NextAuth, { type DefaultSession } from "next-auth";
 import Credentials from "next-auth/providers/credentials";
+import { cookies } from "next/headers";
+import type { JWT } from "@auth/core/jwt";
 import { routes } from "@/lib/routes";
+import { isTierStale, refreshSessionTier } from "@/lib/session-tier";
 import type { SubscriptionTier, User as GroundworkUser } from "@/types/schema";
 
 /**
@@ -45,6 +48,8 @@ declare module "@auth/core/jwt" {
   interface JWT {
     id: string;
     tier: SubscriptionTier;
+    /** Epoch ms when the tier claim was last read from the Go API. Absent on pre-deploy tokens. */
+    tierCheckedAt?: number;
   }
 }
 
@@ -55,6 +60,46 @@ interface LoginResponse {
 
 const API_BASE_URL =
   process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8080";
+
+/**
+ * Keeps the session's display tier claim honest after server-side plan changes.
+ *
+ * The claim is set at sign-in from the login response; a Stripe webhook can change the
+ * authoritative tier in the Go DB at any later moment (upgrade, downgrade, cancellation), and
+ * nothing would update the JWT — so a paid account would keep rendering Free-tier upgrade prompts
+ * until the user signed out and back in. This re-reads the authoritative plan on a TTL
+ * (SESSION_TIER_REFRESH_MS, see lib/session-tier.ts) and updates the claim in place; @auth/core
+ * re-encodes and re-sets the cookie from whatever this returns (session.js).
+ *
+ * Display-only and fail-soft by design: the Go API re-checks entitlement on every gated action, so
+ * a stale or failed refresh is a cosmetic staleness, never a security boundary.
+ */
+async function refreshTierClaim(token: JWT): Promise<JWT> {
+  // Middleware (proxy.ts) runs in the Edge runtime where next/headers has no request scope; the
+  // existing claim is correct enough for an optimistic gate there. Server components and route
+  // handlers (node runtime, request scope) are where the refresh happens.
+  if (process.env.NEXT_RUNTIME === "edge") return token;
+
+  if (!isTierStale(token.tierCheckedAt, Date.now())) return token;
+
+  // Stamp BEFORE the fetch: a slow or unreachable API must not make every request await a network
+  // call, and a failed refresh keeps the existing claim for another window.
+  token.tierCheckedAt = Date.now();
+
+  try {
+    const cookieStore = await cookies();
+    const freshTier = await refreshSessionTier(cookieStore.toString());
+    if (freshTier !== null) {
+      token.tier = freshTier;
+    }
+  } catch {
+    // Never throw from the jwt callback: @auth/core's session action destroys the session cookie
+    // when the callback throws (session.js), which would sign the user out over a display-only
+    // refresh.
+  }
+
+  return token;
+}
 
 export const { handlers, auth, signIn, signOut } = NextAuth({
   session: { strategy: "jwt" },
@@ -113,15 +158,17 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
   ],
 
   callbacks: {
-    /** Copies the app-specific fields onto the token at sign-in. */
-    jwt({ token, user }) {
+    /** Copies the app-specific fields onto the token at sign-in, and keeps the tier claim honest after. */
+    jwt: async ({ token, user }) => {
       // `user` is present only on the sign-in pass; on later calls the token already carries these.
       // Auth.js types `user.id` as optional to accommodate adapter flows, hence the explicit guard.
       if (user?.id) {
         token.id = user.id;
         token.tier = user.tier;
+        token.tierCheckedAt = Date.now();
+        return token;
       }
-      return token;
+      return refreshTierClaim(token);
     },
 
     /** Projects the token onto the session object components consume. */
