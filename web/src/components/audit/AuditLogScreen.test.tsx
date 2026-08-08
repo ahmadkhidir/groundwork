@@ -96,6 +96,48 @@ describe("AuditLogScreen", () => {
     );
   });
 
+  it("lets a long payload scroll inside its cell instead of blowing the web table out (table-fixed)", async () => {
+    // The user-reported shape: a model-call payload whose prior_context is one very long unbroken
+    // line. With default table-auto layout the column would size to that line's min-content width
+    // and push the page wide; fixed layout constrains the column and the payload's own
+    // overflow-auto scrolls inside the cell.
+    const longPayload = JSON.stringify({
+      question: "show the customers base on their total transactions",
+      prior_context:
+        "The user clarified Do you want to rank/order customers by their total transaction count, total transaction amount, or both? And should the output be sorted in descending order (highest first)? with: By total transaction amount (sum).",
+      tables: [
+        {
+          name: "dataset_data_xlsx_878f6acb",
+          columns: [
+            { name: "CUSTOMER_NAME", type: "VARCHAR" },
+            { name: "TRXN_AMT", type: "DOUBLE" },
+          ],
+        },
+      ],
+    });
+    getMock.mockResolvedValue({
+      entries: [{ ...modelCallEntry, payload_sent_to_model: longPayload }],
+      next_cursor: "",
+    });
+    const { container } = render(<AuditLogScreen workspaceId="ws-1" />);
+    await waitFor(() => expect(screen.getAllByText("Model Call").length).toBeGreaterThan(0));
+
+    const table = container.querySelector("table");
+    expect(table?.className).toContain("table-fixed");
+    // Header widths exist so fixed layout keeps sensible proportions rather than equal columns.
+    const headers = table?.querySelectorAll("th");
+    expect(headers?.length).toBe(4);
+    expect(headers?.[0].className).toContain("w-[30%]");
+
+    // Expand the web table row (its <tr> carries the toggle) and confirm the payload surface
+    // scrolls within its own bounds — never widens the page.
+    const webRow = table?.querySelector("tr[aria-expanded]");
+    if (webRow) await userEvent.click(webRow);
+    await waitFor(() => expect(table?.querySelector("pre")).not.toBeNull());
+    const pre = table?.querySelector("pre");
+    expect(pre?.className).toContain("overflow-auto");
+  });
+
   it("shows 'No model payload' for a non-model_call entry's detail", async () => {
     getMock.mockResolvedValue({ entries: [workspaceEntry], next_cursor: "" });
     render(<AuditLogScreen workspaceId="ws-1" />);

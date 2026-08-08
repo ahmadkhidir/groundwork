@@ -483,7 +483,10 @@ export function RunViewerScreen({ workspaceId, runId }: RunViewerScreenProps) {
         </div>
       )}
 
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-[1fr_1.5fr]">
+      {/* minmax(0, …) tracks are load-bearing: a `1fr` track defaults to minmax(auto, 1fr), whose
+          minimum is the content's min-content width — a long one-line generated SQL would blow the
+          page out horizontally instead of letting the code block's own overflow-x-auto engage. */}
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.5fr)]">
         <Card>
           <CardHeader
             title="Steps"

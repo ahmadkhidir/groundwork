@@ -120,6 +120,27 @@ describe("RunViewerScreen", () => {
     expect(screen.getByText("1 row")).toBeInTheDocument();
   });
 
+  it("lets the generated SQL scroll inside its own block instead of blowing the page out (0-min grid tracks)", async () => {
+    // A long one-line query must not widen the page: the two-column grid uses minmax(0, …) tracks
+    // so the code block's own overflow-x-auto engages, and the <pre> is itself scrollable.
+    getMock.mockResolvedValue({
+      run: run("complete"),
+      steps: completeRunSteps(),
+    });
+    const { container } = render(<RunViewerScreen workspaceId="ws-1" runId="run-1" />);
+    await screen.findByText("How many customers per region?");
+
+    const grid = container.querySelector<HTMLElement>(".grid");
+    expect(grid?.className).toContain("lg:grid-cols-[minmax(0,1fr)_minmax(0,1.5fr)]");
+    expect(grid?.className).not.toContain("lg:grid-cols-[1fr_1.5fr]");
+
+    const codeBlock = screen.getAllByTestId("code-block")[0];
+    expect(codeBlock?.className).toContain("overflow-x-auto");
+    // The pre scrolls; the inner code keeps the unbroken line (no wrapping) inside that scroll.
+    const code = codeBlock?.querySelector("code");
+    expect(code?.className).toContain("whitespace-pre");
+  });
+
   it("shows the waking notice while the engine is waking, before steps begin", async () => {
     getMock.mockResolvedValue({ run: run("waking"), steps: [] });
     render(<RunViewerScreen workspaceId="ws-1" runId="run-1" />);

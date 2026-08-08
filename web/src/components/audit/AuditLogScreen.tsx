@@ -171,13 +171,18 @@ export function AuditLogScreen({ workspaceId }: AuditLogScreenProps) {
             </div>
 
             <div className="hidden sm:block">
-              <table className="w-full border-collapse">
+              {/* table-fixed is load-bearing: with the default table-auto layout a column is sized
+                  by its content's min-content width, so a long unbroken JSON line in an expanded
+                  model-call payload would blow the table (and the page) out horizontally. Fixed
+                  layout takes column widths from the header row and lets the payload's own
+                  overflow-auto scroll inside its cell. */}
+              <table className="w-full border-collapse table-fixed">
                 <thead>
                   <tr className="border-b border-border text-left text-caption uppercase tracking-wide text-text-secondary">
-                    <th className="px-2 py-2 font-medium">Timestamp</th>
-                    <th className="px-2 py-2 font-medium">User</th>
-                    <th className="px-2 py-2 font-medium">Action</th>
-                    <th className="px-2 py-2 font-medium">Scope</th>
+                    <th className="w-[30%] px-2 py-2 font-medium">Timestamp</th>
+                    <th className="w-[25%] px-2 py-2 font-medium">User</th>
+                    <th className="w-[25%] px-2 py-2 font-medium">Action</th>
+                    <th className="w-[20%] px-2 py-2 font-medium">Scope</th>
                   </tr>
                 </thead>
                 <tbody>

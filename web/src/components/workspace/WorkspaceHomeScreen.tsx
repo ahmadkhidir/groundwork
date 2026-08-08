@@ -202,7 +202,10 @@ export function WorkspaceHomeScreen({ workspaceId }: WorkspaceHomeScreenProps) {
         </div>
       )}
 
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-[2fr_1fr]">
+      {/* minmax(0, …) tracks: a `1fr` track defaults to minmax(auto, 1fr) and refuses to shrink
+          below its content's intrinsic width — a long dataset filename or report title would blow
+          the page out horizontally instead of truncating inside its panel. */}
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
         <div>
           <h2 className="mb-2 text-h3 text-text-primary">Recent reports</h2>
           <RecentReportsPanel workspaceId={workspaceId} />
