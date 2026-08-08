@@ -1163,19 +1163,26 @@ func (e *Executor) createReport(ctx context.Context, sc stepContext, run domain.
 	return nil
 }
 
-// reportTitleMax is the plain character ceiling a derived report title is truncated to. No ellipsis
+// reportTitleMax is the character ceiling a derived report title is truncated to. No ellipsis
 // gymnastics — schema.md calls for "a short, human-readable title", and simple truncation is all
 // that adds.
 const reportTitleMax = 80
 
 // deriveReportTitle turns the question text into a short report title by collapsing whitespace and
-// truncating to the length bounded by reportTitleMax.
+// truncating to the length bounded by reportTitleMax. The truncation is at a WORD BOUNDARY: a
+// plain character cut renders "…across different player posit" — mid-word and not human-readable
+// (schema.md's phrase), so the title ends at the last space inside the ceiling. Falls back to the
+// hard cut only when the first reportTitleMax characters contain no whitespace at all (a single
+// unbroken word).
 func deriveReportTitle(question string) string {
 	title := strings.Join(strings.Fields(strings.TrimSpace(question)), " ")
-	if len(title) > reportTitleMax {
-		title = title[:reportTitleMax]
+	if len(title) <= reportTitleMax {
+		return title
 	}
-	return title
+	if cut := strings.LastIndex(title[:reportTitleMax], " "); cut > 0 {
+		return title[:cut]
+	}
+	return title[:reportTitleMax]
 }
 
 // buildPayload assembles the single shared model payload for a metadata-only step (plan,

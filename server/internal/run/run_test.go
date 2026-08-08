@@ -1142,8 +1142,9 @@ func TestMeasureRowsIn(t *testing.T) {
 	}
 }
 
-// TestDeriveReportTitle pins the title derivation: whitespace collapses and plain truncation to 80
-// characters, exactly as schema.md's "short, human-readable title" is interpreted.
+// TestDeriveReportTitle pins the title derivation: whitespace collapses, and a too-long title is
+// truncated within the 80-char ceiling at a WORD BOUNDARY — never mid-word, per schema.md's "short,
+// human-readable title" (a plain cut renders "…player posit", the regression this pins).
 func TestDeriveReportTitle(t *testing.T) {
 	if got := deriveReportTitle("How many customers per region?"); got != "How many customers per region?" {
 		t.Errorf("deriveReportTitle(short) = %q", got)
@@ -1154,6 +1155,12 @@ func TestDeriveReportTitle(t *testing.T) {
 	long := strings.Repeat("x", 100)
 	if got := deriveReportTitle(long); got != strings.Repeat("x", 80) {
 		t.Errorf("deriveReportTitle(long) length = %d, want 80", len(got))
+	}
+	// The user-visible regression: a long question must not be cut mid-word. The full question is
+	// 85 chars, so the 80-char ceiling bites; the title ends at the last space inside it.
+	real := "How do defensive actions and interceptions compare across different player positions?"
+	if got := deriveReportTitle(real); got != "How do defensive actions and interceptions compare across different player" {
+		t.Errorf("deriveReportTitle(real) = %q", got)
 	}
 }
 
