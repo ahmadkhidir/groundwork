@@ -20,6 +20,11 @@ jobs:
     name: Deploy to Fly
     needs: test
     runs-on: ubuntu-latest
+    # The deploy secrets live in the repo's "production" environment (Settings → Environments →
+    # production): FLY_API_TOKEN and NEON_DATABASE_URL. Declaring the environment here is what
+    # scopes them into `secrets.*`. Optional hardening on that environment: required reviewers
+    # (manual deploy gate) or a wait timer.
+    environment: production
     steps:
       - uses: actions/checkout@v4
 
