@@ -15,7 +15,7 @@ import { DatasetsPanel } from "./DatasetsPanel";
 import { NotificationsBell } from "@/components/notifications/NotificationsBell";
 import { api, ApiError } from "@/lib/api-client";
 import { routes } from "@/lib/routes";
-import type { Workspace } from "@/types/schema";
+import type { SubscriptionTier, Workspace } from "@/types/schema";
 
 export interface WorkspaceHomeScreenProps {
   workspaceId: string;
@@ -25,6 +25,8 @@ export interface WorkspaceHomeScreenProps {
    * server remains authoritative for every mutation.
    */
   userId?: string;
+  /** The user's tier for DISPLAY — gates FEAT-051's smart-generation affordance. */
+  userTier?: SubscriptionTier;
 }
 
 /**
@@ -74,7 +76,7 @@ const ENGINE_STATUS_POLL_INTERVAL_MS = 10_000;
  * discipline note for why: this screen's shell ships now so navigation and the honest engine status
  * are usable today, without pretending the rest of the product already exists.
  */
-export function WorkspaceHomeScreen({ workspaceId, userId }: WorkspaceHomeScreenProps) {
+export function WorkspaceHomeScreen({ workspaceId, userId, userTier }: WorkspaceHomeScreenProps) {
   const [state, setState] = useState<ScreenState>({ status: "loading" });
   // Preserves the last-known engine status across a poll that fails or is still in flight, per
   // screens/04's Loading state: "engine status pill shows last-known state... rather than a neutral
@@ -189,6 +191,7 @@ export function WorkspaceHomeScreen({ workspaceId, userId }: WorkspaceHomeScreen
           // for read-only members (screens/04's edge case) alongside the Ask input's mutating role.
           hasDatasets={workspace?.has_datasets}
           readOnly={userId !== undefined && workspace !== null && workspace.owner_id !== userId}
+          tier={userTier}
         />
       </Card>
 

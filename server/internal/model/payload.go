@@ -74,6 +74,32 @@ type Facts struct {
 	Rows [][]any
 }
 
+// ValueCount is one profiling bucket: a distinct value and how often it occurs.
+type ValueCount struct {
+	Value string
+	Count int64
+}
+
+// NumericRange summarizes a numeric column's observed range for FEAT-051's smart generation.
+type NumericRange struct {
+	Min float64
+	Max float64
+	Avg float64
+}
+
+// SuggestionsProfile is on-demand profiling output for ONE safe column — the data-informed context
+// FEAT-051 hands the model (top distinct values with counts, min/max/avg, top dates). Profiles are
+// only ever built for safe columns (internal/suggestions filters before querying), and
+// BuildSuggestionsPayload re-filters defensively: a PII-flagged or excluded column is excluded
+// ENTIRELY — no name, no values — per FEAT-051's privacy acceptance criterion.
+type SuggestionsProfile struct {
+	Column    string
+	Type      string
+	TopValues []ValueCount
+	Numeric   *NumericRange
+	TopDates  []string
+}
+
 // payloadColumn is what actually reaches the model for one column: always name and type, plus the
 // two profiling aggregates ONLY when the column is neither PII-flagged nor excluded.
 type payloadColumn struct {
@@ -112,9 +138,9 @@ type payloadCorrection struct {
 }
 
 // Payload is the ONLY shape that may reach Client.Complete. Every field is unexported; the sole
-// constructors are BuildPayload (metadata only) and BuildFactsPayload (metadata plus the execute
-// result set, R-016-filtered). See this file's package doc for why that is load-bearing rather than
-// a style preference.
+// constructors are BuildPayload (metadata only), BuildFactsPayload (metadata plus the execute
+// result set, R-016-filtered), and BuildSuggestionsPayload (FEAT-051's smart-generation task). See
+// this file's package doc for why that is load-bearing rather than a style preference.
 type Payload struct {
 	question      string
 	priorContext  string
@@ -125,6 +151,10 @@ type Payload struct {
 	// facts is nil for metadata-only steps (plan, generate_sql); it is populated ONLY through
 	// BuildFactsPayload, after the R-016 value filter has run. See BuildFactsPayload.
 	facts *factSet
+	// suggestions is nil for question-answering payloads; it is populated ONLY through
+	// BuildSuggestionsPayload and marks the call as FEAT-051's smart-generation task rather than a
+	// question-answering step.
+	suggestions *wireSuggestionsTask
 }
 
 // factSet is the serialized form of Facts inside a Payload. Pointer so `omitempty` can drop it from
@@ -132,6 +162,32 @@ type Payload struct {
 type factSet struct {
 	Columns []string `json:"columns"`
 	Rows    [][]any  `json:"rows"`
+}
+
+// wireValueCount / wireNumericRange / wireSuggestionsProfile / wireSuggestionsTask are the wire
+// shapes for FEAT-051's smart-generation task, kept unexported like the rest of the wire payload.
+type wireValueCount struct {
+	Value string `json:"value"`
+	Count int64  `json:"count"`
+}
+
+type wireNumericRange struct {
+	Min float64 `json:"min"`
+	Max float64 `json:"max"`
+	Avg float64 `json:"avg"`
+}
+
+type wireSuggestionsProfile struct {
+	Column    string            `json:"column"`
+	Type      string            `json:"type"`
+	TopValues []wireValueCount  `json:"top_values,omitempty"`
+	Numeric   *wireNumericRange `json:"numeric,omitempty"`
+	TopDates  []string          `json:"top_dates,omitempty"`
+}
+
+type wireSuggestionsTask struct {
+	Candidates []string                 `json:"candidates"`
+	Profiles   []wireSuggestionsProfile `json:"profiles"`
 }
 
 // wirePayload is Payload's exported mirror, used only internally by JSON to produce the exact bytes
@@ -149,6 +205,9 @@ type wirePayload struct {
 	// Facts is present only when a step is built by BuildFactsPayload (narrate, chart_spec). Its
 	// values have already been filtered by the R-016 exposure rule.
 	Facts *factSet `json:"facts,omitempty"`
+	// Suggestions is present only when the payload was built by BuildSuggestionsPayload (FEAT-051);
+	// a question-answering payload never carries it.
+	Suggestions *wireSuggestionsTask `json:"suggestions,omitempty"`
 }
 
 // BuildPayload is the single shared payload-construction function FEAT-013's description and R-016's
@@ -269,6 +328,50 @@ func BuildFactsPayload(question, priorContext string, tables []TableMetadata, gr
 	return out
 }
 
+// BuildSuggestionsPayload constructs the payload for FEAT-051's smart-question-generation model
+// call — the same single shared construction seam as BuildPayload, but for a suggestions task.
+//
+// Privacy is STRICTER than question-answering: a column with PIIFlag or ExcludedFromModel is
+// excluded from the suggestions payload ENTIRELY — no name, no type, no aggregates, no profiles —
+// per FEAT-051's "never even by name" rule on the suggestions surface (the looser name-and-type
+// reduction that BuildPayload applies is deliberately not used here). The builder re-filters the
+// incoming profiles defensively even though internal/suggestions already filters before profiling.
+//
+// tables carry the same metadata FEAT-050's templates read (the R-016-filtered construction
+// applies the name-and-type reduction in the metadata; the suggestions profiles carry the safe
+// columns' on-demand profiling output). candidates is the deterministic suggestion set the model
+// may rephrase and enrich — never inventing columns, metrics, or joins beyond it.
+func BuildSuggestionsPayload(tables []TableMetadata, candidates []string, profiles []SuggestionsProfile) Payload {
+	flagged := flaggedColumnNames(tables)
+
+	// Defense in depth: drop any profile whose column is PII-flagged or excluded, even though the
+	// profiler only queried safe columns.
+	safeProfiles := make([]SuggestionsProfile, 0, len(profiles))
+	for _, p := range profiles {
+		if flagged[strings.ToLower(strings.TrimSpace(p.Column))] {
+			continue
+		}
+		safeProfiles = append(safeProfiles, p)
+	}
+
+	wireProfiles := make([]wireSuggestionsProfile, 0, len(safeProfiles))
+	for _, p := range safeProfiles {
+		wp := wireSuggestionsProfile{Column: p.Column, Type: p.Type}
+		for _, vc := range p.TopValues {
+			wp.TopValues = append(wp.TopValues, wireValueCount{Value: vc.Value, Count: vc.Count})
+		}
+		if p.Numeric != nil {
+			wp.Numeric = &wireNumericRange{Min: p.Numeric.Min, Max: p.Numeric.Max, Avg: p.Numeric.Avg}
+		}
+		wp.TopDates = append(wp.TopDates, p.TopDates...)
+		wireProfiles = append(wireProfiles, wp)
+	}
+
+	base := BuildPayload("", "", tables, semantic.GroundingContext{})
+	base.suggestions = &wireSuggestionsTask{Candidates: candidates, Profiles: wireProfiles}
+	return base
+}
+
 // flaggedColumnNames returns the lowercased name of every column in tables whose values are
 // withheld by FEAT-007 (PII) or FEAT-010 (excluded_from_model).
 func flaggedColumnNames(tables []TableMetadata) map[string]bool {
@@ -299,6 +402,7 @@ func (p Payload) JSON() (string, error) {
 		Metrics:       p.metrics,
 		Corrections:   p.corrections,
 		Facts:         p.facts,
+		Suggestions:   p.suggestions,
 	}
 	body, err := json.Marshal(wire)
 	if err != nil {

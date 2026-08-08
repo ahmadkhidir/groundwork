@@ -102,6 +102,11 @@ type Dependencies struct {
 	// repositories. The UI hides the strip for read-only members, but the endpoint is a harmless
 	// metadata read behind the ordinary read boundary.
 	Suggestions SuggestionSource
+	// SuggestionEngine + SuggestionModel back FEAT-051's smart generation (the same engine Provider
+	// and model Client the run executor uses). When either is nil the smart route is not registered
+	// and only the deterministic strip exists.
+	SuggestionEngine SuggestionEngineProvider
+	SuggestionModel  SmartSuggestionModel
 
 	// Datasets... below back FEAT-048 (Single-Dataset Deletion) — screens/04-workspace-home.md's
 	// Datasets panel and the shared Delete Confirmation Modal's data source — and FEAT-049's
@@ -350,9 +355,11 @@ func (s *Server) routes() {
 						s.deps.SemanticMetrics, s.deps.SemanticCorrections, s.deps.SemanticSummary, s.logger)
 				}
 
-				// FEAT-050: deterministic question suggestions — metadata-only, no engine, no model.
+				// FEAT-050/FEAT-051: question suggestions — deterministic strip (no engine, no model)
+				// plus the Pro/Team-gated smart generation (engine profile + one model call).
 				if s.deps.Suggestions != nil {
-					RegisterSuggestionRoutes(r, s.deps.Workspaces, s.deps.MemberLookup, s.deps.Suggestions, s.logger)
+					RegisterSuggestionRoutes(r, s.deps.Workspaces, s.deps.MemberLookup, s.deps.Users, s.deps.Suggestions,
+						s.deps.SuggestionEngine, s.deps.SuggestionModel, s.logger)
 				}
 
 				// FEAT-013: ask-a-question run lifecycle — create a run and watch it execute.

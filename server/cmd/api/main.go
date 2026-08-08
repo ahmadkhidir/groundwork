@@ -224,14 +224,18 @@ func run(logger *slog.Logger) error {
 		SemanticCorrections:   correctionRepo,
 		SemanticSummary:       semanticSummaryRepo,
 
-		// FEAT-050: deterministic question suggestions — metadata-only, no engine, no model. The
-		// four listers suggestions.Generate reads come from the same repositories as the seams above.
+		// FEAT-050/FEAT-051: question suggestions — deterministic strip (metadata-only) plus the
+		// Pro/Team-gated smart generation. SuggestionEngine/SuggestionModel are the same engine
+		// Provider and model Client the run executor uses, so smart generation egress-logs and
+		// meters through the shared seams.
 		Suggestions: suggestionSource{
 			datasets:      datasetRepo,
 			columns:       columnRepo,
 			relationships: relationshipRepo,
 			metrics:       metricDefinitionRepo,
 		},
+		SuggestionEngine: engineProvider,
+		SuggestionModel:  modelClient,
 
 		// FEAT-048 (single-dataset deletion) and FEAT-049 (duplicate-filename detection). Same
 		// datasetRepo/relationshipRepo/objectStore/auditWriter instances as above, satisfying the

@@ -7,7 +7,7 @@ import { Input } from "@/components/ui/Input";
 import { Button } from "@/components/ui/Button";
 import { api, ApiError } from "@/lib/api-client";
 import { routes } from "@/lib/routes";
-import { EngineStatus, type Run } from "@/types/schema";
+import { EngineStatus, SubscriptionTier, type Run } from "@/types/schema";
 import { QuestionSuggestions } from "./QuestionSuggestions";
 
 export interface AskPanelProps {
@@ -29,6 +29,8 @@ export interface AskPanelProps {
   hasDatasets?: boolean;
   /** Read-only shared access (FEAT-045): the suggestions strip is hidden with the Ask input. */
   readOnly?: boolean;
+  /** The user's tier for DISPLAY — gates FEAT-051's smart-generation affordance. */
+  tier?: SubscriptionTier;
 }
 
 interface CreateRunResponse {
@@ -63,6 +65,7 @@ export function AskPanel({
   onEngineStatusChange,
   hasDatasets = false,
   readOnly = false,
+  tier,
 }: AskPanelProps) {
   const router = useRouter();
   const [question, setQuestion] = useState("");
@@ -150,11 +153,11 @@ export function AskPanel({
         </Button>
       </form>
 
-      {/* FEAT-050: the deterministic suggestions strip — metadata-only, no engine, no model.
-          Shown only when the workspace has data and the member may submit questions; hidden for
-          read-only access and in the Empty (no data) state. */}
+      {/* FEAT-050/FEAT-051: the suggestions strip — deterministic on every tier, smart generation
+          gated to Pro/Team. Shown only when the workspace has data and the member may submit
+          questions; hidden for read-only access and in the Empty (no data) state. */}
       {hasDatasets && !readOnly && (
-        <QuestionSuggestions workspaceId={workspaceId} onFill={setQuestion} />
+        <QuestionSuggestions workspaceId={workspaceId} onFill={setQuestion} tier={tier} />
       )}
     </div>
   );

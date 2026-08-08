@@ -1330,6 +1330,13 @@ func (e *Executor) downloadToTemp(ctx context.Context, key, ext string) (string,
 	return file.Name(), cleanup, nil
 }
 
+// TableNameForDataset is the exported form of tableNameForDataset, for callers outside internal/run
+// that must query the same engine views the executor uses (FEAT-051's smart-generation profiling
+// queries the dataset views by this exact name).
+func TableNameForDataset(ds domain.Dataset) string {
+	return tableNameForDataset(ds)
+}
+
 // tableNameForDataset returns the canonical SQL identifier a dataset's data is exposed under in the
 // engine, and taught to the model via model.TableMetadata.Name — the "internal/run's table-naming
 // helper" payload.go's TableMetadata doc references.
