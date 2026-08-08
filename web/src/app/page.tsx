@@ -1,45 +1,19 @@
-import Link from "next/link";
-import { buttonClassNames } from "@/components/ui/Button";
-import { routes } from "@/lib/routes";
+import type { Metadata } from "next";
+import { LandingScreen } from "@/components/landing/LandingScreen";
+import { auth } from "@/auth";
+
+export const metadata: Metadata = {
+  title: "Groundwork — Every number, traced back to the data.",
+};
 
 /**
- * Landing page — screen 01, see docs/Groundwork/screens/01-landing-page.md.
+ * Route: `/` — Landing Page, screen 01 (docs/Groundwork/screens/01-landing-page.md).
  *
- * Foundation renders the tagline and the two entry points into the auth flow, so the public shell
- * and the auth gate are verifiable end to end before feature work lands. The full marketing content
- * is FEAT-044, Phase 1.
+ * Server-rendered with no client fetch on load (the one SSR/SSG screen per architecture.md). The
+ * session is read only for the screens/01 edge case: an already-authenticated visitor still sees
+ * the landing page, but the primary CTA becomes "Go to Workspaces" instead of "Get started".
  */
-export default function LandingPage() {
-  return (
-    <main
-      id="main-content"
-      className="mx-auto flex w-full max-w-3xl flex-1 flex-col items-center justify-center gap-6 p-8 text-center"
-    >
-      <div className="flex flex-col gap-4">
-        <h1 className="text-display text-text-primary">Groundwork</h1>
-        <p className="text-body-large text-text-secondary">
-          Every number, traced back to the data.
-        </p>
-      </div>
-
-      <div className="flex flex-wrap items-center justify-center gap-2">
-        {/*
-          Rendered as links, not buttons: these navigate, so they must keep middle-click,
-          open-in-new-tab, and the anchor role. buttonClassNames gives them the button's appearance
-          without duplicating its tokens.
-        */}
-        <Link href={routes.signup()} className={buttonClassNames("primary")}>
-          Get started
-        </Link>
-        <Link href={routes.login()} className={buttonClassNames("outline")}>
-          Log in
-        </Link>
-      </div>
-
-      <p className="text-body-small text-text-secondary">
-        Screen 01 · <span className="font-mono">screens/01-landing-page.md</span>{" "}
-        · FEAT-044 · Phase 1
-      </p>
-    </main>
-  );
+export default async function LandingPage() {
+  const session = await auth();
+  return <LandingScreen signedIn={Boolean(session)} />;
 }
