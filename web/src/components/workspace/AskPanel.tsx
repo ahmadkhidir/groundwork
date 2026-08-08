@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/Button";
 import { api, ApiError } from "@/lib/api-client";
 import { routes } from "@/lib/routes";
 import { EngineStatus, type Run } from "@/types/schema";
+import { QuestionSuggestions } from "./QuestionSuggestions";
 
 export interface AskPanelProps {
   workspaceId: string;
@@ -24,6 +25,10 @@ export interface AskPanelProps {
    * claims "waking" that the engine did not report.
    */
   onEngineStatusChange?: (status: EngineStatus) => void;
+  /** True once the workspace has at least one ingested dataset — shows the FEAT-050 strip. */
+  hasDatasets?: boolean;
+  /** Read-only shared access (FEAT-045): the suggestions strip is hidden with the Ask input. */
+  readOnly?: boolean;
 }
 
 interface CreateRunResponse {
@@ -52,7 +57,13 @@ interface WakeResponse {
  * The trimmed-empty check mirrors the server's `invalid_question` rejection: the control disables
  * submit for blank input rather than issuing a request that is guaranteed to be rejected.
  */
-export function AskPanel({ workspaceId, engineStatus, onEngineStatusChange }: AskPanelProps) {
+export function AskPanel({
+  workspaceId,
+  engineStatus,
+  onEngineStatusChange,
+  hasDatasets = false,
+  readOnly = false,
+}: AskPanelProps) {
   const router = useRouter();
   const [question, setQuestion] = useState("");
   const [submitting, setSubmitting] = useState(false);
@@ -138,6 +149,13 @@ export function AskPanel({ workspaceId, engineStatus, onEngineStatusChange }: As
           <span className="sr-only">Submit question</span>
         </Button>
       </form>
+
+      {/* FEAT-050: the deterministic suggestions strip — metadata-only, no engine, no model.
+          Shown only when the workspace has data and the member may submit questions; hidden for
+          read-only access and in the Empty (no data) state. */}
+      {hasDatasets && !readOnly && (
+        <QuestionSuggestions workspaceId={workspaceId} onFill={setQuestion} />
+      )}
     </div>
   );
 }

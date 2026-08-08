@@ -19,6 +19,12 @@ import type { Workspace } from "@/types/schema";
 
 export interface WorkspaceHomeScreenProps {
   workspaceId: string;
+  /**
+   * The signed-in user's id, used to decide owner vs read-only member treatment for the Ask panel
+   * and suggestions strip (FEAT-045/FEAT-050). When absent, the screen assumes the owner — the
+   * server remains authoritative for every mutation.
+   */
+  userId?: string;
 }
 
 /**
@@ -68,7 +74,7 @@ const ENGINE_STATUS_POLL_INTERVAL_MS = 10_000;
  * discipline note for why: this screen's shell ships now so navigation and the honest engine status
  * are usable today, without pretending the rest of the product already exists.
  */
-export function WorkspaceHomeScreen({ workspaceId }: WorkspaceHomeScreenProps) {
+export function WorkspaceHomeScreen({ workspaceId, userId }: WorkspaceHomeScreenProps) {
   const [state, setState] = useState<ScreenState>({ status: "loading" });
   // Preserves the last-known engine status across a poll that fails or is still in flight, per
   // screens/04's Loading state: "engine status pill shows last-known state... rather than a neutral
@@ -179,6 +185,10 @@ export function WorkspaceHomeScreen({ workspaceId }: WorkspaceHomeScreenProps) {
                 : current,
             );
           }}
+          // FEAT-050: the suggestions strip renders only when the workspace has data, and is hidden
+          // for read-only members (screens/04's edge case) alongside the Ask input's mutating role.
+          hasDatasets={workspace?.has_datasets}
+          readOnly={userId !== undefined && workspace !== null && workspace.owner_id !== userId}
         />
       </Card>
 

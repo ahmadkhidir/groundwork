@@ -97,6 +97,12 @@ type Dependencies struct {
 	SemanticCorrections   SemanticCorrectionStore
 	SemanticSummary       SemanticSummaryStore
 
+	// Suggestions backs FEAT-050's deterministic question-suggestions strip (screens/04-workspace-
+	// home.md): the same four listers suggestions.Generate reads, satisfied by the postgres
+	// repositories. The UI hides the strip for read-only members, but the endpoint is a harmless
+	// metadata read behind the ordinary read boundary.
+	Suggestions SuggestionSource
+
 	// Datasets... below back FEAT-048 (Single-Dataset Deletion) — screens/04-workspace-home.md's
 	// Datasets panel and the shared Delete Confirmation Modal's data source — and FEAT-049's
 	// duplicate-filename check (DuplicateCheck), which also calls FEAT-048's deletion directly for its
@@ -342,6 +348,11 @@ func (s *Server) routes() {
 					s.deps.SemanticCorrections != nil && s.deps.SemanticSummary != nil {
 					RegisterSemanticRoutes(r, s.deps.Workspaces, s.deps.MemberLookup, s.deps.Users, s.deps.SemanticRelationships,
 						s.deps.SemanticMetrics, s.deps.SemanticCorrections, s.deps.SemanticSummary, s.logger)
+				}
+
+				// FEAT-050: deterministic question suggestions — metadata-only, no engine, no model.
+				if s.deps.Suggestions != nil {
+					RegisterSuggestionRoutes(r, s.deps.Workspaces, s.deps.MemberLookup, s.deps.Suggestions, s.logger)
 				}
 
 				// FEAT-013: ask-a-question run lifecycle — create a run and watch it execute.

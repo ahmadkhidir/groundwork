@@ -19,6 +19,7 @@ import (
 	"github.com/ahmadkhidir/groundwork/server/internal/auth"
 	"github.com/ahmadkhidir/groundwork/server/internal/billing"
 	"github.com/ahmadkhidir/groundwork/server/internal/config"
+	"github.com/ahmadkhidir/groundwork/server/internal/domain"
 	"github.com/ahmadkhidir/groundwork/server/internal/engine"
 	"github.com/ahmadkhidir/groundwork/server/internal/events"
 	"github.com/ahmadkhidir/groundwork/server/internal/ingest"
@@ -223,6 +224,15 @@ func run(logger *slog.Logger) error {
 		SemanticCorrections:   correctionRepo,
 		SemanticSummary:       semanticSummaryRepo,
 
+		// FEAT-050: deterministic question suggestions — metadata-only, no engine, no model. The
+		// four listers suggestions.Generate reads come from the same repositories as the seams above.
+		Suggestions: suggestionSource{
+			datasets:      datasetRepo,
+			columns:       columnRepo,
+			relationships: relationshipRepo,
+			metrics:       metricDefinitionRepo,
+		},
+
 		// FEAT-048 (single-dataset deletion) and FEAT-049 (duplicate-filename detection). Same
 		// datasetRepo/relationshipRepo/objectStore/auditWriter instances as above, satisfying the
 		// further narrow seams datasets.go and upload.go declare — see api.Dependencies' doc comment.
@@ -380,4 +390,30 @@ func reconcileAllWorkspaces(ctx context.Context, reconciler metering.Reconciler,
 			logger.Error("metering: reconciling storage usage", slog.String("workspace_id", ws.ID), slog.String("error", err.Error()))
 		}
 	}
+}
+
+// suggestionSource adapts the four repositories to api.SuggestionSource (FEAT-050): the same four
+// ListByWorkspace methods suggestions.Generate reads, composed at the root because no single
+// repository satisfies the full interface. Metadata-only reads — no engine, no model.
+type suggestionSource struct {
+	datasets      *postgres.DatasetRepository
+	columns       *postgres.ColumnRepository
+	relationships *postgres.RelationshipRepository
+	metrics       *postgres.MetricDefinitionRepository
+}
+
+func (s suggestionSource) Datasets(ctx context.Context, workspaceID string) ([]domain.Dataset, error) {
+	return s.datasets.ListByWorkspace(ctx, workspaceID)
+}
+
+func (s suggestionSource) Columns(ctx context.Context, workspaceID string) ([]domain.Column, error) {
+	return s.columns.ListByWorkspace(ctx, workspaceID)
+}
+
+func (s suggestionSource) Relationships(ctx context.Context, workspaceID string) ([]domain.Relationship, error) {
+	return s.relationships.ListByWorkspace(ctx, workspaceID)
+}
+
+func (s suggestionSource) Metrics(ctx context.Context, workspaceID string) ([]domain.MetricDefinition, error) {
+	return s.metrics.ListByWorkspace(ctx, workspaceID)
 }

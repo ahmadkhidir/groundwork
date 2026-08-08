@@ -11,11 +11,12 @@ vi.mock("@/lib/api-client", async () => {
     await vi.importActual<typeof import("@/lib/api-client")>("@/lib/api-client");
   return {
     ...actual,
-    api: { ...actual.api, post: vi.fn() },
+    api: { ...actual.api, post: vi.fn(), get: vi.fn() },
   };
 });
 
 const postMock = vi.mocked(api.post);
+const getMock = vi.mocked(api.get);
 
 // A stable object, not a fresh literal per call: Next's real useRouter() returns a referentially
 // stable router, and tests that assert on the mock's calls would otherwise accumulate.
@@ -51,6 +52,7 @@ function mockPostByPath(overrides: { wake?: () => unknown; run?: () => unknown }
 describe("AskPanel", () => {
   beforeEach(() => {
     postMock.mockReset();
+    getMock.mockReset();
     pushMock.mockReset();
     mockPostByPath();
   });
@@ -217,5 +219,41 @@ describe("AskPanel", () => {
     await waitFor(() =>
       expect(pushMock).toHaveBeenCalledWith(routes.run("ws-1", "run-1")),
     );
+  });
+
+  it("renders the FEAT-050 suggestions strip when the workspace has data and the member may ask", async () => {
+    getMock.mockResolvedValue({ suggestions: ["What is the total total amount?"] });
+    render(<AskPanel workspaceId="ws-1" hasDatasets />);
+
+    await waitFor(() =>
+      expect(screen.getByText("What is the total total amount?")).toBeInTheDocument(),
+    );
+    expect(getMock).toHaveBeenCalledWith("/v1/workspaces/ws-1/suggestions");
+  });
+
+  it("clicking a suggestion fills the input without submitting", async () => {
+    getMock.mockResolvedValue({ suggestions: ["What is the total total amount?"] });
+    const user = userEvent.setup();
+    render(<AskPanel workspaceId="ws-1" hasDatasets />);
+
+    await user.click(
+      await screen.findByRole("button", { name: "What is the total total amount?" }),
+    );
+    const input = screen.getByPlaceholderText(
+      "Ask a question about your data...",
+    ) as HTMLInputElement;
+    expect(input.value).toBe("What is the total total amount?");
+    // Nothing was submitted — no run creation fired.
+    expect(postMock.mock.calls.some(([path]) => path.endsWith("/runs"))).toBe(false);
+  });
+
+  it("hides the suggestions strip in the Empty (no data) state and for read-only members", () => {
+    render(<AskPanel workspaceId="ws-1" hasDatasets={false} />);
+    expect(screen.queryByText("Suggested questions")).not.toBeInTheDocument();
+
+    render(<AskPanel workspaceId="ws-1" hasDatasets readOnly />);
+    expect(screen.queryByText("Suggested questions")).not.toBeInTheDocument();
+    // The strip's fetch must not fire in either hidden state.
+    expect(getMock).not.toHaveBeenCalledWith("/v1/workspaces/ws-1/suggestions");
   });
 });
