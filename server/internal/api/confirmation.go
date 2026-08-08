@@ -150,7 +150,10 @@ type publicConfirmationColumn struct {
 	PIIPattern   string                          `json:"pii_pattern,omitempty"`
 	// PIIReviewedAt is RFC 3339, or "" when no user has ever reviewed this column's flag — the
 	// distinction FEAT-007 requires between reviewed-and-cleared and never-flagged.
-	PIIReviewedAt     string  `json:"pii_reviewed_at,omitempty"`
+	PIIReviewedAt string `json:"pii_reviewed_at,omitempty"`
+	// TypeOverriddenAt is RFC 3339, or "" when no user has ever set a type override on this column —
+	// what distinguishes an overridden type from the original inference (schema.md, FEAT-048).
+	TypeOverriddenAt  string  `json:"type_overridden_at,omitempty"`
 	ExcludedFromModel bool    `json:"excluded_from_model"`
 	NullRate          float64 `json:"null_rate"`
 	DistinctCount     int64   `json:"distinct_count"`
@@ -212,6 +215,7 @@ func handleListWorkspaceColumns(workspaces WorkspaceStore, members MemberLookupS
 				PIIFlag:           c.PIIFlag,
 				PIIPattern:        c.PIIPattern,
 				PIIReviewedAt:     c.PIIReviewedAt,
+				TypeOverriddenAt:  c.TypeOverriddenAt,
 				ExcludedFromModel: c.ExcludedFromModel,
 				NullRate:          c.NullRate,
 				DistinctCount:     c.DistinctCount,
@@ -312,6 +316,10 @@ func handleUpdateColumn(workspaces WorkspaceStore, members MemberLookupStore, us
 				return
 			}
 			col.InferredType = t
+			// Record the override instant on the response the way the SQL records it on the row:
+			// a non-empty type_overridden_at is what distinguishes an overridden type from the
+			// original inference (schema.md), which FEAT-048's deletion-impact disclosure reads.
+			col.TypeOverriddenAt = time.Now().UTC().Format(time.RFC3339)
 			// The response badge must describe the newly selected type, so move TypeConfidence to
 			// that type's measured fit rate — exactly what UpdateInferredType's SQL does via COALESCE
 			// (columns.go). A flat 1.0 here previously fabricated "100% of values fit this type" on a

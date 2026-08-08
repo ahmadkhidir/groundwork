@@ -235,11 +235,47 @@ func TestDatasetDeletionImpactNamesDependentRelationshipsAndReviewedPII(t *testi
 	if !impact.HasReviewedPII {
 		t.Error("has_reviewed_pii = false, want true (one column has pii_reviewed_at set)")
 	}
+	if impact.HasTypeOverrideRisk {
+		// The columns exist but none carries a FEAT-006 override — type_overridden_at is empty on
+		// both, so the risk is precisely false. The historical over-disclosure (true for any dataset
+		// with columns) must not regress (docs 171167b, schema.md Column.type_overridden_at).
+		t.Error("has_type_override_risk = true, want false (no column has a type override)")
+	}
 	if len(impact.DependentRelationships) != 1 || impact.DependentRelationships[0].ID != "rel-1" {
 		t.Fatalf("dependent_relationships = %+v, want exactly rel-1 named", impact.DependentRelationships)
 	}
 	if impact.ColumnCount != 2 {
 		t.Errorf("column_count = %d, want 2", impact.ColumnCount)
+	}
+}
+
+// TestDatasetDeletionImpactReportsTypeOverrideRisk pins the precise half of FEAT-048's disclosure:
+// a column carrying a type override (type_overridden_at set) makes has_type_override_risk true.
+func TestDatasetDeletionImpactReportsTypeOverrideRisk(t *testing.T) {
+	workspaces := newFakeWorkspaceStore()
+	workspaces.byID["ws-1"] = domain.Workspace{ID: "ws-1", OwnerID: "user-1"}
+	datasets := newFakeDatasetsStore(domain.Dataset{ID: "ds-1", WorkspaceID: "ws-1", OriginalFilename: "customers.csv"})
+	columns := &fakeDatasetColumnsStore{byDataset: map[string][]domain.Column{
+		"ds-1": {
+			{ID: "col-1", DatasetID: "ds-1", Name: "total", InferredType: domain.TypeNumber, TypeOverriddenAt: "2026-08-02T09:30:00Z"},
+			{ID: "col-2", DatasetID: "ds-1", Name: "region", InferredType: domain.TypeString},
+		},
+	}}
+	router := newTestDatasetsRouter(workspaces, datasets, columns, &fakeDatasetRelationshipsStore{}, newFakeDatasetObjectDeleter(), &fakeDatasetDeletionAuditWriter{})
+
+	req := authedRequest(t, http.MethodGet, "/v1/workspaces/ws-1/datasets/ds-1/deletion-impact", nil, "user-1", domain.TierFree)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var impact datasetDeletionImpact
+	if err := json.Unmarshal(rec.Body.Bytes(), &impact); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+	if !impact.HasTypeOverrideRisk {
+		t.Error("has_type_override_risk = false, want true (col-1 carries a type override)")
 	}
 }
 

@@ -301,6 +301,12 @@ export interface Column {
   /** Detected pattern when `pii_flag` is true — e.g. "email", "national_id". Empty string otherwise. */
   pii_pattern?: string;
   /**
+   * When the user last set a type override on this column. Empty/absent when no override has ever
+   * been set — the active type is still the original inference — distinguishing an overridden type
+   * from the original profile (FEAT-048's deletion-impact disclosure reads this).
+   */
+  type_overridden_at?: string;
+  /**
    * Whether the user has explicitly excluded this column from ever being sent to the model.
    * The column remains queryable by the engine regardless — exclusion is about egress, not access.
    */

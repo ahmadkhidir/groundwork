@@ -167,26 +167,13 @@ type datasetDeletionImpact struct {
 	ColumnCount            int                           `json:"column_count"`
 	DependentRelationships []publicDependentRelationship `json:"dependent_relationships"`
 	// HasReviewedPII is a precise, computed signal: true when any column on this dataset has an
-	// explicit pii_reviewed_at, per FEAT-007. See HasTypeOverrideRisk's doc comment for why the other
-	// half of FEAT-048's disclosure requirement (type overrides) cannot be computed the same way.
+	// explicit pii_reviewed_at, per FEAT-007.
 	HasReviewedPII bool `json:"has_reviewed_pii"`
-	// HasTypeOverrideRisk is true whenever the dataset has any profiled columns at all — NOT a
-	// precise "this column was actually overridden" signal.
-	//
-	// schema.md's Column has no field distinguishing "inferred_type as originally profiled" from
-	// "inferred_type after a FEAT-006 override" — UpdateInferredType (columns.go) overwrites the same
-	// column in place. That makes an exact answer to FEAT-048's acceptance criterion ("if the dataset
-	// has any columns carrying a type override... states that this review work will be permanently
-	// lost") impossible to compute from current schema without a migration, which this wave was
-	// explicitly told to avoid inventing.
-	//
-	// Reported rather than guessed at: a false NEGATIVE here (silently omitting the warning when a
-	// column really was overridden) would violate the acceptance criterion outright, so this
-	// deliberately over-discloses instead — true whenever the dataset has any columns, which is every
-	// dataset that reached profiling. The alternative (always false) is not a safe default for a
-	// warning whose entire purpose is to never be silently skipped. Flagged for product-shaper: a
-	// `Column.type_overridden_at` (paired with `pii_reviewed_at`'s own convention) would make this
-	// exact instead of conservative.
+	// HasTypeOverrideRisk is a precise, computed signal (docs 171167b, schema.md
+	// Column.type_overridden_at): true when any column on this dataset carries a FEAT-006 type
+	// override — the review work FEAT-048's disclosure warns is permanently lost. Empty-string
+	// means the column's active type is still the original inference, so a dataset that reached
+	// profiling but was never overridden reports false rather than the historical over-disclosure.
 	HasTypeOverrideRisk bool `json:"has_type_override_risk"`
 }
 
@@ -228,10 +215,13 @@ func handleDatasetDeletionImpact(
 		}
 
 		hasReviewedPII := false
+		hasTypeOverride := false
 		for _, c := range cols {
 			if c.PIIReviewedAt != "" {
 				hasReviewedPII = true
-				break
+			}
+			if c.TypeOverriddenAt != "" {
+				hasTypeOverride = true
 			}
 		}
 
@@ -258,7 +248,7 @@ func handleDatasetDeletionImpact(
 			ColumnCount:            len(cols),
 			DependentRelationships: depRels,
 			HasReviewedPII:         hasReviewedPII,
-			HasTypeOverrideRisk:    len(cols) > 0,
+			HasTypeOverrideRisk:    hasTypeOverride,
 		})
 	}
 }

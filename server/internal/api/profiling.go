@@ -67,7 +67,11 @@ type publicColumn struct {
 	// PIIReviewedAt is RFC 3339, or "" when no user has ever explicitly reviewed this column's PII
 	// flag. Per schema.md, that emptiness is what distinguishes a column that was reviewed and
 	// cleared from one that was simply never flagged (FEAT-007).
-	PIIReviewedAt     string  `json:"pii_reviewed_at,omitempty"`
+	PIIReviewedAt string `json:"pii_reviewed_at,omitempty"`
+	// TypeOverriddenAt is RFC 3339, or "" when no user has ever set a type override on this column.
+	// Per schema.md, that emptiness distinguishes an overridden type from the original inference —
+	// what FEAT-048's deletion-impact disclosure reads.
+	TypeOverriddenAt  string  `json:"type_overridden_at,omitempty"`
 	ExcludedFromModel bool    `json:"excluded_from_model"`
 	NullRate          float64 `json:"null_rate"`
 	DistinctCount     int64   `json:"distinct_count"`
@@ -84,6 +88,7 @@ func toPublicColumn(c domain.Column) publicColumn {
 		PIIFlag:           c.PIIFlag,
 		PIIPattern:        c.PIIPattern,
 		PIIReviewedAt:     c.PIIReviewedAt,
+		TypeOverriddenAt:  c.TypeOverriddenAt,
 		ExcludedFromModel: c.ExcludedFromModel,
 		NullRate:          c.NullRate,
 		DistinctCount:     c.DistinctCount,

@@ -77,12 +77,13 @@ func (f *fakeConfirmationColumnStore) GetByIDForWorkspace(ctx context.Context, i
 func (f *fakeConfirmationColumnStore) UpdateInferredType(ctx context.Context, id string, t domain.InferredType) error {
 	c := f.byID[id]
 	c.InferredType = t
-	// Mirrors ColumnRepository.UpdateInferredType's COALESCE (columns.go): move confidence to the
-	// newly selected type's measured fit rate, keeping the existing confidence when the map lacks
-	// that type (a column profiled before migration 00006 — "unknown", never fabricated 1.0).
+	// Mirrors ColumnRepository.UpdateInferredType (columns.go): move confidence to the newly
+	// selected type's measured fit rate (COALESCE), and stamp type_overridden_at so an overridden
+	// type is distinguishable from the original inference (schema.md, FEAT-048).
 	if rate, ok := c.TypeFitRates[t]; ok {
 		c.TypeConfidence = rate
 	}
+	c.TypeOverriddenAt = time.Now().UTC().Format(time.RFC3339)
 	f.byID[id] = c
 	return nil
 }
@@ -613,6 +614,21 @@ func TestUpdateColumnTypeOverrideWritesNoPIIAuditEntry(t *testing.T) {
 	}
 	if columns.byID["col-1"].PIIReviewedAt != "" {
 		t.Error("a type correction stamped pii_reviewed_at, claiming a PII review that never happened")
+	}
+	if columns.byID["col-1"].TypeOverriddenAt == "" {
+		t.Error("a type correction did not stamp type_overridden_at — an overridden type is now indistinguishable from the original inference")
+	}
+
+	var body struct {
+		Column struct {
+			TypeOverriddenAt string `json:"type_overridden_at"`
+		} `json:"column"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decoding body: %v", err)
+	}
+	if body.Column.TypeOverriddenAt == "" {
+		t.Error("response body omits type_overridden_at, so the review step cannot show an override happened")
 	}
 }
 

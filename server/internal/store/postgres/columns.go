@@ -47,10 +47,12 @@ func (r *ColumnRepository) BulkInsert(ctx context.Context, workspaceID string, c
 		batch.Queue(
 			`INSERT INTO columns
 			   (id, dataset_id, workspace_id, name, inferred_type, type_confidence, type_fit_rates,
-			    pii_flag, pii_pattern, pii_reviewed_at, excluded_from_model, null_rate, distinct_count)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+			    pii_flag, pii_pattern, pii_reviewed_at, type_overridden_at,
+			    excluded_from_model, null_rate, distinct_count)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
 			c.ID, c.DatasetID, workspaceID, c.Name, string(c.InferredType), c.TypeConfidence, fitRatesJSON(c.TypeFitRates),
-			c.PIIFlag, c.PIIPattern, nullableTime(c.PIIReviewedAt), c.ExcludedFromModel, c.NullRate, c.DistinctCount,
+			c.PIIFlag, c.PIIPattern, nullableTime(c.PIIReviewedAt), nullableTime(c.TypeOverriddenAt),
+			c.ExcludedFromModel, c.NullRate, c.DistinctCount,
 		)
 	}
 
@@ -69,7 +71,8 @@ func (r *ColumnRepository) BulkInsert(ctx context.Context, workspaceID string, c
 func (r *ColumnRepository) ListByDataset(ctx context.Context, datasetID string) ([]domain.Column, error) {
 	rows, err := r.pool.Query(ctx,
 		`SELECT id, dataset_id, name, inferred_type, type_confidence, type_fit_rates,
-		        pii_flag, pii_pattern, pii_reviewed_at, excluded_from_model, null_rate, distinct_count
+		        pii_flag, pii_pattern, pii_reviewed_at, type_overridden_at,
+		        excluded_from_model, null_rate, distinct_count
 		 FROM columns WHERE dataset_id = $1 ORDER BY name ASC`,
 		datasetID,
 	)
@@ -85,7 +88,8 @@ func (r *ColumnRepository) ListByDataset(ctx context.Context, datasetID string) 
 func (r *ColumnRepository) ListByWorkspace(ctx context.Context, workspaceID string) ([]domain.Column, error) {
 	rows, err := r.pool.Query(ctx,
 		`SELECT id, dataset_id, name, inferred_type, type_confidence, type_fit_rates,
-		        pii_flag, pii_pattern, pii_reviewed_at, excluded_from_model, null_rate, distinct_count
+		        pii_flag, pii_pattern, pii_reviewed_at, type_overridden_at,
+		        excluded_from_model, null_rate, distinct_count
 		 FROM columns WHERE workspace_id = $1 ORDER BY dataset_id, name ASC`,
 		workspaceID,
 	)
@@ -101,18 +105,21 @@ func scanColumns(rows pgx.Rows) ([]domain.Column, error) {
 	var out []domain.Column
 	for rows.Next() {
 		var (
-			c             domain.Column
-			inferredType  string
-			fitRates      []byte
-			piiReviewedAt *time.Time
+			c                domain.Column
+			inferredType     string
+			fitRates         []byte
+			piiReviewedAt    *time.Time
+			typeOverriddenAt *time.Time
 		)
 		if err := rows.Scan(&c.ID, &c.DatasetID, &c.Name, &inferredType, &c.TypeConfidence, &fitRates,
-			&c.PIIFlag, &c.PIIPattern, &piiReviewedAt, &c.ExcludedFromModel, &c.NullRate, &c.DistinctCount); err != nil {
+			&c.PIIFlag, &c.PIIPattern, &piiReviewedAt, &typeOverriddenAt,
+			&c.ExcludedFromModel, &c.NullRate, &c.DistinctCount); err != nil {
 			return nil, fmt.Errorf("scanning column: %w", err)
 		}
 		c.InferredType = domain.InferredType(inferredType)
 		c.TypeFitRates = parseFitRates(fitRates)
 		c.PIIReviewedAt = formatNullableTime(piiReviewedAt)
+		c.TypeOverriddenAt = formatNullableTime(typeOverriddenAt)
 		out = append(out, c)
 	}
 	if err := rows.Err(); err != nil {
@@ -124,18 +131,21 @@ func scanColumns(rows pgx.Rows) ([]domain.Column, error) {
 // GetByID returns the column with id, or ErrColumnNotFound.
 func (r *ColumnRepository) GetByID(ctx context.Context, id string) (domain.Column, error) {
 	var (
-		c             domain.Column
-		inferredType  string
-		fitRates      []byte
-		piiReviewedAt *time.Time
+		c                domain.Column
+		inferredType     string
+		fitRates         []byte
+		piiReviewedAt    *time.Time
+		typeOverriddenAt *time.Time
 	)
 	err := r.pool.QueryRow(ctx,
 		`SELECT id, dataset_id, name, inferred_type, type_confidence, type_fit_rates,
-		        pii_flag, pii_pattern, pii_reviewed_at, excluded_from_model, null_rate, distinct_count
+		        pii_flag, pii_pattern, pii_reviewed_at, type_overridden_at,
+		        excluded_from_model, null_rate, distinct_count
 		 FROM columns WHERE id = $1`,
 		id,
 	).Scan(&c.ID, &c.DatasetID, &c.Name, &inferredType, &c.TypeConfidence, &fitRates,
-		&c.PIIFlag, &c.PIIPattern, &piiReviewedAt, &c.ExcludedFromModel, &c.NullRate, &c.DistinctCount)
+		&c.PIIFlag, &c.PIIPattern, &piiReviewedAt, &typeOverriddenAt,
+		&c.ExcludedFromModel, &c.NullRate, &c.DistinctCount)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.Column{}, ErrColumnNotFound
@@ -145,6 +155,7 @@ func (r *ColumnRepository) GetByID(ctx context.Context, id string) (domain.Colum
 	c.InferredType = domain.InferredType(inferredType)
 	c.TypeFitRates = parseFitRates(fitRates)
 	c.PIIReviewedAt = formatNullableTime(piiReviewedAt)
+	c.TypeOverriddenAt = formatNullableTime(typeOverriddenAt)
 	return c, nil
 }
 
@@ -155,18 +166,21 @@ func (r *ColumnRepository) GetByID(ctx context.Context, id string) (domain.Colum
 // API's existing non-enumeration pattern (see handleListColumns's doc comment).
 func (r *ColumnRepository) GetByIDForWorkspace(ctx context.Context, id, workspaceID string) (domain.Column, error) {
 	var (
-		c             domain.Column
-		inferredType  string
-		fitRates      []byte
-		piiReviewedAt *time.Time
+		c                domain.Column
+		inferredType     string
+		fitRates         []byte
+		piiReviewedAt    *time.Time
+		typeOverriddenAt *time.Time
 	)
 	err := r.pool.QueryRow(ctx,
 		`SELECT id, dataset_id, name, inferred_type, type_confidence, type_fit_rates,
-		        pii_flag, pii_pattern, pii_reviewed_at, excluded_from_model, null_rate, distinct_count
+		        pii_flag, pii_pattern, pii_reviewed_at, type_overridden_at,
+		        excluded_from_model, null_rate, distinct_count
 		 FROM columns WHERE id = $1 AND workspace_id = $2`,
 		id, workspaceID,
 	).Scan(&c.ID, &c.DatasetID, &c.Name, &inferredType, &c.TypeConfidence, &fitRates,
-		&c.PIIFlag, &c.PIIPattern, &piiReviewedAt, &c.ExcludedFromModel, &c.NullRate, &c.DistinctCount)
+		&c.PIIFlag, &c.PIIPattern, &piiReviewedAt, &typeOverriddenAt,
+		&c.ExcludedFromModel, &c.NullRate, &c.DistinctCount)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.Column{}, ErrColumnNotFound
@@ -176,6 +190,7 @@ func (r *ColumnRepository) GetByIDForWorkspace(ctx context.Context, id, workspac
 	c.InferredType = domain.InferredType(inferredType)
 	c.TypeFitRates = parseFitRates(fitRates)
 	c.PIIReviewedAt = formatNullableTime(piiReviewedAt)
+	c.TypeOverriddenAt = formatNullableTime(typeOverriddenAt)
 	return c, nil
 }
 
@@ -201,7 +216,8 @@ func (r *ColumnRepository) UpdateInferredType(ctx context.Context, id string, t 
 	_, err := r.pool.Exec(ctx,
 		`UPDATE columns
 		    SET inferred_type = $2,
-		        type_confidence = COALESCE((type_fit_rates ->> $2)::double precision, type_confidence)
+		        type_confidence = COALESCE((type_fit_rates ->> $2)::double precision, type_confidence),
+		        type_overridden_at = now()
 		  WHERE id = $1`,
 		id, string(t),
 	)

@@ -346,6 +346,12 @@ type Column struct {
 	// internal/store/postgres converts NULL <-> "" at the boundary, as migration 00002 established
 	// for audit_log_entries.workspace_id.
 	PIIReviewedAt string `json:"pii_reviewed_at,omitempty"`
+	// TypeOverriddenAt is when the user last set a type override on this column (FEAT-006), as an
+	// RFC 3339 timestamp. Empty when no override has ever been set — the column's active type is
+	// still the original profile — which is exactly what distinguishes an overridden type from the
+	// original inference. FEAT-048's deletion-impact disclosure reads this to know whether review
+	// work would be lost. Same string/empty convention as PIIReviewedAt.
+	TypeOverriddenAt string `json:"type_overridden_at,omitempty"`
 	// ExcludedFromModel keeps this column out of every model payload. The engine may still query
 	// it — exclusion governs egress, not access.
 	ExcludedFromModel bool `json:"excluded_from_model"`

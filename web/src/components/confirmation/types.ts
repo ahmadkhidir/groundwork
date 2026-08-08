@@ -43,6 +43,12 @@ export interface ConfirmationColumn {
    * truthiness check, per the empty-string-means-absent convention.
    */
   pii_reviewed_at?: string;
+  /**
+   * When the user last set a type override on this column. Empty/absent when no override has ever
+   * been set — the active type is still the original inference — which is what distinguishes an
+   * overridden type from the original profile (schema.md; FEAT-048's deletion-impact reads it).
+   */
+  type_overridden_at?: string;
   excluded_from_model: boolean;
   null_rate: number;
   distinct_count: number;
