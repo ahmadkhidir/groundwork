@@ -80,7 +80,7 @@ func newTestServerWithAuth(t *testing.T) *Server {
 		Environment:    "development",
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	service := auth.NewService(newFakeUserStore(), logger)
+	service := auth.NewService(newFakeUserStore(), auth.NewMemoryResetTokenStore(), logger)
 	return NewServer(cfg, logger, service, Dependencies{})
 }
 

@@ -1,72 +1,117 @@
 package auth
 
 import (
+	"context"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 )
 
-func TestResetTokenStoreIssueAndConsume(t *testing.T) {
-	store := NewResetTokenStore()
+// The in-memory store's contract must mirror the durable repository's (single-use on any attempt,
+// invalidate-others on success), so the seam's behavior is pinned without a database.
 
-	token := store.Issue("user_1")
-	if token == "" {
-		t.Fatal("Issue() returned an empty token")
+func TestMemoryResetTokenStoreIssueAndConsume(t *testing.T) {
+	store := NewMemoryResetTokenStore()
+	ctx := context.Background()
+
+	if err := store.Issue(ctx, "user-1", "the-token-hash", time.Now().Add(resetTokenTTL)); err != nil {
+		t.Fatalf("Issue() error = %v", err)
 	}
 
-	userID, ok := store.Consume(token)
-	if !ok {
-		t.Fatal("Consume() ok = false, want true for a freshly issued token")
+	userID, err := store.Consume(ctx, "the-token-hash")
+	if err != nil {
+		t.Fatalf("Consume() error = %v", err)
 	}
-	if userID != "user_1" {
-		t.Errorf("Consume() userID = %q, want user_1", userID)
-	}
-}
-
-func TestResetTokenStoreTokenIsSingleUse(t *testing.T) {
-	store := NewResetTokenStore()
-	token := store.Issue("user_1")
-
-	if _, ok := store.Consume(token); !ok {
-		t.Fatal("first Consume() ok = false, want true")
-	}
-
-	// A leaked or observed token must not be replayable after a legitimate use.
-	if _, ok := store.Consume(token); ok {
-		t.Error("second Consume() ok = true, want false — a token must not be reusable")
+	if userID != "user-1" {
+		t.Errorf("userID = %q, want user-1", userID)
 	}
 }
 
-func TestResetTokenStoreRejectsUnknownToken(t *testing.T) {
-	store := NewResetTokenStore()
+func TestMemoryResetTokenStoreTokenIsSingleUse(t *testing.T) {
+	store := NewMemoryResetTokenStore()
+	ctx := context.Background()
+	if err := store.Issue(ctx, "user-1", "h", time.Now().Add(resetTokenTTL)); err != nil {
+		t.Fatalf("Issue() error = %v", err)
+	}
 
-	if _, ok := store.Consume("never-issued"); ok {
-		t.Error("Consume() ok = true, want false for a token that was never issued")
+	if _, err := store.Consume(ctx, "h"); err != nil {
+		t.Fatalf("first Consume() error = %v", err)
+	}
+	if _, err := store.Consume(ctx, "h"); !errors.Is(err, ErrResetTokenNotFound) {
+		t.Errorf("second Consume() error = %v, want ErrResetTokenNotFound", err)
 	}
 }
 
-func TestResetTokenStoreRejectsExpiredToken(t *testing.T) {
-	store := NewResetTokenStore()
-	token := store.Issue("user_1")
-
-	// Directly back-date the entry rather than sleeping resetTokenTTL in a test.
-	store.mu.Lock()
-	entry := store.entries[token]
-	entry.expiresAt = time.Now().Add(-time.Minute)
-	store.entries[token] = entry
-	store.mu.Unlock()
-
-	if _, ok := store.Consume(token); ok {
-		t.Error("Consume() ok = true, want false for an expired token")
+func TestMemoryResetTokenStoreRejectsUnknownToken(t *testing.T) {
+	store := NewMemoryResetTokenStore()
+	if _, err := store.Consume(context.Background(), "never-issued"); !errors.Is(err, ErrResetTokenNotFound) {
+		t.Errorf("Consume() error = %v, want ErrResetTokenNotFound", err)
 	}
 }
 
-func TestResetTokenStoreIssuesUniqueTokens(t *testing.T) {
-	store := NewResetTokenStore()
+func TestMemoryResetTokenStoreRejectsExpiredToken(t *testing.T) {
+	store := NewMemoryResetTokenStore()
+	ctx := context.Background()
+	if err := store.Issue(ctx, "user-1", "h", time.Now().Add(-time.Minute)); err != nil {
+		t.Fatalf("Issue() error = %v", err)
+	}
+	if _, err := store.Consume(ctx, "h"); !errors.Is(err, ErrResetTokenNotFound) {
+		t.Errorf("Consume() error = %v, want ErrResetTokenNotFound", err)
+	}
+}
 
-	first := store.Issue("user_1")
-	second := store.Issue("user_2")
+func TestMemoryResetTokenStoreConsumeInvalidatesOtherTokensForUser(t *testing.T) {
+	// screens/19 step 5: consuming one token invalidates the user's other outstanding tokens.
+	store := NewMemoryResetTokenStore()
+	ctx := context.Background()
+	if err := store.Issue(ctx, "user-1", "hash-a", time.Now().Add(resetTokenTTL)); err != nil {
+		t.Fatalf("Issue(a) error = %v", err)
+	}
+	if err := store.Issue(ctx, "user-1", "hash-b", time.Now().Add(resetTokenTTL)); err != nil {
+		t.Fatalf("Issue(b) error = %v", err)
+	}
 
-	if first == second {
-		t.Error("Issue() produced the same token for two different users")
+	if _, err := store.Consume(ctx, "hash-a"); err != nil {
+		t.Fatalf("Consume(a) error = %v", err)
+	}
+	if _, err := store.Consume(ctx, "hash-b"); !errors.Is(err, ErrResetTokenNotFound) {
+		t.Errorf("Consume(b) after a succeeded: error = %v, want ErrResetTokenNotFound", err)
+	}
+}
+
+func TestMemoryResetTokenStoreConsumeLeavesOtherUsersTokensAlone(t *testing.T) {
+	store := NewMemoryResetTokenStore()
+	ctx := context.Background()
+	if err := store.Issue(ctx, "user-1", "hash-1", time.Now().Add(resetTokenTTL)); err != nil {
+		t.Fatalf("Issue(user-1) error = %v", err)
+	}
+	if err := store.Issue(ctx, "user-2", "hash-2", time.Now().Add(resetTokenTTL)); err != nil {
+		t.Fatalf("Issue(user-2) error = %v", err)
+	}
+
+	if _, err := store.Consume(ctx, "hash-1"); err != nil {
+		t.Fatalf("Consume(user-1) error = %v", err)
+	}
+	if _, err := store.Consume(ctx, "hash-2"); err != nil {
+		t.Errorf("Consume(user-2) after user-1 consumed: error = %v, want success", err)
+	}
+}
+
+func TestHashTokenIsDeterministicAndOneWay(t *testing.T) {
+	token := "some-raw-token"
+	hash := hashToken(token)
+
+	if hash == token {
+		t.Error("hash must differ from the raw token")
+	}
+	if hashToken(token) != hash {
+		t.Error("hashToken must be deterministic")
+	}
+	if len(hash) != 64 {
+		t.Errorf("SHA-256 hex length = %d, want 64", len(hash))
+	}
+	if strings.Contains(hash, token) {
+		t.Error("the raw token is recoverable from its hash")
 	}
 }

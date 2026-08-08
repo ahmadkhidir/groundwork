@@ -1,10 +1,12 @@
 package auth
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -62,7 +64,32 @@ func (f *fakeUserStore) UpdatePasswordHash(ctx context.Context, userID, password
 }
 
 func newTestService() *Service {
-	return NewService(newFakeUserStore(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return newTestServiceWithWriter(io.Discard)
+}
+
+// newTestServiceWithWriter wires the service's logger to w, so a test can capture the logged reset
+// token — the only delivery channel until the Transactional Email Provider lands (the log line is
+// what an operator relays manually).
+func newTestServiceWithWriter(w io.Writer) *Service {
+	return NewService(newFakeUserStore(), NewMemoryResetTokenStore(), slog.New(slog.NewTextHandler(w, nil)))
+}
+
+// captureResetToken parses the `reset_token=<value>` field out of a slog text-format log buffer.
+func captureResetToken(t *testing.T, logOutput []byte) string {
+	t.Helper()
+	marker := "reset_token="
+	idx := strings.Index(string(logOutput), marker)
+	if idx < 0 {
+		t.Fatalf("no reset_token in service log: %q", string(logOutput))
+	}
+	rest := string(logOutput)[idx+len(marker):]
+	if end := strings.IndexAny(rest, " \n"); end >= 0 {
+		rest = rest[:end]
+	}
+	if rest == "" {
+		t.Fatal("empty reset_token in service log")
+	}
+	return rest
 }
 
 func TestSignUpCreatesAnAccount(t *testing.T) {
@@ -242,7 +269,8 @@ func TestAuthenticateDoesNotDistinguishWrongPasswordFromNoSuchAccount(t *testing
 }
 
 func TestPasswordResetRequestThenConfirmChangesThePassword(t *testing.T) {
-	svc := newTestService()
+	var logBuf bytes.Buffer
+	svc := newTestServiceWithWriter(&logBuf)
 	ctx := context.Background()
 	if _, err := svc.SignUp(ctx, "ngozi@example.com", "old-password"); err != nil {
 		t.Fatalf("SignUp() error = %v", err)
@@ -252,16 +280,9 @@ func TestPasswordResetRequestThenConfirmChangesThePassword(t *testing.T) {
 		t.Fatalf("RequestPasswordReset() error = %v", err)
 	}
 
-	// The service logs the token rather than returning it (see ResetTokenStore's doc comment), so
-	// the test reaches into the store the way an operator relaying the logged token effectively
-	// would — it's the only handle available without a real delivery channel.
-	var token string
-	for tok := range svc.resets.entries {
-		token = tok
-	}
-	if token == "" {
-		t.Fatal("no reset token was issued")
-	}
+	// The service logs the token rather than returning it (see reset_store.go's doc comment), so the
+	// test captures it the way an operator relaying the logged token would.
+	token := captureResetToken(t, logBuf.Bytes())
 
 	if err := svc.ConfirmPasswordReset(ctx, token, "new-password"); err != nil {
 		t.Fatalf("ConfirmPasswordReset() error = %v", err)
@@ -272,6 +293,38 @@ func TestPasswordResetRequestThenConfirmChangesThePassword(t *testing.T) {
 	}
 	if _, err := svc.Authenticate(ctx, "ngozi@example.com", "new-password"); err != nil {
 		t.Errorf("Authenticate() with new password error = %v, want nil", err)
+	}
+}
+
+func TestPasswordResetStoresOnlyTheTokenHash(t *testing.T) {
+	// schema.md's PasswordResetToken.token_hash: the raw token is never persisted — the store key is
+	// its one-way hash, and the raw token cannot be recovered from the store.
+	var logBuf bytes.Buffer
+	svc := newTestServiceWithWriter(&logBuf)
+	ctx := context.Background()
+	if _, err := svc.SignUp(ctx, "ngozi@example.com", "old-password"); err != nil {
+		t.Fatalf("SignUp() error = %v", err)
+	}
+	if err := svc.RequestPasswordReset(ctx, "ngozi@example.com"); err != nil {
+		t.Fatalf("RequestPasswordReset() error = %v", err)
+	}
+	token := captureResetToken(t, logBuf.Bytes())
+
+	entries := svc.resets.(*MemoryResetTokenStore).entries
+	if len(entries) != 1 {
+		t.Fatalf("stored %d tokens, want 1", len(entries))
+	}
+	for stored := range entries {
+		if stored == token {
+			t.Error("the raw token is stored verbatim — only the hash may be persisted")
+		}
+		if stored != hashToken(token) {
+			t.Errorf("stored key = %q, want hashToken(token) = %q", stored, hashToken(token))
+		}
+	}
+	// The raw token must not consume anything — only its hash matches a stored entry.
+	if _, err := svc.resets.Consume(ctx, token); !errors.Is(err, ErrResetTokenNotFound) {
+		t.Errorf("raw token consumed the store: error = %v, want ErrResetTokenNotFound", err)
 	}
 }
 
@@ -295,7 +348,8 @@ func TestConfirmPasswordResetRejectsUnknownToken(t *testing.T) {
 }
 
 func TestConfirmPasswordResetTokenIsSingleUse(t *testing.T) {
-	svc := newTestService()
+	var logBuf bytes.Buffer
+	svc := newTestServiceWithWriter(&logBuf)
 	ctx := context.Background()
 	if _, err := svc.SignUp(ctx, "ngozi@example.com", "old-password"); err != nil {
 		t.Fatalf("SignUp() error = %v", err)
@@ -303,10 +357,7 @@ func TestConfirmPasswordResetTokenIsSingleUse(t *testing.T) {
 	if err := svc.RequestPasswordReset(ctx, "ngozi@example.com"); err != nil {
 		t.Fatalf("RequestPasswordReset() error = %v", err)
 	}
-	var token string
-	for tok := range svc.resets.entries {
-		token = tok
-	}
+	token := captureResetToken(t, logBuf.Bytes())
 
 	if err := svc.ConfirmPasswordReset(ctx, token, "new-password-1"); err != nil {
 		t.Fatalf("first ConfirmPasswordReset() error = %v", err)

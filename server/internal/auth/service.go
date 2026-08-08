@@ -55,7 +55,7 @@ type LoginAuditor interface {
 // Service implements FEAT-001: account creation, credential verification, and password reset.
 type Service struct {
 	users  UserStore
-	resets *ResetTokenStore
+	resets ResetTokenStore
 	logger *slog.Logger
 	// loginAuditor is nil until SetLoginAuditor is called. Kept optional (rather than a required
 	// constructor argument) so every existing caller of NewService — including this package's own
@@ -66,11 +66,13 @@ type Service struct {
 	clock func() time.Time
 }
 
-// NewService constructs a Service backed by users.
-func NewService(users UserStore, logger *slog.Logger) *Service {
+// NewService constructs a Service backed by users and the durable resets store. The resets
+// argument is the production reset-token persistence (internal/store/postgres.ResetTokenRepository);
+// tests pass the in-memory MemoryResetTokenStore.
+func NewService(users UserStore, resets ResetTokenStore, logger *slog.Logger) *Service {
 	return &Service{
 		users:  users,
-		resets: NewResetTokenStore(),
+		resets: resets,
 		logger: logger,
 		clock:  time.Now,
 	}
@@ -156,8 +158,10 @@ func (s *Service) Authenticate(ctx context.Context, email, password string) (dom
 // Always returns nil for a "no such account" outcome — the caller sends one generic response
 // regardless, so this method must never let the handler distinguish the two cases (the same
 // no-enumeration rule as Authenticate). The token is logged, not emailed or returned to the
-// caller: see ResetTokenStore's doc comment for the missing email-delivery integration this
-// stands in for.
+// caller: see reset_store.go's doc comment for the missing email-delivery integration this stands
+// in for (the Transactional Email Provider is a vendor decision, per architecture.md). Only the
+// token's one-way hash is persisted (schema.md's PasswordResetToken.token_hash); the raw token
+// exists only in the delivered link and this log line.
 func (s *Service) RequestPasswordReset(ctx context.Context, email string) error {
 	email = normalizeEmail(email)
 
@@ -169,7 +173,10 @@ func (s *Service) RequestPasswordReset(ctx context.Context, email string) error 
 		return err
 	}
 
-	token := s.resets.Issue(user.ID)
+	token := randomToken()
+	if err := s.resets.Issue(ctx, user.ID, hashToken(token), s.clock().Add(resetTokenTTL)); err != nil {
+		return fmt.Errorf("issuing reset token: %w", err)
+	}
 	s.logger.Info("password reset requested",
 		slog.String("user_id", user.ID),
 		slog.String("reset_token", token),
@@ -180,9 +187,12 @@ func (s *Service) RequestPasswordReset(ctx context.Context, email string) error 
 // ConfirmPasswordReset consumes a reset token and sets a new password for the account it was issued
 // to. Returns ErrInvalidResetToken for a missing, already-used, or expired token.
 func (s *Service) ConfirmPasswordReset(ctx context.Context, token, newPassword string) error {
-	userID, ok := s.resets.Consume(token)
-	if !ok {
-		return ErrInvalidResetToken
+	userID, err := s.resets.Consume(ctx, hashToken(token))
+	if err != nil {
+		if errors.Is(err, ErrResetTokenNotFound) {
+			return ErrInvalidResetToken
+		}
+		return fmt.Errorf("consuming reset token: %w", err)
 	}
 	if err := validatePassword(newPassword); err != nil {
 		return err

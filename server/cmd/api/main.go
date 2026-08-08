@@ -66,7 +66,10 @@ func run(logger *slog.Logger) error {
 	auditRepo := postgres.NewAuditRepository(pool)
 	auditWriter := audit.NewWriter(auditRepo)
 
-	authService := auth.NewService(userRepo, logger)
+	// Reset tokens are durable (password_reset_tokens, migration 00011) so a reset link survives a
+	// restart or a multi-instance deployment — the in-memory store did not (see auth.reset_store.go).
+	resetTokens := postgres.NewResetTokenRepository(pool)
+	authService := auth.NewService(userRepo, resetTokens, logger)
 	authService.SetLoginAuditor(auditWriter)
 
 	objectStore := storage.NewClient(storage.Config{
