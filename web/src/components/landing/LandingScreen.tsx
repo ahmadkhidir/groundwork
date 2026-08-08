@@ -27,22 +27,24 @@ export function LandingScreen({ signedIn }: LandingScreenProps) {
       <header className="sticky top-0 z-40 border-b border-border bg-surface/90 backdrop-blur">
         <nav
           aria-label="Main"
-          className="mx-auto flex w-full max-w-6xl items-center justify-between gap-4 px-4 py-3 lg:px-8"
+          className="mx-auto flex w-full max-w-6xl items-center justify-between gap-2 px-3 py-2.5 sm:gap-4 sm:px-4 sm:py-3 lg:px-8"
         >
-          {/* Brand logo (screens/01's Navbar "logo"). The logo is a dark-on-transparent lockup, so
-              it inverts in dark mode to stay visible on the dark surface. */}
+          {/* Brand lockup + wordmark (screens/01's Navbar "logo"). The logo is a dark-on-transparent
+              asset, so it inverts in dark mode; it is decorative here because the text beside it is
+              the accessible name. Sized down at the mobile base so the two CTAs beside it never jam. */}
           <Link
             href={routes.home()}
-            className="flex items-center gap-2 text-h3 text-text-primary"
+            className="flex min-w-0 items-center gap-1.5 text-body text-text-primary sm:gap-2 sm:text-h3"
           >
             <Image
               src="/images/logo.png"
-              alt="Groundwork"
+              alt=""
               width={506}
               height={506}
               priority
-              className="h-8 w-auto dark:invert"
+              className="h-7 w-auto shrink-0 dark:invert sm:h-8"
             />
+            <span className="truncate">Groundwork</span>
           </Link>
           <div className="hidden items-center gap-6 text-body-small text-text-secondary sm:flex">
             <a href="#how-it-works" className="hover:text-text-primary">
@@ -52,16 +54,16 @@ export function LandingScreen({ signedIn }: LandingScreenProps) {
               Pricing
             </a>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex shrink-0 items-center gap-1.5 sm:gap-2">
             <Link
               href={routes.login()}
-              className={buttonClassNames("ghost", "h-(--size-button-height) px-3")}
+              className={buttonClassNames("ghost", "h-(--size-button-height) px-2.5 sm:px-3")}
             >
               Log in
             </Link>
             <Link
               href={signedIn ? routes.workspaces() : routes.signup()}
-              className={buttonClassNames("primary", "h-(--size-button-height) px-3")}
+              className={buttonClassNames("primary", "h-(--size-button-height) px-2.5 sm:px-3")}
             >
               {signedIn ? "Go to Workspaces" : "Get started"}
             </Link>
@@ -169,14 +171,17 @@ export function LandingScreen({ signedIn }: LandingScreenProps) {
 
       <footer className="border-t border-border bg-surface-secondary/50">
         <div className="mx-auto flex w-full max-w-6xl flex-col items-center justify-between gap-4 px-4 py-8 text-body-small text-text-secondary sm:flex-row lg:px-8">
-          <div className="flex items-center gap-2">
+          {/* The brand group wraps on narrow screens: logo + wordmark + tagline would otherwise
+              exceed a 320px viewport's content width and overflow the footer. */}
+          <div className="flex flex-wrap items-center justify-center gap-x-2 gap-y-1">
             <Image
               src="/images/logo.png"
-              alt="Groundwork"
+              alt=""
               width={506}
               height={506}
               className="h-5 w-auto dark:invert"
             />
+            <span className="text-text-primary">Groundwork</span>
             <span>· Every number, traced back to the data.</span>
           </div>
           <div className="flex items-center gap-4">

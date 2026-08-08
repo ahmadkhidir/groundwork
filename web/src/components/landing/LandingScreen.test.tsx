@@ -5,14 +5,18 @@ import { LandingScreen } from "./LandingScreen";
 
 describe("LandingScreen", () => {
   it("renders the hero, how-it-works, pricing teaser, and footer for a visitor", () => {
-    render(<LandingScreen signedIn={false} />);
+    const { container } = render(<LandingScreen signedIn={false} />);
 
-    // The brand lockup sits in the navbar and the footer (screens/01's Navbar "logo").
-    const logos = screen.getAllByRole("img", { name: "Groundwork" });
+    // The brand lockup + wordmark sit in the navbar and the footer (screens/01's Navbar "logo");
+    // the images are decorative (alt="") with the text carrying the accessible name.
+    const logos = container.querySelectorAll("img");
     expect(logos.length).toBeGreaterThanOrEqual(2);
-    for (const logo of logos) {
+    for (const logo of Array.from(logos)) {
+      expect(logo.getAttribute("src")).toContain("logo.png");
+      expect(logo.getAttribute("alt")).toBe("");
       expect(logo.className).toContain("dark:invert");
     }
+    expect(screen.getAllByText("Groundwork").length).toBeGreaterThanOrEqual(2);
 
     expect(
       screen.getByRole("heading", { name: "Every number, traced back to the data." }),
