@@ -109,6 +109,27 @@ type Config struct {
 	StripeWebhookSecret string // verifies Stripe-Signature on POST /v1/billing/webhook
 	StripePricePro      string // recurring monthly Price ID for Pro
 	StripePriceTeam     string // recurring monthly Price ID for Team
+
+	// Mail is the transactional email configuration for password-reset link delivery
+	// (architecture.md's Transactional Email Provider). All fields optional in the same sense as
+	// AnthropicAPIKey: with SMTPHost unset, delivery is disabled and the structured log line remains
+	// the relay path (see internal/mail). No vendor is baked in — any provider's SMTP credentials
+	// configure this.
+	Mail MailConfig
+}
+
+// MailConfig describes the SMTP endpoint reset links are delivered through.
+type MailConfig struct {
+	SMTPHost     string
+	SMTPPort     int
+	SMTPUser     string
+	SMTPPassword string
+	// From is the envelope/From address for reset mail. Empty disables delivery alongside an empty
+	// SMTPHost.
+	From string
+	// WebBaseURL is the web origin reset links are built from (the link points at the web tier's
+	// /reset-password route). Defaults to the AllowedOrigin, which IS the web origin.
+	WebBaseURL string
 }
 
 // StorageConfig describes the S3-compatible object store holding uploaded and normalized datasets.
@@ -183,6 +204,16 @@ func Load() (Config, error) {
 	cfg.StripePricePro = os.Getenv("STRIPE_PRICE_PRO")
 	cfg.StripePriceTeam = os.Getenv("STRIPE_PRICE_TEAM")
 
+	// Optional by design — see the fields' doc comment. Consumed by password-reset delivery only.
+	cfg.Mail = MailConfig{
+		SMTPHost:     os.Getenv("SMTP_HOST"),
+		SMTPPort:     envOrDefaultInt("SMTP_PORT", 587),
+		SMTPUser:     os.Getenv("SMTP_USER"),
+		SMTPPassword: os.Getenv("SMTP_PASSWORD"),
+		From:         os.Getenv("EMAIL_FROM"),
+		WebBaseURL:   envOrDefault("WEB_BASE_URL", cfg.AllowedOrigin),
+	}
+
 	cfg.Storage = StorageConfig{
 		Endpoint:        os.Getenv("S3_ENDPOINT"),
 		Bucket:          os.Getenv("S3_BUCKET"),
@@ -219,6 +250,19 @@ func Load() (Config, error) {
 func envOrDefault(key, fallback string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
+	}
+	return fallback
+}
+
+// envOrDefaultInt parses an integer environment variable, returning fallback when unset or invalid.
+// Invalid values are deliberately silent here (unlike MAX_UPLOAD_BYTES, which is a security
+// control): a misconfigured SMTP port falling back to the standard 587 is a cosmetic problem, not
+// a data-safety one.
+func envOrDefaultInt(key string, fallback int) int {
+	if value := os.Getenv(key); value != "" {
+		if parsed, err := strconv.Atoi(value); err == nil && parsed > 0 {
+			return parsed
+		}
 	}
 	return fallback
 }

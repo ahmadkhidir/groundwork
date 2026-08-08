@@ -52,6 +52,14 @@ type LoginAuditor interface {
 	WriteLogin(ctx context.Context, userID string) error
 }
 
+// ResetTokenDeliverer delivers the password-reset link for a token (architecture.md's Transactional
+// Email Provider seam), satisfied by internal/mail.Client. The link carries the RAW token — the
+// store persists only its hash (schema.md PasswordResetToken.token_hash). Delivery is best-effort by
+// contract: a failure is logged, never propagated to the reset-request flow.
+type ResetTokenDeliverer interface {
+	DeliverPasswordReset(ctx context.Context, to, token string) error
+}
+
 // Service implements FEAT-001: account creation, credential verification, and password reset.
 type Service struct {
 	users  UserStore
@@ -62,6 +70,9 @@ type Service struct {
 	// tests and internal/api's — keeps compiling unchanged; cmd/api/main.go is the one production
 	// caller that wires a real one.
 	loginAuditor LoginAuditor
+	// resetDeliverer is nil until SetResetTokenDeliverer is called; while nil, password-reset
+	// delivery stays the structured log line (the operator-relay fallback). See ResetTokenDeliverer.
+	resetDeliverer ResetTokenDeliverer
 	// clock is overridden in tests; defaults to time.Now.
 	clock func() time.Time
 }
@@ -83,6 +94,13 @@ func NewService(users UserStore, resets ResetTokenStore, logger *slog.Logger) *S
 // of this Service's optional collaborators.
 func (s *Service) SetLoginAuditor(a LoginAuditor) {
 	s.loginAuditor = a
+}
+
+// SetResetTokenDeliverer wires transactional email delivery for reset links (internal/mail.Client).
+// Until called, delivery stays the structured log line — the operator-relay fallback documented on
+// ResetTokenDeliverer.
+func (s *Service) SetResetTokenDeliverer(d ResetTokenDeliverer) {
+	s.resetDeliverer = d
 }
 
 // SignUp creates a new account for email/password.
@@ -157,11 +175,10 @@ func (s *Service) Authenticate(ctx context.Context, email, password string) (dom
 //
 // Always returns nil for a "no such account" outcome — the caller sends one generic response
 // regardless, so this method must never let the handler distinguish the two cases (the same
-// no-enumeration rule as Authenticate). The token is logged, not emailed or returned to the
-// caller: see reset_store.go's doc comment for the missing email-delivery integration this stands
-// in for (the Transactional Email Provider is a vendor decision, per architecture.md). Only the
-// token's one-way hash is persisted (schema.md's PasswordResetToken.token_hash); the raw token
-// exists only in the delivered link and this log line.
+// no-enumeration rule as Authenticate). The token is logged (the operator-relay path) and, when a
+// ResetTokenDeliverer is wired, emailed as a reset link — fire-and-forget, so a delivery failure
+// never changes the response. Only the token's one-way hash is persisted (schema.md's
+// PasswordResetToken.token_hash); the raw token exists only in the delivered link and this log line.
 func (s *Service) RequestPasswordReset(ctx context.Context, email string) error {
 	email = normalizeEmail(email)
 
@@ -181,6 +198,20 @@ func (s *Service) RequestPasswordReset(ctx context.Context, email string) error 
 		slog.String("user_id", user.ID),
 		slog.String("reset_token", token),
 	)
+	// Fire-and-forget delivery per architecture.md: the reset-request flow never depends on email.
+	// A failure (or an unconfigured provider) is logged and the response stays identical — the
+	// token is already in the log line above as the operator-relay path. A bounded timeout keeps a
+	// slow SMTP server from backing up the request path for long.
+	if s.resetDeliverer != nil {
+		deliverCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		if err := s.resetDeliverer.DeliverPasswordReset(deliverCtx, user.Email, token); err != nil {
+			s.logger.Error("delivering password reset email",
+				slog.String("error", err.Error()),
+				slog.String("user_id", user.ID),
+			)
+		}
+	}
 	return nil
 }
 

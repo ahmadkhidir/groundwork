@@ -92,6 +92,17 @@ func captureResetToken(t *testing.T, logOutput []byte) string {
 	return rest
 }
 
+// fakeResetDeliverer records delivered reset links, or returns a configured error.
+type fakeResetDeliverer struct {
+	calls []struct{ to, token string }
+	err   error
+}
+
+func (f *fakeResetDeliverer) DeliverPasswordReset(_ context.Context, to, token string) error {
+	f.calls = append(f.calls, struct{ to, token string }{to, token})
+	return f.err
+}
+
 func TestSignUpCreatesAnAccount(t *testing.T) {
 	svc := newTestService()
 
@@ -325,6 +336,44 @@ func TestPasswordResetStoresOnlyTheTokenHash(t *testing.T) {
 	// The raw token must not consume anything — only its hash matches a stored entry.
 	if _, err := svc.resets.Consume(ctx, token); !errors.Is(err, ErrResetTokenNotFound) {
 		t.Errorf("raw token consumed the store: error = %v, want ErrResetTokenNotFound", err)
+	}
+}
+
+func TestPasswordResetDeliversTheLinkViaTheDeliverer(t *testing.T) {
+	var logBuf bytes.Buffer
+	svc := newTestServiceWithWriter(&logBuf)
+	deliverer := &fakeResetDeliverer{}
+	svc.SetResetTokenDeliverer(deliverer)
+	ctx := context.Background()
+	if _, err := svc.SignUp(ctx, "ngozi@example.com", "old-password"); err != nil {
+		t.Fatalf("SignUp() error = %v", err)
+	}
+	if err := svc.RequestPasswordReset(ctx, "ngozi@example.com"); err != nil {
+		t.Fatalf("RequestPasswordReset() error = %v", err)
+	}
+	token := captureResetToken(t, logBuf.Bytes())
+
+	if len(deliverer.calls) != 1 {
+		t.Fatalf("deliverer got %d calls, want 1", len(deliverer.calls))
+	}
+	if deliverer.calls[0].to != "ngozi@example.com" {
+		t.Errorf("deliverer recipient = %q, want ngozi@example.com", deliverer.calls[0].to)
+	}
+	if deliverer.calls[0].token != token {
+		t.Error("deliverer received a token different from the one issued")
+	}
+}
+
+func TestPasswordResetDeliveryFailureDoesNotFailTheRequest(t *testing.T) {
+	// architecture.md: delivery is fire-and-forget — the reset-request flow never depends on email.
+	svc := newTestService()
+	svc.SetResetTokenDeliverer(&fakeResetDeliverer{err: errors.New("smtp down")})
+	ctx := context.Background()
+	if _, err := svc.SignUp(ctx, "ngozi@example.com", "old-password"); err != nil {
+		t.Fatalf("SignUp() error = %v", err)
+	}
+	if err := svc.RequestPasswordReset(ctx, "ngozi@example.com"); err != nil {
+		t.Errorf("RequestPasswordReset() error = %v, want nil even when email delivery fails", err)
 	}
 }
 

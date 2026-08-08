@@ -22,6 +22,7 @@ import (
 	"github.com/ahmadkhidir/groundwork/server/internal/engine"
 	"github.com/ahmadkhidir/groundwork/server/internal/events"
 	"github.com/ahmadkhidir/groundwork/server/internal/ingest"
+	"github.com/ahmadkhidir/groundwork/server/internal/mail"
 	"github.com/ahmadkhidir/groundwork/server/internal/metering"
 	"github.com/ahmadkhidir/groundwork/server/internal/model"
 	runpkg "github.com/ahmadkhidir/groundwork/server/internal/run"
@@ -71,6 +72,16 @@ func run(logger *slog.Logger) error {
 	resetTokens := postgres.NewResetTokenRepository(pool)
 	authService := auth.NewService(userRepo, resetTokens, logger)
 	authService.SetLoginAuditor(auditWriter)
+	// Transactional email delivery for reset links (architecture.md's email-provider seam). When
+	// SMTP is unconfigured the client is disabled and delivery stays the structured log line.
+	authService.SetResetTokenDeliverer(mail.NewClient(mail.Config{
+		SMTPHost:     cfg.Mail.SMTPHost,
+		SMTPPort:     cfg.Mail.SMTPPort,
+		SMTPUser:     cfg.Mail.SMTPUser,
+		SMTPPassword: cfg.Mail.SMTPPassword,
+		From:         cfg.Mail.From,
+		WebBaseURL:   cfg.Mail.WebBaseURL,
+	}))
 
 	objectStore := storage.NewClient(storage.Config{
 		Endpoint:        cfg.Storage.Endpoint,
