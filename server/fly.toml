@@ -1,0 +1,43 @@
+# Fly.io app for the Groundwork API service (the single Go backend).
+#
+# App name / region: adjust to your Fly org. `primary_region` should match the region your Neon
+# database and R2 bucket live in (single-region topology per architecture.md — co-locate for
+# lowest engine↔storage latency).
+#
+# Secrets (NEVER in this file): `fly secrets set` on this app —
+#   DATABASE_URL (Neon), S3_ENDPOINT/S3_BUCKET/S3_ACCESS_KEY_ID/S3_SECRET_ACCESS_KEY/S3_REGION
+#   (R2), ANTHROPIC_API_KEY, STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, STRIPE_PRICE_PRO,
+#   STRIPE_PRICE_TEAM, SMTP_* / EMAIL_FROM, and AUTH_SECRET — the SAME AUTH_SECRET value as the
+#   web app (the Go service decodes the Auth.js session cookie; a mismatch rejects every
+#   signed-in browser request).
+app = "groundwork-api"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  ENVIRONMENT = "production"
+  PORT = "8080"
+  # The web origin (CORS + password-reset links). Never "*" — credentials ride on every request.
+  ALLOWED_ORIGIN = "https://app.groundwork.app"
+  WEB_BASE_URL = "https://app.groundwork.app"
+  # Optional thresholds; defaults are fine unless overridden (see server/.env.example).
+  # MAX_UPLOAD_BYTES = "524288000"
+  # ENGINE_IDLE_TIMEOUT = "10m"
+  # USAGE_RECONCILE_INTERVAL = "24h"
+
+# The API is the always-on backend (it hosts the engine lifecycle and receives every browser
+# request with the session cookie), so it does NOT scale to zero — the per-session engine inside
+# it idles down on its own via ENGINE_IDLE_TIMEOUT.
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "requests"
+    hard_limit = 250
+    soft_limit = 200

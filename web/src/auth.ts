@@ -4,6 +4,7 @@ import { cookies } from "next/headers";
 import type { JWT } from "@auth/core/jwt";
 import { routes } from "@/lib/routes";
 import { isTierStale, refreshSessionTier } from "@/lib/session-tier";
+import { sessionTokenCookieConfig } from "@/lib/session-cookie";
 import type { SubscriptionTier, User as GroundworkUser } from "@/types/schema";
 
 /**
@@ -101,8 +102,21 @@ async function refreshTierClaim(token: JWT): Promise<JWT> {
   return token;
 }
 
+/**
+ * Production session-cookie configuration — see lib/session-cookie.ts. In production (COOKIE_DOMAIN
+ * set) the session token is set under the plain name with a Domain so the browser sends it to the
+ * Go API on a sibling subdomain; locally the defaults (host-only) are preserved.
+ */
+const sessionCookieConfig = sessionTokenCookieConfig(process.env.COOKIE_DOMAIN);
+
 export const { handlers, auth, signIn, signOut } = NextAuth({
   session: { strategy: "jwt" },
+
+  // Auth.js v5 requires trusting the host behind a reverse proxy (Fly terminates TLS and forwards
+  // plain HTTP to the app). AUTH_URL is the canonical public origin.
+  trustHost: true,
+
+  cookies: sessionCookieConfig ? { sessionToken: sessionCookieConfig } : undefined,
 
   pages: {
     signIn: routes.login(),

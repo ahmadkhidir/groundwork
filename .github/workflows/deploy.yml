@@ -1,0 +1,57 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  # The deploy gate: the same checks as CI run here so a main push only deploys green. (Branch
+  # protection can additionally require the CI workflow's jobs; this keeps the guarantee even if
+  # it isn't configured.)
+  test:
+    name: Test
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    name: Deploy to Fly
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go (for goose migrations)
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+
+      - name: Setup flyctl
+        uses: superfly/flyctl-actions/setup-flyctl@master
+        with:
+          version: latest
+
+      # Migrations run BEFORE the API deploys, so the new binary never boots against an
+      # un-migrated schema. goose is pure Go (no cgo), run against the target Neon database.
+      # Migrations are additive by convention, so a failed deploy after a successful migrate
+      # leaves the previous binary working against the new schema.
+      - name: Migrate database
+        working-directory: server
+        env:
+          DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+        run: go run github.com/pressly/goose/v3/cmd/goose@latest -dir migrations postgres "$DATABASE_URL" up
+
+      - name: Deploy API
+        working-directory: server
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        # --remote-only builds on Fly's builder, so the runner needs no Docker daemon.
+        run: flyctl deploy --remote-only
+
+      - name: Deploy Web
+        working-directory: web
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: flyctl deploy --remote-only

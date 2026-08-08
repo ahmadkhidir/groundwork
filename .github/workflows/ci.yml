@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Reused by deploy.yml (the deploy gate) — a workflow_call-triggered run is identical to the
+  # push/PR runs.
+  workflow_call:
+
+jobs:
+  server:
+    name: Server (Go)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache-dependency-path: server/go.sum
+      - name: Format
+        run: make fmt
+      - name: Vet
+        run: make vet
+      - name: Test
+        run: make test
+
+  web:
+    name: Web (Next.js)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install
+        run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Lint
+        run: npm run lint
+      - name: Test
+        run: npm run test
+      - name: Build
+        run: npm run build
+        env:
+          # Build-time only. `next build` needs a value here (the prerendered pages call auth());
+          # the real secret is injected at runtime in production and never baked into an image.
+          AUTH_SECRET: ci-build-placeholder-only
+          AUTH_URL: http://localhost:3000
+          NEXT_PUBLIC_API_BASE_URL: http://localhost:8080
+          NEXT_PUBLIC_MAX_UPLOAD_BYTES: "524288000"

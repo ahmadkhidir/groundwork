@@ -1504,6 +1504,50 @@ authorization boundary, so a bare curl to a protected Next route only proves the
 `-H "Cookie: authjs.session-token=<token>"` and the full page actually renders. Dev diagnostic
 only; never ship it to production or point it at anything but localhost.
 
+**Deployment (GitHub Actions + Fly.io — set up 2026-08-08, production only).** Target topology per
+`architecture.md`: Fly.io (compute — two apps), Neon (Postgres), Cloudflare R2 (object storage),
+single region. CI/CD is `.github/workflows/ci.yml` (push to main + PR: server `make fmt/vet/test`
+on Linux — the static cgo linkage the Makefile's non-Windows path uses is exactly what CI needs —
+and web `npm ci` + typecheck + lint + vitest + standalone build) and `.github/workflows/deploy.yml`
+(main push: runs CI as the gate, then goose-migrates the Neon DB, then `flyctl deploy` of the API
+then the web, `--remote-only` so the runner needs no Docker).
+
+**One-time setup (no workflow run succeeds before this):**
+
+1. **Fly apps + region.** `flyctl apps create groundwork-api`, `flyctl apps create groundwork-web`.
+   Match `primary_region` in both `fly.toml`s to the Neon/R2 region (single-region co-location).
+2. **Domains.** Web at `app.<your-domain>`, API at `api.<your-domain>` (or similar) — they MUST be
+   sibling subdomains of one parent domain: the browser calls the Go API directly with the Auth.js
+   session cookie, and a cross-subdomain cookie requires a shared parent domain.
+3. **Secrets.** `fly secrets set` per app (never commit):
+   - `groundwork-api`: `DATABASE_URL` (Neon), `S3_ENDPOINT`/`S3_BUCKET`/`S3_ACCESS_KEY_ID`/
+     `S3_SECRET_ACCESS_KEY`/`S3_REGION` (R2 — S3-compatible), `ANTHROPIC_API_KEY`,
+     `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_PRO`, `STRIPE_PRICE_TEAM`,
+     `SMTP_HOST`/`SMTP_PORT`/`SMTP_USER`/`SMTP_PASSWORD`/`EMAIL_FROM`, and `AUTH_SECRET`.
+   - `groundwork-web`: `AUTH_SECRET` (**byte-identical to the API app** — the Go service decodes
+     the session cookie; a mismatch rejects every signed-in request) and `COOKIE_DOMAIN` (the
+     shared parent domain with a leading dot, e.g. `.groundwork.app`).
+   - GitHub repo secrets: `FLY_API_TOKEN` (a Fly token with deploy rights) and `NEON_DATABASE_URL`
+     (used by the migrate step).
+4. **Web build args.** `web/fly.toml` `[build.args]` bake the `NEXT_PUBLIC_*` values into the
+   client bundle — set the real Stripe publishable key and API URL there before first deploy.
+5. **Stripe webhook.** Point the Stripe webhook at `https://api.<your-domain>/v1/billing/webhook`.
+
+**Why the production session cookie is plain-named + domain-scoped (do not "fix" it back):** the
+browser sends the Auth.js session cookie to the Go API on a sibling subdomain, so the cookie needs
+a `Domain` attribute. The `__Secure-` prefix HTTPS defaults use FORBIDS a `Domain` attribute
+(browsers reject the Set-Cookie), so production sets the plain `authjs.session-token` name with
+`Domain=<COOKIE_DOMAIN>` (web/src/lib/session-cookie.ts). The Go decoder already checks both names
+(server/internal/authsession/session.go). Dev keeps the host-only default. `trustHost: true` is
+required for Auth.js v5 behind Fly's TLS termination.
+
+**Known image constraints (they are load-bearing, not optional):** `server/Dockerfile` installs
+the DuckDB `excel` + `sqlite_scanner` extensions at BUILD time into `$HOME/.duckdb` (R-017 — the
+production container must never `INSTALL` from extensions.duckdb.org at runtime) and pins the
+DuckDB CLI to 1.5.5, the exact version the driver targets; keep it in step with `server/go.mod`.
+The web image builds with a throwaway `AUTH_SECRET` (prerendered pages are unauthenticated) — the
+real secret is runtime-only, never baked into an image layer.
+
 **This Next.js version is not the one in your training data.** `web/AGENTS.md` is written by
 `next dev` and says so. Before writing app code, read the bundled docs at
 `web/node_modules/next/dist/docs/`. Changes already hit in Foundation:

@@ -1,0 +1,9 @@
+.git
+.env
+.env.*
+bin/
+*.exe
+coverage/
+Dockerfile
+fly.toml
+IMPLEMENTATION.md
