@@ -36,6 +36,8 @@ export const metadata: Metadata = {
     template: "%s · Groundwork",
   },
   description: "Every number, traced back to the data.",
+  // Favicon comes from the app/icon.png file convention (the user's brand icon) — no metadata
+  // entry needed; Next serves it automatically.
 };
 
 /**

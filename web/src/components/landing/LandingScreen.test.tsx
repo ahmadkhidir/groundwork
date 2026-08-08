@@ -7,6 +7,13 @@ describe("LandingScreen", () => {
   it("renders the hero, how-it-works, pricing teaser, and footer for a visitor", () => {
     render(<LandingScreen signedIn={false} />);
 
+    // The brand lockup sits in the navbar and the footer (screens/01's Navbar "logo").
+    const logos = screen.getAllByRole("img", { name: "Groundwork" });
+    expect(logos.length).toBeGreaterThanOrEqual(2);
+    for (const logo of logos) {
+      expect(logo.className).toContain("dark:invert");
+    }
+
     expect(
       screen.getByRole("heading", { name: "Every number, traced back to the data." }),
     ).toBeInTheDocument();

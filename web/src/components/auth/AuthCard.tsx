@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import Image from "next/image";
 import Link from "next/link";
 import { Card } from "@/components/ui/Card";
 
@@ -29,9 +30,16 @@ export function AuthCard({ title, toggle, children }: AuthCardProps) {
       className="flex min-h-full flex-1 items-center justify-center bg-surface-secondary p-4"
     >
       <div className="w-full max-w-sm">
-        <p className="mb-6 text-center text-h3 text-text-primary">
-          Groundwork
-        </p>
+        {/* The minimal logo header (screens/02). The logo is a dark-on-transparent lockup, so it
+            inverts in dark mode to stay visible on the dark surface. */}
+        <Image
+          src="/images/logo.png"
+          alt="Groundwork"
+          width={506}
+          height={506}
+          priority
+          className="mx-auto mb-6 h-12 w-auto dark:invert"
+        />
 
         <Card>
           <h1 className="mb-6 text-h2 text-text-primary">{title}</h1>

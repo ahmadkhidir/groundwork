@@ -1,5 +1,6 @@
 import Link from "next/link";
-import { ArrowRight, Database, FileUp, MessageSquareText, ScanSearch } from "lucide-react";
+import Image from "next/image";
+import { ArrowRight, FileUp, MessageSquareText, ScanSearch } from "lucide-react";
 import { buttonClassNames } from "@/components/ui/Button";
 import { PLANS } from "@/components/billing/PlanCard";
 import { ClaimDemo } from "./ClaimDemo";
@@ -28,8 +29,20 @@ export function LandingScreen({ signedIn }: LandingScreenProps) {
           aria-label="Main"
           className="mx-auto flex w-full max-w-6xl items-center justify-between gap-4 px-4 py-3 lg:px-8"
         >
-          <Link href={routes.home()} className="text-h3 text-text-primary">
-            Groundwork
+          {/* Brand logo (screens/01's Navbar "logo"). The logo is a dark-on-transparent lockup, so
+              it inverts in dark mode to stay visible on the dark surface. */}
+          <Link
+            href={routes.home()}
+            className="flex items-center gap-2 text-h3 text-text-primary"
+          >
+            <Image
+              src="/images/logo.png"
+              alt="Groundwork"
+              width={506}
+              height={506}
+              priority
+              className="h-8 w-auto dark:invert"
+            />
           </Link>
           <div className="hidden items-center gap-6 text-body-small text-text-secondary sm:flex">
             <a href="#how-it-works" className="hover:text-text-primary">
@@ -157,8 +170,13 @@ export function LandingScreen({ signedIn }: LandingScreenProps) {
       <footer className="border-t border-border bg-surface-secondary/50">
         <div className="mx-auto flex w-full max-w-6xl flex-col items-center justify-between gap-4 px-4 py-8 text-body-small text-text-secondary sm:flex-row lg:px-8">
           <div className="flex items-center gap-2">
-            <Database size={14} aria-hidden="true" />
-            <span className="text-text-primary">Groundwork</span>
+            <Image
+              src="/images/logo.png"
+              alt="Groundwork"
+              width={506}
+              height={506}
+              className="h-5 w-auto dark:invert"
+            />
             <span>· Every number, traced back to the data.</span>
           </div>
           <div className="flex items-center gap-4">
