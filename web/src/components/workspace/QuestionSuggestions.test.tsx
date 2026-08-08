@@ -106,6 +106,12 @@ describe("QuestionSuggestions", () => {
     expect(screen.getByText(SMART[0].question)).toBeInTheDocument();
     // The deterministic strip is still visible alongside the bucket.
     expect(screen.getByText(SUGGESTIONS[0])).toBeInTheDocument();
+    // The smart chip's fill button is the pill itself, with the SAME hover treatment as the
+    // deterministic chips (border → primary) — a smart question must not feel dead on hover.
+    const smartPill = screen.getByText(SMART[0].question).closest("button");
+    expect(smartPill).toHaveClass("hover:border-primary");
+    const standardPill = screen.getByText(SUGGESTIONS[0]).closest("button");
+    expect(standardPill).toHaveClass("hover:border-primary");
   });
 
   it("generates smart questions on Pro/Team and APPENDS them to the persisted bucket (no swap, no revert)", async () => {

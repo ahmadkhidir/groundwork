@@ -278,12 +278,15 @@ export function QuestionSuggestions({ workspaceId, onFill, tier }: QuestionSugge
             {smart.map((item) => (
               <span
                 key={item.id}
-                className="inline-flex max-w-full items-center rounded-full border border-border bg-surface-secondary py-1 pl-3 pr-1"
+                className="relative inline-flex max-w-full items-center"
               >
+                {/* The fill button IS the pill, carrying the same hover treatment as the
+                    deterministic chips (border → primary) so both groups feel identical. pr-8
+                    clears the overlaid delete control. */}
                 <button
                   type="button"
                   onClick={() => onFill(item.question)}
-                  className="min-w-0 shrink truncate text-left text-body-small text-text-primary transition-colors hover:text-text-primary focus:outline-2 focus:outline-primary"
+                  className="min-w-0 shrink truncate rounded-full border border-border bg-surface-secondary py-1.5 pl-3 pr-8 text-left text-body-small text-text-primary transition-colors hover:border-primary hover:text-text-primary focus:outline-2 focus:outline-primary"
                 >
                   {item.question}
                 </button>
@@ -292,7 +295,7 @@ export function QuestionSuggestions({ workspaceId, onFill, tier }: QuestionSugge
                   aria-label={`Delete ${item.question}`}
                   onClick={() => void handleDelete(item.id)}
                   disabled={deletingId === item.id}
-                  className="ml-1 inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-text-secondary transition-colors hover:bg-error/10 hover:text-error focus:outline-2 focus:outline-primary disabled:opacity-50"
+                  className="absolute right-1 top-1/2 inline-flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded-full text-text-secondary transition-colors hover:bg-error/10 hover:text-error focus:outline-2 focus:outline-primary disabled:opacity-50"
                 >
                   {deletingId === item.id ? (
                     <Loader2 size={12} className="animate-spin" aria-hidden="true" />
