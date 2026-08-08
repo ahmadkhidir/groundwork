@@ -11,6 +11,7 @@ import { ErrorState } from "@/components/shared/ErrorState";
 import { SkeletonList } from "@/components/shared/Skeleton";
 import { api, ApiError } from "@/lib/api-client";
 import { routes } from "@/lib/routes";
+import { upgradeLabelFor } from "@/lib/tier";
 import { SubscriptionTier, type MetricDefinition } from "@/types/schema";
 import {
   datasetGroupLabel,
@@ -383,11 +384,11 @@ function ExclusionControl({
     return (
       <Link
         href={routes.accountSettings()}
-        aria-label={`Upgrade to Pro/Team to exclude ${column.name} from model visibility`}
+        aria-label={`${upgradeLabelFor(SubscriptionTier.Pro)} to exclude ${column.name} from model visibility`}
         className="inline-flex items-center gap-1 rounded-sm border border-border px-2 py-1 text-body-small text-text-secondary hover:bg-surface-secondary"
       >
         <Lock size={12} aria-hidden="true" />
-        Upgrade to Pro/Team
+        {upgradeLabelFor(SubscriptionTier.Pro)}
       </Link>
     );
   }

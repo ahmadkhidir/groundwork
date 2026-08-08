@@ -19,6 +19,7 @@ import {
 import { Button } from "@/components/ui/Button";
 import { apiUrl, ApiError } from "@/lib/api-client";
 import { QueryParam, routes } from "@/lib/routes";
+import { upgradeLabelFor } from "@/lib/tier";
 import { SubscriptionTier } from "@/types/schema";
 import { cn } from "@/lib/cn";
 
@@ -318,7 +319,7 @@ function ExportDialogContent({
                           className="mt-1 inline-flex items-center gap-1 text-body-small text-provenance hover:text-provenance"
                         >
                           <Lock size={12} aria-hidden="true" />
-                          Upgrade to Pro/Team
+                          {upgradeLabelFor(option.minTier)}
                         </Link>
                       </span>
                     </div>

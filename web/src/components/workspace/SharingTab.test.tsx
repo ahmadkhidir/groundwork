@@ -55,12 +55,13 @@ describe("SharingTab", () => {
     expect(
       screen.getByText(/Shared report links are available on the Pro and Team plans/),
     ).toBeInTheDocument();
-    // Both locked sections carry the shared Upgrade Prompt, routed to the account plan screen.
-    const upgradeLinks = screen.getAllByRole("link", { name: /Upgrade to Pro\/Team/ });
-    expect(upgradeLinks).toHaveLength(2);
-    for (const link of upgradeLinks) {
-      expect(link).toHaveAttribute("href", "/settings");
-    }
+    // Both locked sections carry the shared Upgrade Prompt, routed to the account plan screen —
+    // each naming the plan(s) that actually unlock it: Team for workspace members (FEAT-045),
+    // Pro/Team for shared report links (FEAT-046).
+    const teamLink = screen.getByRole("link", { name: /Upgrade to Team/ });
+    expect(teamLink).toHaveAttribute("href", "/settings");
+    const proTeamLink = screen.getByRole("link", { name: /Upgrade to Pro\/Team/ });
+    expect(proTeamLink).toHaveAttribute("href", "/settings");
     // Locked sections never fetch (screens/13 Data Flow step 3).
     expect(getMock).not.toHaveBeenCalledWith("/v1/workspaces/ws-1/members");
     expect(getMock).not.toHaveBeenCalledWith("/v1/workspaces/ws-1/report-shares");
@@ -70,8 +71,12 @@ describe("SharingTab", () => {
     render(<SharingTab workspaceId="ws-1" tier={SubscriptionTier.Pro} />);
 
     expect(screen.getByText(/Workspace sharing is available on the Team plan/)).toBeInTheDocument();
-    const upgradeLink = screen.getByRole("link", { name: /Upgrade to Pro\/Team/ });
+    // The Team-only CTA names Team, not the misleading "Pro/Team".
+    const upgradeLink = screen.getByRole("link", { name: /Upgrade to Team/ });
     expect(upgradeLink).toHaveAttribute("href", "/settings");
+    expect(
+      screen.queryByRole("link", { name: /Upgrade to Pro\/Team/ }),
+    ).not.toBeInTheDocument();
     // Pro unlocks the report links section — it fetches.
     expect(getMock).toHaveBeenCalledWith("/v1/workspaces/ws-1/report-shares");
     expect(getMock).not.toHaveBeenCalledWith("/v1/workspaces/ws-1/members");

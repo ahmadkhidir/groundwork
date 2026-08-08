@@ -11,6 +11,7 @@ import { ErrorState } from "@/components/shared/ErrorState";
 import { SkeletonList } from "@/components/shared/Skeleton";
 import { api, ApiError } from "@/lib/api-client";
 import { routes } from "@/lib/routes";
+import { upgradeLabelFor } from "@/lib/tier";
 import { SubscriptionTier, type WorkspaceRole } from "@/types/schema";
 
 export interface SharingTabProps {
@@ -87,7 +88,17 @@ export function SharingTab({ workspaceId, tier }: SharingTabProps) {
   );
 }
 
-function UpgradePromptCard({ feature, plans }: { feature: string; plans: string }) {
+function UpgradePromptCard({
+  feature,
+  plans,
+  minTier,
+}: {
+  feature: string;
+  plans: string;
+  /** The lowest tier that unlocks this feature — decides which plan the CTA names (Team-only
+   *  features say "Upgrade to Team", never the misleading "Pro/Team"). */
+  minTier: SubscriptionTier;
+}) {
   return (
     <Card>
       <CardHeader
@@ -97,14 +108,15 @@ function UpgradePromptCard({ feature, plans }: { feature: string; plans: string 
       <p className="text-body-small text-text-secondary">
         The authoritative gate is enforced server-side; this section is locked for your current plan.
       </p>
-      {/* screens.md's shared Upgrade Prompt pattern: lock icon + "Upgrade to Pro/Team" link to the
-          account plan screen at /settings (billing milestone Pass 3). */}
+      {/* screens.md's shared Upgrade Prompt pattern: lock icon + an upgrade link naming the plan(s)
+          that actually unlock the feature, routed to the account plan screen at /settings
+          (billing milestone Pass 3). */}
       <Link
         href={routes.accountSettings()}
         className="mt-3 inline-flex items-center gap-1 text-body-small text-provenance hover:text-provenance"
       >
         <Lock size={12} aria-hidden="true" />
-        Upgrade to Pro/Team
+        {upgradeLabelFor(minTier)}
       </Link>
     </Card>
   );
@@ -201,6 +213,7 @@ function WorkspaceMembersSection({
       <UpgradePromptCard
         feature="Workspace members"
         plans="Workspace sharing is available on the Team plan"
+        minTier={SubscriptionTier.Team}
       />
     );
   }
@@ -367,6 +380,7 @@ function SharedReportLinksSection({
       <UpgradePromptCard
         feature="Shared report links"
         plans="Shared report links are available on the Pro and Team plans"
+        minTier={SubscriptionTier.Pro}
       />
     );
   }

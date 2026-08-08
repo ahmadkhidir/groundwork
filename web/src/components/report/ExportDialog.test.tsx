@@ -254,11 +254,12 @@ describe("ExportDialog", () => {
     expect(screen.getByRole("radio", { name: /Chart image/ })).toBeInTheDocument();
 
     // PowerPoint is Team-only (monetization.md row 120): for Pro it renders as a locked row with
-    // the Upgrade Prompt, exactly like the Free-tier treatment of the other paid rows.
+    // the Upgrade Prompt, exactly like the Free-tier treatment of the other paid rows — and the
+    // CTA names Team, not the misleading "Pro/Team".
     const pptxRow = screen.getByText("PowerPoint").closest("div[aria-disabled='true']");
     expect(pptxRow).not.toBeNull();
     const upgradeLink = within(pptxRow as HTMLElement).getByRole("link", {
-      name: /Upgrade to Pro\/Team/,
+      name: /Upgrade to Team/,
     });
     expect(upgradeLink).toHaveAttribute("href", "/settings");
     expect(screen.getAllByRole("radio")).toHaveLength(5);
