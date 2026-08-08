@@ -1418,6 +1418,26 @@ npm run typecheck                    # tsc --noEmit
 npx next typegen                     # Regenerate PageProps/LayoutProps after adding a route
 ```
 
+**Windows dev-server hazards (both observed 2026-08-08 — the routes themselves are fine; `next build`
+compiles every route and production is unaffected):**
+
+1. **`next dev` after `next build` into the same `.next` can lose routes.** The build artifacts
+   (`build/`, `server/`, `BUILD_ID`, manifests) and Turbopack's dev state share `.next`; a dev server
+   started on top of a build's `.next` 404'd `/workspaces/:id/ingest/progress` and
+   `/workspaces/:id/ingest/confirm` even though the files existed and the build listed them. Fix:
+   stop dev, delete `.next`, `npm run dev` again.
+2. **Turbopack's file watcher can drop a route mid-session on this machine** (heavy I/O — first-hit
+   compiles take 30–90s). A route that served 200 then 404s for no code change. Fix: touch the
+   route's `page.tsx` (forces a recompile that restores it), or restart dev. There is no
+   `watchOptions`/polling knob in the Next 16 config surface.
+
+**Authenticated route verification** (how the ingest 404 was diagnosed): the Go API is the
+authorization boundary, so a bare curl to a protected Next route only proves the proxy redirects.
+`web/scripts/mint-session-cookie.cjs` mints a real Auth.js session cookie from the local
+`AUTH_SECRET` (reads `web/.env.local`) for a given user id/tier — pass it as
+`-H "Cookie: authjs.session-token=<token>"` and the full page actually renders. Dev diagnostic
+only; never ship it to production or point it at anything but localhost.
+
 **This Next.js version is not the one in your training data.** `web/AGENTS.md` is written by
 `next dev` and says so. Before writing app code, read the bundled docs at
 `web/node_modules/next/dist/docs/`. Changes already hit in Foundation:
