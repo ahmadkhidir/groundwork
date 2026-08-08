@@ -51,6 +51,11 @@ interface CheckoutResponse {
   checkout: { session_id: string; url: string };
 }
 
+/** POST /v1/billing/portal — a Stripe Customer Portal session; redirect the browser to `url`. */
+interface PortalResponse {
+  portal: { url: string };
+}
+
 interface SubscriptionState {
   plan: SubscriptionTier;
   stripeSubscriptionExists: boolean;
@@ -107,8 +112,9 @@ function subscriptionStatusPill(status: string): { variant: StatusVariant; label
  * and then cleans the query param from the URL.
  *
  * The Free plan has no Stripe price (STRIPE_PRICE_FREE is blank): it is selectable only as the
- * current plan. A paid user's path back to Free is cancellation, which the server does NOT expose
- * as an endpoint this pass — the screen says so honestly instead of fabricating one.
+ * current plan. A paid user's path back to Free is cancellation, which happens in Stripe's Customer
+ * Portal (POST /v1/billing/portal — the "Manage billing" button below); the server never changes a
+ * tier itself, the portal action is applied by the existing webhooks at period end.
  */
 export function PlanScreen(props: PlanScreenProps) {
   // The page threads the session tier/userId for parity with the app's session convention, but
@@ -125,6 +131,8 @@ export function PlanScreen(props: PlanScreenProps) {
   const [outcome, setOutcome] = useState<UpgradeOutcome | null>(null);
   const [checkoutPlan, setCheckoutPlan] = useState<PlanId | null>(null);
   const [checkoutError, setCheckoutError] = useState<string | null>(null);
+  const [portalBusy, setPortalBusy] = useState(false);
+  const [portalError, setPortalError] = useState<string | null>(null);
   const mounted = useRef(true);
 
   const load = useCallback(async () => {
@@ -213,6 +221,27 @@ export function PlanScreen(props: PlanScreenProps) {
     },
     [checkoutPlan],
   );
+
+  // Opens Stripe's Customer Portal (POST /v1/billing/portal), where self-serve cancellation and
+  // plan changes happen. The portal is the ONLY path back from a paid plan — there is no cancel
+  // endpoint, and monetization.md's semantics (access until period end, then revert to Free) are
+  // enforced by the existing webhooks after the user acts there.
+  const startPortal = useCallback(async () => {
+    if (portalBusy) return;
+    setPortalBusy(true);
+    setPortalError(null);
+    try {
+      const res = await api.post<PortalResponse>("/v1/billing/portal");
+      window.location.assign(res.portal.url);
+    } catch (error) {
+      setPortalBusy(false);
+      setPortalError(
+        error instanceof ApiError
+          ? error.message
+          : "Could not open billing management. Try again.",
+      );
+    }
+  }, [portalBusy]);
 
   if (state.status === "loading") {
     return (
@@ -321,16 +350,30 @@ export function PlanScreen(props: PlanScreenProps) {
         </dl>
 
         {subscribed && (
-          <div className="mt-4 border-t border-border pt-4">
+          <div className="mt-4 flex flex-col gap-3 border-t border-border pt-4">
             <p className="flex items-start gap-2 text-body-small text-text-secondary">
               <Lock size={14} className="mt-0.5 shrink-0 text-text-secondary" aria-hidden="true" />
               <span>
-                Cancelling or downgrading is managed through Stripe — there&apos;s no self-serve
-                cancel button here yet. Paid access continues until the end of the current billing
-                period, then the account reverts to Free tier limits; workspaces beyond the Free
-                tier&apos;s single-workspace limit become read-only (never deleted).
+                Cancelling or changing plans is managed through Stripe&apos;s billing portal. Paid
+                access continues until the end of the current billing period, then the account
+                reverts to Free tier limits; workspaces beyond the Free tier&apos;s single-workspace
+                limit become read-only (never deleted).
               </span>
             </p>
+            <div className="flex flex-wrap items-center gap-3">
+              <Button
+                variant="outline"
+                onClick={() => void startPortal()}
+                loading={portalBusy}
+              >
+                Manage billing
+              </Button>
+              {portalError && (
+                <span role="alert" className="text-body-small text-error">
+                  {portalError}
+                </span>
+              )}
+            </div>
           </div>
         )}
       </Card>

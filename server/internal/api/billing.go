@@ -47,10 +47,12 @@ type BillingEventStore interface {
 }
 
 // StripeClient is the Stripe API seam, satisfied by *billing.Client. Narrow by construction: the
-// handlers only create checkout sessions and read one subscription snapshot.
+// handlers only create checkout sessions, read one subscription snapshot, and open the customer
+// portal.
 type StripeClient interface {
 	CreateCheckoutSession(ctx context.Context, p billing.CheckoutParams) (billing.CheckoutResult, error)
 	GetSubscription(ctx context.Context, id string) (billing.SubscriptionSnapshot, error)
+	CreatePortalSession(ctx context.Context, customerID string) (billing.PortalSessionResult, error)
 }
 
 // RegisterBillingRoutes wires the AUTHENTICATED billing endpoints onto r (mounted inside
@@ -61,6 +63,7 @@ type StripeClient interface {
 func RegisterBillingRoutes(r chi.Router, users BillingUserStore, client StripeClient, pricePro, priceTeam, webBaseURL string, logger *slog.Logger) {
 	r.Get("/billing/subscription", handleGetSubscription(users, logger))
 	r.Post("/billing/checkout", handleCreateCheckoutSession(users, client, pricePro, priceTeam, webBaseURL, logger))
+	r.Post("/billing/portal", handleCreatePortalSession(users, client, logger))
 }
 
 // RegisterStripeWebhookRoute wires the PUBLIC Stripe webhook onto r (registered on the /v1 group
@@ -114,6 +117,60 @@ func handleGetSubscription(users BillingUserStore, logger *slog.Logger) http.Han
 		}
 
 		respondJSON(w, http.StatusOK, map[string]any{"subscription": toPublicSubscription(info)})
+	}
+}
+
+// portalResult is POST /v1/billing/portal's payload — the Customer Portal URL the browser should
+// be handed to.
+type portalResult struct {
+	URL string `json:"url"`
+}
+
+// handleCreatePortalSession serves POST /v1/billing/portal: creates a Stripe Customer Portal session
+// for the caller's Stripe customer and returns the redirect URL.
+//
+// The portal is where self-serve cancellation and plan changes happen (monetization.md's
+// Cancellation / Downgrade events); the existing webhooks — customer.subscription.deleted (revert to
+// Free at period end) and customer.subscription.updated (status/period end) — keep stored
+// tier/subscription state fresh after the portal does its work. This handler never changes a tier
+// itself; it only opens the door.
+func handleCreatePortalSession(users BillingUserStore, client StripeClient, logger *slog.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		claims, ok := requireClaims(w, r)
+		if !ok {
+			return
+		}
+
+		info, err := users.GetBillingByID(r.Context(), claims.UserID)
+		if err != nil {
+			logger.Error("looking up user billing state for portal", slog.String("error", err.Error()))
+			respondJSON(w, http.StatusInternalServerError, map[string]string{
+				"error": "Something went wrong. Try again.",
+				"code":  "internal_error",
+			})
+			return
+		}
+		if info.StripeCustomerID == "" {
+			// No Stripe customer means no subscription — there is nothing to manage in the portal.
+			// An honest 409 the UI can branch on, never a fabricated portal session.
+			respondJSON(w, http.StatusConflict, map[string]string{
+				"error": "No active billing account to manage.",
+				"code":  "no_billing_account",
+			})
+			return
+		}
+
+		result, err := client.CreatePortalSession(r.Context(), info.StripeCustomerID)
+		if err != nil {
+			logger.Error("creating billing portal session", slog.String("error", err.Error()))
+			respondJSON(w, http.StatusBadGateway, map[string]string{
+				"error": "The payment provider could not open billing management right now.",
+				"code":  "payment_provider_error",
+			})
+			return
+		}
+
+		respondJSON(w, http.StatusCreated, map[string]any{"portal": portalResult{URL: result.URL}})
 	}
 }
 

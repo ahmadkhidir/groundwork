@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -151,12 +152,15 @@ func (f *fakeBillingEventStore) has(eventID string) bool {
 
 // fakeStripeClient is an in-memory StripeClient.
 type fakeStripeClient struct {
-	mu             sync.Mutex
-	checkoutResult billing.CheckoutResult
-	checkoutErr    error
-	checkoutParams []billing.CheckoutParams
-	snapshot       billing.SubscriptionSnapshot
-	snapshotErr    error
+	mu              sync.Mutex
+	checkoutResult  billing.CheckoutResult
+	checkoutErr     error
+	checkoutParams  []billing.CheckoutParams
+	snapshot        billing.SubscriptionSnapshot
+	snapshotErr     error
+	portalResult    billing.PortalSessionResult
+	portalErr       error
+	portalCustomers []string
 }
 
 func (f *fakeStripeClient) CreateCheckoutSession(ctx context.Context, p billing.CheckoutParams) (billing.CheckoutResult, error) {
@@ -176,6 +180,25 @@ func (f *fakeStripeClient) GetSubscription(ctx context.Context, id string) (bill
 		return billing.SubscriptionSnapshot{}, f.snapshotErr
 	}
 	return f.snapshot, nil
+}
+
+func (f *fakeStripeClient) CreatePortalSession(ctx context.Context, customerID string) (billing.PortalSessionResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.portalCustomers = append(f.portalCustomers, customerID)
+	if f.portalErr != nil {
+		return billing.PortalSessionResult{}, f.portalErr
+	}
+	return f.portalResult, nil
+}
+
+func (f *fakeStripeClient) lastPortalCustomer() (string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.portalCustomers) == 0 {
+		return "", false
+	}
+	return f.portalCustomers[len(f.portalCustomers)-1], true
 }
 
 func (f *fakeStripeClient) lastCheckoutParams() billing.CheckoutParams {
@@ -710,5 +733,95 @@ func TestBillingSubscriptionReadActive(t *testing.T) {
 	}
 	if s.StripeSubscriptionPeriodEnd != "2026-09-06T12:00:00Z" {
 		t.Errorf("period end = %q, want 2026-09-06T12:00:00Z", s.StripeSubscriptionPeriodEnd)
+	}
+}
+
+func TestBillingPortalReturnsRedirectURL(t *testing.T) {
+	users := newFakeBillingUserStore()
+	users.seed(postgres.UserBilling{
+		UserID: "user-1", Email: "a@b.com", Tier: domain.TierPro,
+		StripeCustomerID: "cus_123", StripeSubscriptionID: "sub_123", StripeSubscriptionStatus: "active",
+	})
+	client := &fakeStripeClient{portalResult: billing.PortalSessionResult{URL: "https://billing.stripe.com/p/session/xyz"}}
+	handler := newBillingTestRouter(users, newFakeBillingEventStore(), client,
+		billingTestSecret, billingTestPricePro, billingTestPriceTeam, billingTestWebBase)
+
+	req := authedRequest(t, http.MethodPost, "/v1/billing/portal", nil, "user-1", domain.TierPro)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var body struct {
+		Portal struct {
+			URL string `json:"url"`
+		} `json:"portal"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decoding body: %v", err)
+	}
+	if body.Portal.URL != "https://billing.stripe.com/p/session/xyz" {
+		t.Errorf("portal url = %q", body.Portal.URL)
+	}
+	// The portal session is created for the caller's stored Stripe customer, never a caller-supplied id.
+	if customer, ok := client.lastPortalCustomer(); !ok || customer != "cus_123" {
+		t.Errorf("portal customer = %q, ok = %v, want cus_123", customer, ok)
+	}
+}
+
+func TestBillingPortalRejectsAccountWithoutStripeCustomer(t *testing.T) {
+	users := newFakeBillingUserStore()
+	users.seed(postgres.UserBilling{UserID: "user-1", Email: "a@b.com", Tier: domain.TierFree})
+	client := &fakeStripeClient{}
+	handler := newBillingTestRouter(users, newFakeBillingEventStore(), client,
+		billingTestSecret, billingTestPricePro, billingTestPriceTeam, billingTestWebBase)
+
+	req := authedRequest(t, http.MethodPost, "/v1/billing/portal", nil, "user-1", domain.TierFree)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusConflict, rec.Body.String())
+	}
+	var body struct {
+		Code string `json:"code"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decoding body: %v", err)
+	}
+	if body.Code != "no_billing_account" {
+		t.Errorf("code = %q, want no_billing_account", body.Code)
+	}
+	if _, called := client.lastPortalCustomer(); called {
+		t.Error("portal session created for an account with no Stripe customer")
+	}
+}
+
+func TestBillingPortalSurfacesProviderError(t *testing.T) {
+	users := newFakeBillingUserStore()
+	users.seed(postgres.UserBilling{
+		UserID: "user-1", Email: "a@b.com", Tier: domain.TierPro,
+		StripeCustomerID: "cus_123",
+	})
+	client := &fakeStripeClient{portalErr: errors.New("stripe is down")}
+	handler := newBillingTestRouter(users, newFakeBillingEventStore(), client,
+		billingTestSecret, billingTestPricePro, billingTestPriceTeam, billingTestWebBase)
+
+	req := authedRequest(t, http.MethodPost, "/v1/billing/portal", nil, "user-1", domain.TierPro)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusBadGateway, rec.Body.String())
+	}
+	var body struct {
+		Code string `json:"code"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decoding body: %v", err)
+	}
+	if body.Code != "payment_provider_error" {
+		t.Errorf("code = %q, want payment_provider_error", body.Code)
 	}
 }

@@ -152,6 +152,12 @@ type SubscriptionSnapshot struct {
 	PriceID          string
 }
 
+// PortalSessionResult is what CreatePortalSession returns.
+type PortalSessionResult struct {
+	// URL is the Stripe Customer Portal URL the browser should be handed to.
+	URL string
+}
+
 // Client wraps the Stripe SDK's typed services. It holds the API key on the instance (via
 // stripe.NewClient) and never mutates the package-level stripe.Key global — constructor injection,
 // matching the codebase's no-global-mutable-state rule.
@@ -191,6 +197,28 @@ func (c *Client) GetSubscription(ctx context.Context, id string) (SubscriptionSn
 		return SubscriptionSnapshot{}, fmt.Errorf("billing: retrieving subscription %s: %w", id, err)
 	}
 	return subscriptionSnapshotFromStripe(sub), nil
+}
+
+// CreatePortalSession creates a Stripe Customer Portal session for customerID — the self-serve
+// surface where a user cancels or changes their plan (monetization.md's Cancellation / Downgrade
+// events). The existing webhooks (customer.subscription.deleted, customer.subscription.updated)
+// keep stored tier/subscription state fresh after the portal does its work, so this endpoint only
+// ever hands back a redirect URL.
+func (c *Client) CreatePortalSession(ctx context.Context, customerID string) (PortalSessionResult, error) {
+	if customerID == "" {
+		// A caller with no stored customer cannot have a subscription to manage; surfacing this as
+		// an error keeps the handler honest instead of sending Stripe an empty customer id.
+		return PortalSessionResult{}, errors.New("billing: no Stripe customer for the portal session")
+	}
+	params := &stripe.BillingPortalSessionCreateParams{
+		Customer: stripe.String(customerID),
+	}
+	params.Context = ctx
+	session, err := c.stripe.V1BillingPortalSessions.Create(ctx, params)
+	if err != nil {
+		return PortalSessionResult{}, fmt.Errorf("billing: creating billing portal session: %w", err)
+	}
+	return PortalSessionResult{URL: session.URL}, nil
 }
 
 // buildCheckoutSessionParams is the pure constructor for the Stripe request — extracted so the

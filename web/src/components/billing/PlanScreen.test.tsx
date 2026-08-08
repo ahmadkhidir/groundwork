@@ -146,6 +146,69 @@ describe("PlanScreen", () => {
     );
   });
 
+  it("opens Stripe's Customer Portal from Manage billing for a subscribed user", async () => {
+    getMock.mockResolvedValue(
+      subscriptionResponse({
+        plan: "pro",
+        stripe_subscription_exists: true,
+        stripe_subscription_status: "active",
+        stripe_subscription_period_end: "2026-09-06T12:00:00Z",
+      }),
+    );
+    postMock.mockResolvedValue({
+      portal: { url: "https://billing.stripe.com/p/session/xyz" },
+    });
+    const user = userEvent.setup();
+
+    renderScreen();
+    await user.click(await screen.findByRole("button", { name: "Manage billing" }));
+
+    await waitFor(() =>
+      expect(postMock).toHaveBeenCalledWith("/v1/billing/portal"),
+    );
+    // Self-serve cancellation lives in the portal: a full-browser redirect, never an inline form.
+    await waitFor(() =>
+      expect(assignMock).toHaveBeenCalledWith("https://billing.stripe.com/p/session/xyz"),
+    );
+  });
+
+  it("does not offer Manage billing without a Stripe subscription", async () => {
+    getMock.mockResolvedValue(subscriptionResponse());
+
+    renderScreen();
+    await waitFor(() => expect(screen.getByText("Compare plans")).toBeInTheDocument());
+
+    expect(
+      screen.queryByRole("button", { name: "Manage billing" }),
+    ).not.toBeInTheDocument();
+    expect(postMock).not.toHaveBeenCalledWith("/v1/billing/portal");
+  });
+
+  it("shows an inline error when the billing portal cannot be opened", async () => {
+    getMock.mockResolvedValue(
+      subscriptionResponse({
+        plan: "pro",
+        stripe_subscription_exists: true,
+        stripe_subscription_status: "active",
+      }),
+    );
+    postMock.mockRejectedValue(
+      new ApiError(502, "The payment provider could not open billing management right now.", "payment_provider_error"),
+    );
+    const user = userEvent.setup();
+
+    renderScreen();
+    await user.click(await screen.findByRole("button", { name: "Manage billing" }));
+
+    await waitFor(() =>
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        /could not open billing management/i,
+      ),
+    );
+    // The button returns to idle so the user can retry.
+    expect(screen.getByRole("button", { name: "Manage billing" })).toBeInTheDocument();
+  });
+
   it("shows the honest success banner from ?upgrade=success and cleans the param from the URL", async () => {
     getMock.mockResolvedValue(subscriptionResponse());
     searchParamsStore.set(new URLSearchParams("upgrade=success"));
@@ -228,11 +291,13 @@ describe("PlanScreen", () => {
     await waitFor(() => expect(screen.getByText("Active")).toBeInTheDocument());
     expect(screen.getByText(/Current period ends/)).toBeInTheDocument();
 
-    // No cancel endpoint exists server-side (only checkout + subscription read + webhook), so the
-    // screen says the truth: managed through Stripe — never a fabricated cancel button.
+    // Cancellation is managed in Stripe's Customer Portal (POST /v1/billing/portal), not by a
+    // fabricated in-app cancel button; the screen states the semantics honestly and offers the
+    // portal entry point instead.
     expect(
-      screen.getByText(/Cancelling or downgrading is managed through Stripe/),
+      screen.getByText(/Cancelling or changing plans is managed through Stripe/),
     ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Manage billing" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /cancel/i })).not.toBeInTheDocument();
   });
 
