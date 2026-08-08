@@ -706,6 +706,83 @@ it. Web-only (no server changes). Verification: web `tsc --noEmit` + `eslint . -
   monetization.md cancellation semantics as an honest note with no cancel button — a Stripe billing
   portal endpoint is the follow-up if self-serve cancellation is wanted.
 
+### Post-billing bugfix — stale session tier claim kept showing upgrade prompts on paid accounts
+
+A paid (Pro/Team) account kept rendering the Free-tier "Upgrade to Pro/Team" prompts — Workspace
+Settings Sharing sections, ExportDialog locked rows, ColumnVisibilityTab, Usage tab — until
+sign-out. Root cause: the JWT `tier` claim is written **at sign-in only**; when a Stripe webhook
+changes `users.tier` (upgrade, downgrade, cancellation), nothing refreshed the claim, so the UI's
+display gates read a stale `free` even though the Go API (authoritative, DB-backed) would permit
+the action. The server-side gates were never wrong — the session claim was lying, not the server.
+
+**Fix (web only, no server change):** the `jwt` callback in `web/src/auth.ts` now re-reads the
+authoritative plan from the Go API (`GET /v1/billing/subscription`, session-cookie forwarded
+server-to-server) on a 60s TTL (`SESSION_TIER_REFRESH_MS`) and updates the claim in place;
+`@auth/core` re-encodes the cookie from the callback's return (verified in `session.js` — the
+callback runs on every session read and its result is re-encoded). New module
+`web/src/lib/session-tier.ts` holds the TTL, the plan-string normalizer, and the fail-soft fetch.
+
+Fail-soft everywhere, verified against the installed `@auth/core` source: a failed refresh keeps the
+existing claim, and the callback **never throws** — a throw makes the session action destroy the
+session cookie (session.js), which would sign the user out over a display-only refresh. Edge-runtime
+middleware (`proxy.ts`, `NEXT_RUNTIME === "edge"`) skips the refresh entirely; it decodes the token
+without the callback anyway. Downgrades propagate the same way (a webhook-set `free` claim replaces
+the old paid one within the TTL).
+
+Verification: `tsc --noEmit` + `eslint` clean, `vitest run` 303/303 (9 new tests in
+`session-tier.test.ts`: normalizer, staleness window, cookie forwarding, fail-soft on non-OK /
+network failure / unrecognized plan), `next build` green including the Proxy (Middleware).
+
+**Left for the user to observe:** convergence within one TTL (60s) — the very first server-render of
+a protected page after a plan change already carries the fresh claim, because sign-in is usually more
+than a minute in the past. If upgrade prompts persist beyond a minute on an account that is truly
+Pro, the Stripe webhook has not landed (`users.tier` is still `free`) — the `/settings` plan screen
+shows the real plan, and the prompt is truthful.
+
+**Follow-up (same session): tier-accurate upgrade labels.** The locked-state CTA previously said
+"Upgrade to Pro/Team" everywhere, including for Team-only features — confusing a Pro user into
+clicking "Pro/Team" for something Pro will never unlock. New helper `web/src/lib/tier.ts`
+(`upgradeLabelFor(minTier)`) names the plan(s) that actually unlock a feature, applied in
+`SharingTab` (Workspace members → "Upgrade to Team"; Shared report links → "Upgrade to Pro/Team"),
+`ExportDialog` (PowerPoint row → "Upgrade to Team"; CSV/Markdown/JSON/Image → "Upgrade to
+Pro/Team"), and `ColumnVisibilityTab` (Pro/Team → unchanged). This closes the Phase 5 "label isn't
+precise for a Team-only row" doc tension at the UI layer; `screens/` copy still describes the shared
+prompt generically. Verification: `tsc --noEmit` + `eslint` clean, `vitest run` 306/306 (3 new
+`tier.test.ts` cases; SharingTab/ExportDialog assertions updated to the tier-accurate labels),
+`next build` green.
+
+### Post-billing bugfix — long one-line SQL blew the Run Viewer page out horizontally
+
+A generated query like `SELECT CUSTOMER_NAME, SUM(TRXN_AMT) … GROUP BY CUSTOMER_NAME ORDER BY …`
+pushed the whole page wider than the viewport on desktop. Root cause was NOT a missing scrollable
+surface — the shared `CodeBlock`/`EditableCodeBlock` `<pre>` already carries `overflow-x-auto`
+(screens.md's documented "scrollable code surface"). The bug was the two-column grid on the Run
+Viewer: `lg:grid-cols-[1fr_1.5fr]`. A `1fr` track defaults to `minmax(auto, 1fr)`, so its minimum
+is the content's min-content width — the unbroken long line — and the grid item refuses to shrink,
+so the page widens instead of the inner scrollbar engaging.
+
+**Fix:** the Run Viewer's grid and Workspace Home's grid (same latent bug: long dataset
+filenames/report titles in the side panels) now use 0-min tracks —
+`lg:grid-cols-[minmax(0,1fr)_minmax(0,1.5fr)]` / `[minmax(0,2fr)_minmax(0,1fr)]` — so items can
+shrink to the container and the code/table's own `overflow-x-auto` takes over. Deliberately NOT
+word-wrapping or auto-formatting the SQL: the docs specify a scrollable code surface, wrapping
+mid-clause hurts readability, and reformatting user-edited SQL on display would alter what they
+copy/run. The editable textarea already wraps natively. Regression guard in
+`RunViewerScreen.test.tsx` pins the 0-min tracks. Verification: `tsc --noEmit` + `eslint` clean,
+`vitest run` 307/307, `next build` green.
+
+**Follow-up (same session) — audit log page, same symptom.** The expanded model-call payload
+(pretty-printed JSON with a long unbroken `prior_context` string) blew the web table out
+horizontally. Distinct root cause: the audit table used default `table-auto` layout, where a column
+is sized by its content's min-content width — the payload's long line forced the column (and page)
+wider than the viewport, and the `PayloadViewer` `<pre>`'s `overflow-auto` could not engage because
+the cell was sized by the column, not the other way around. Fix: `table-fixed` on the audit table
+(column widths come from the header row: Timestamp 30% / User 25% / Action 25% / Scope 20%), so the
+expanded `<td colSpan={4}>` constrains to the table width and the payload scrolls inside its cell.
+The mobile card path was already a normal block chain (no table), so it was never affected.
+Regression guard in `AuditLogScreen.test.tsx` pins `table-fixed` + the payload pre's `overflow-auto`.
+Verification: `tsc --noEmit` + `eslint` clean, `vitest run` 308/308, `next build` green.
+
 ### Screen 13 — Workspace Settings: Phase-1 shell (`d8f1bdf`, 2026-08-07)
 
 The Settings route (`/workspaces/:id/settings`, screens/13) is now a real tabbed surface instead of
