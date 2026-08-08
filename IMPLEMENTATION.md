@@ -783,6 +783,42 @@ The mobile card path was already a normal block chain (no table), so it was neve
 Regression guard in `AuditLogScreen.test.tsx` pins `table-fixed` + the payload pre's `overflow-auto`.
 Verification: `tsc --noEmit` + `eslint` clean, `vitest run` 308/308, `next build` green.
 
+### Post-billing follow-up — durable, hashed password reset tokens (user-authorized 2026-08-08)
+
+Closes the "password reset tokens live in a process-local in-memory store" known divergence's
+durability half. `PasswordResetToken` (schema.md) is now a real table — migration `00011` — and
+production wires `postgres.NewResetTokenRepository` into `auth.Service`. Tokens are stored as
+one-way hashes (`token_hash`, SHA-256 — the right primitive since the token is a 256-bit random
+value); the raw token exists only in the delivered link and the delivery log line. Rows survive a
+restart / multi-instance deployment (architecture.md). Semantics per screens/19 step 5:
+single-use-on-any-attempt (an expired or already-consumed token is still marked consumed, so it
+cannot be replayed), 30-minute expiry, and on success the user's OTHER outstanding tokens are
+invalidated in the same transaction (`SELECT ... FOR UPDATE` serializes concurrent attempts).
+`schema.md`'s `token_hash` required field now matches reality. The seam is consumer-side
+(`auth.ResetTokenStore` interface, `auth.MemoryResetTokenStore` as the test fake mirroring the
+durable contract; `NewService` now takes the store explicitly — the in-memory one is no longer the
+default anywhere in production). STILL PENDING the vendor decision: delivery is a structured log
+line (the Transactional Email Provider, architecture.md's Medium risk); the token in the log is
+exactly what an operator relays today.
+
+### Billing follow-up — Stripe Customer Portal for self-serve cancellation (user-authorized 2026-08-08)
+
+Closes the Pass 3 "no cancel/downgrade endpoint exists" gap without inventing one: self-serve
+cancellation and plan changes now happen in Stripe's Customer Portal. Server: `POST /v1/billing/portal`
+(authenticated) creates a portal session for the caller's stored `stripe_customer_id` and returns
+the redirect URL — 409 `no_billing_account` when no customer exists (nothing to manage), 502
+`payment_provider_error` on Stripe failure. The existing webhooks (`customer.subscription.deleted`
+→ revert to Free at period end; `customer.subscription.updated` → status/period end) keep stored
+state fresh after the portal does its work; this handler never changes a tier itself. Web: the
+`/settings` PlanScreen's subscribed state now offers a **Manage billing** button (POST
+`/v1/billing/portal` → full-browser redirect), replacing the "there's no self-serve cancel button
+here yet" note with the portal path while keeping monetization.md's honest semantics (access until
+period end, then Free limits; excess workspaces read-only, never deleted). `.env.example`'s
+`STRIPE_PRICE_FREE` removal stands (Free has no Stripe price). Verification: server `make vet` +
+`make test` (3 new portal handler tests, 1 fake extension) + `gofmt -l` clean; web `tsc --noEmit` +
+`eslint` clean, `vitest run` 311/311 (4 new PlanScreen portal tests, 1 copy update), `next build`
+green.
+
 ### Screen 13 — Workspace Settings: Phase-1 shell (`d8f1bdf`, 2026-08-07)
 
 The Settings route (`/workspaces/:id/settings`, screens/13) is now a real tabbed surface instead of
