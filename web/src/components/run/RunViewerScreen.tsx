@@ -16,6 +16,7 @@ import {
   parseExecuteStep,
   parseGenerateSQLStep,
   parsePlanStep,
+  splitStepError,
 } from "./step-payloads";
 import { api, ApiError, subscribeToStream } from "@/lib/api-client";
 import { routes } from "@/lib/routes";
@@ -379,6 +380,17 @@ export function RunViewerScreen({ workspaceId, runId }: RunViewerScreenProps) {
   const clarificationReason =
     plan?.reason?.trim() || "This question couldn't be answered from the available data.";
 
+  // FEAT-014: a failed execute step is surfaced as a readable banner with the real engine reason and
+  // the recovery path (the generated SQL is editable just below), never as a raw error dump or a
+  // generic "something went wrong". splitStepError strips the Go wrapper noise and hides DuckDB's
+  // long "LINE n: …" SQL echo; the full text remains in the Execute step's feed row.
+  const executeFailed =
+    run?.status === RunStatus.Failed &&
+    executeStep !== undefined &&
+    executeStep.status === "failed" &&
+    Boolean(executeStep.output);
+  const executeFailure = executeFailed && executeStep?.output ? splitStepError(executeStep.output) : null;
+
   return (
     <main id="main-content" className="mx-auto w-full max-w-5xl p-8">
       <nav aria-label="Run navigation" className="mb-4">
@@ -480,6 +492,20 @@ export function RunViewerScreen({ workspaceId, runId }: RunViewerScreenProps) {
         >
           <p className="font-medium">This question can&apos;t be answered from the available data</p>
           <p className="mt-1 text-text-secondary">{clarificationReason}</p>
+        </div>
+      )}
+
+      {executeFailure && (
+        <div
+          role="alert"
+          className="mb-4 rounded-md border border-error bg-error/10 p-3 text-body-small text-text-primary"
+        >
+          <p className="font-medium">The generated query couldn&apos;t run</p>
+          <p className="mt-1 text-text-secondary">{executeFailure.summary}</p>
+          <p className="mt-2 text-text-secondary">
+            Edit the generated SQL and run it, or refine your question. The engine&apos;s full reason
+            is in the Execute step.
+          </p>
         </div>
       )}
 

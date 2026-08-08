@@ -6,6 +6,7 @@ import {
   parseAdversarialReviewStep,
   parseShadowCheckStep,
   parseStaticCheckStep,
+  splitStepError,
 } from "@/components/run/step-payloads";
 
 export interface StepFeedProps {
@@ -151,6 +152,32 @@ function renderAdversarialReview(step: Step): ReactNode | null {
   );
 }
 
+/**
+ * A failed step's reason, rendered for the user rather than dumped raw. The server persists the
+ * Go-wrapped engine error (e.g. "executing query: engine: query: Binder Error: …"); splitStepError
+ * strips the wrapper noise and hides DuckDB's long "LINE n: …" SQL echo behind a disclosure, so the
+ * row reads "GROUP BY clause cannot contain window functions!" — the reason — instead of an internal
+ * error chain. The full text stays available, never discarded (honest status, Behavior Rule 10).
+ */
+function FailedStepReason({ output }: { output: string }) {
+  const { summary, detail } = splitStepError(output);
+  return (
+    <div className="mt-1 text-body-small text-error">
+      <p>{summary}</p>
+      {detail ? (
+        <details className="mt-1">
+          <summary className="cursor-pointer text-caption uppercase tracking-wide text-text-secondary">
+            Engine detail
+          </summary>
+          <pre className="mt-1 overflow-x-auto whitespace-pre-wrap rounded-md bg-surface-secondary p-2 text-body-small text-text-primary">
+            {detail}
+          </pre>
+        </details>
+      ) : null}
+    </div>
+  );
+}
+
 export function StepFeed({ steps }: StepFeedProps) {
   if (steps.length === 0) {
     return <p className="text-body-small text-text-secondary">Waiting for the run to begin…</p>;
@@ -182,7 +209,7 @@ export function StepFeed({ steps }: StepFeedProps) {
               </p>
             </div>
             {step.status === "failed" && step.output ? (
-              <p className="mt-1 text-body-small text-error">{step.output}</p>
+              <FailedStepReason output={step.output} />
             ) : null}
             {step.step_name === "static_check" && step.status === "complete"
               ? renderStaticCheckWarnings(step)

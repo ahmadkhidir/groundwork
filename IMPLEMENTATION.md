@@ -1129,6 +1129,37 @@ getter is wired too, guarded in `RegisterSuggestionRoutes` like engine/model. Ve
 CPU contention from running the cgo-heavy Go suite concurrently; the file passes in isolation and
 the full suite is green alone). Also in this wave: a dev-only `allowedDevOrigins` entry
 (`192.168.0.111`) in `web/next.config.ts` for LAN-device verification of the mobile UI.
+
+### Post-suggestions bugfix — failed execute steps read as a crash (FEAT-014 AC "surfaced without crashing")
+
+A real user question ("What patterns exist between defensive actions and clean sheet achievements
+across different player positions?") generated SQL that DuckDB rejected at bind time —
+`PERCENTILE_CONT(...) WITHIN GROUP (...) OVER (PARTITION BY position)` referenced by a GROUP BY,
+which the binder refuses. The server already failed the run honestly (execute step `failed` with the
+engine's message — FEAT-014's AC was met at the data layer), but the Run Viewer dumped the raw
+Go-wrapped chain — `executing query: engine: query: Binder Error: …` — in red with no path forward,
+which reads as a crash. Two-part fix:
+
+- **Readable surfacing (web):** `step-payloads.ts` gains `friendlyStepError`/`splitStepError`
+  (strip the known wrapper prefixes `executing query:`/`engine: query:`/`engine: exec:`; split the
+  DuckDB "LINE n: …" SQL echo into a disclosure). `StepFeed` renders a failed step's reason via a
+  `FailedStepReason` component (summary + "Engine detail" disclosure — full text kept, never
+  discarded), and the Run Viewer shows a `role="alert"` banner — "The generated query couldn't run"
+  + the cleaned engine reason + "Edit the generated SQL and run it, or refine your question." — the
+  recovery surface (FEAT-018's editable SQL) is right there in the same view.
+- **Reduce recurrence (server):** `generateSQLSystemPrompt` now instructs the model explicitly that
+  DuckDB rejects window functions (OVER clauses) inside GROUP BY and GROUP BY on a window-derived
+  alias, and prescribes the correct pattern (percentile in its own grouped subquery/CTE, then
+  compare/join).
+
+Deliberately NOT built: a "regenerate SQL on execution failure" retry loop — no doc mandates it,
+and the honest model is the plan→SQL→execute contract. Surfaced for product-shaper instead.
+Verification: server `make vet` + `make test` (all packages) + `gofmt -l` clean; web `tsc --noEmit`
++ `eslint` (the previously-committed `web/scripts/mint-session-cookie.cjs` gained the TS-only
+`no-require-imports` disable) + `vitest run` 335/335 (9 new tests) + live check against the actual
+failed run: the Go API serves it `failed` with the wrapped engine error, which the new rendering
+cleans. Note: on this machine `vitest`'s default forks pool intermittently fails to spawn workers
+under load — `npm run test -- --pool=threads` is the reliable invocation.
 | ~~**FEAT-007's "name-and-type-only exposure to the model" has NO ENFORCEMENT POINT**~~ — **Closed in Phase 2 Wave 2 (FEAT-013)** | Detection, user override, `pii_reviewed_at`, and the `pii_override` audit entry made a reviewed-and-cleared column distinguishable from a never-flagged one; FEAT-013 (this wave) made `pii_flag`/`excluded_from_model` govern egress at runtime by routing every model call through the one shared `model.BuildPayload` → `model.Client.Complete` seam, which reduces any flagged/excluded column to name-and-type only. The old gap text ("no payload builder exists until FEAT-013") no longer holds: `internal/model/payload_test.go` pins the wire-level filter and `client_test.go` pins egress-before-call (fail-closed), closing `risk_log.md` R-016. | **done** |
 | **FEAT-009's accepted joins land directly in `relationships`, not a full semantic layer** | FEAT-019 (Semantic Layer Storage — listing, editing, using relationships as query-planning grounding) is Phase 2 and not authorized this wave. `internal/store/postgres.RelationshipRepository` is deliberately `Create`-only; there is no read/update/delete surface, and no UI beyond ingest confirmation shows a relationship once created. This is intentional under-scoping, not a gap. | FEAT-019 (Phase 2) |
 | **Rejected-join resurrection is guarded by (dataset filename, column name), not a content hash** | `CandidateJoinRepository.ExistsRejectedForNamePair` matches on original filename + column name, since nothing in `docs/` defines a stronger notion of "the same file" across re-ingests. Renaming a file, or uploading a genuinely different file that happens to share both a name and a column name, are both outside this heuristic's guarantee. Verified live against a real re-ingest (see Wave 5's report) that the literal scenario in FEAT-009's acceptance criterion works. | Product (if a stronger identity is wanted) |

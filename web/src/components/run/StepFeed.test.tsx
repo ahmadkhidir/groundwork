@@ -79,4 +79,30 @@ describe("StepFeed", () => {
     expect(screen.getByText("Execute")).toBeTruthy();
     expect(screen.getByText("Halted")).toBeTruthy();
   });
+
+  it("renders a failed execute step's reason stripped of the Go wrapper noise (FEAT-014)", () => {
+    const raw =
+      "executing query: engine: query: Binder Error: GROUP BY clause cannot contain window functions!\n" +
+      "LINE 1: ...ulation AS (SELECT position, CASE WHEN defensive_actions < PERCENTILE_CONT(0.33) WITHIN GROUP (ORDER BY defensive_actions";
+    render(<StepFeed steps={[step("execute", { status: "failed", output: raw })]} />);
+
+    // The reason reads as the engine's message, not an internal error chain.
+    expect(
+      screen.getByText("Binder Error: GROUP BY clause cannot contain window functions!"),
+    ).toBeTruthy();
+    expect(screen.queryByText(/executing query:/)).toBeNull();
+    expect(screen.queryByText(/engine: query:/)).toBeNull();
+    // DuckDB's long LINE echo is behind a disclosure — present but not dumped inline.
+    expect(screen.getByText("Engine detail")).toBeTruthy();
+    expect(screen.getByText(/LINE 1:/)).toBeTruthy();
+  });
+
+  it("passes a plain failed-step message through unchanged", () => {
+    render(
+      <StepFeed steps={[step("generate_sql", { status: "failed", output: "The model returned no SQL." })]} />,
+    );
+
+    expect(screen.getByText("The model returned no SQL.")).toBeTruthy();
+    expect(screen.queryByText("Engine detail")).toBeNull();
+  });
 });

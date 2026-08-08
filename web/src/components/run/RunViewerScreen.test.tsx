@@ -186,6 +186,32 @@ describe("RunViewerScreen", () => {
     expect(screen.queryByText("This question needs clarification")).not.toBeInTheDocument();
   });
 
+  it("surfaces a failed execute step as a readable banner with the engine reason and the recovery path (FEAT-014)", async () => {
+    getMock.mockResolvedValue({
+      run: run("failed"),
+      steps: [
+        step("plan", { output: JSON.stringify({ answerable: true, approach: "x" }) }),
+        step("generate_sql", { output: JSON.stringify({ sql: SQL_TEXT }) }),
+        step("execute", {
+          status: "failed",
+          output:
+            "executing query: engine: query: Binder Error: GROUP BY clause cannot contain window functions!\n" +
+            "LINE 1: ...ulation AS (SELECT position, CASE WHEN defensive_actions < PERCENTILE_CONT(0.33)",
+        }),
+      ],
+    });
+    render(<RunViewerScreen workspaceId="ws-1" runId="run-1" />);
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("The generated query couldn't run");
+    // The wrapper noise is gone; the engine's actual reason is shown and actionable.
+    expect(alert).toHaveTextContent("Binder Error: GROUP BY clause cannot contain window functions!");
+    expect(alert).not.toHaveTextContent("executing query:");
+    expect(alert).toHaveTextContent("Edit the generated SQL and run it");
+    // The editable SQL (FEAT-018) is still rendered as the recovery surface.
+    expect(screen.getByRole("heading", { name: "Generated SQL" })).toBeInTheDocument();
+  });
+
   it("shows the error state with a working retry when the initial fetch fails", async () => {
     getMock.mockRejectedValueOnce(new ApiError(500, "Server exploded"));
     render(<RunViewerScreen workspaceId="ws-1" runId="run-1" />);

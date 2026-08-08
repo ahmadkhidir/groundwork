@@ -1464,6 +1464,7 @@ Write read-only analytical SQL that answers the question. Requirements:
 - Only join tables when a confirmed or clearly implied relationship connects them.
 - Return only the columns the question needs. Use aggregate functions and GROUP BY for summarization questions.
 - Use standard SQL; the engine is DuckDB (functions like date_trunc, strftime, unnest are available).
+- DuckDB validity: never put a window function (any expression with an OVER clause) inside a GROUP BY, and never GROUP BY an output alias whose expression is a window function — DuckDB rejects both at bind time and the whole run fails. When you need per-group percentile bands (e.g. low/medium/high by value), compute the percentile in its own subquery or CTE with a plain GROUP BY (e.g. PERCENTILE_CONT(0.33) WITHIN GROUP (ORDER BY col) as a grouped aggregate) and compare or join against that; you cannot group by a value derived from a window function.
 - Never return row-level values for columns that are withheld (they will not be listed in the payload — do not try to select them).
 
 Respond with ONLY a JSON object of the form {"sql": "..."} containing the SQL as a string. Escape any embedded double quotes. Do not include markdown fences or any text outside the JSON object.`

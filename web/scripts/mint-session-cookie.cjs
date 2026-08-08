@@ -1,5 +1,9 @@
 // Diagnostic: mint an Auth.js session cookie for a given user using the installed @auth/core
 // encode() and the local AUTH_SECRET. Prints "name=value" for curl -H "Cookie: ...".
+//
+// This is a plain CommonJS Node script by design (run directly with `node`, not through the TS
+// pipeline), so the TS-only no-require-imports rule does not apply here.
+/* eslint-disable @typescript-eslint/no-require-imports */
 const fs = require("fs");
 const path = require("path");
 const { encode } = require("@auth/core/jwt");

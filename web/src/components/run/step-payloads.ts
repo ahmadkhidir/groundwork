@@ -178,3 +178,47 @@ export function parseAdversarialReviewStep(
   }
   return parsed as AdversarialReviewStepOutput;
 }
+
+/**
+ * Strips the server's Go error-chain wrappers from a failed step's output so the reason reads as the
+ * engine's message rather than an internal error chain. A failed execute step's output is
+ * "executing query: engine: query: Binder Error: …" (run.go wraps handle.Query, which wraps the
+ * DuckDB error at engine/local_provider.go) — the wrappers are implementation noise; the tail is the
+ * real reason the user can act on. Output that carries no wrapper (e.g. the row-ceiling message, an
+ * adversarial-review verdict, "The model returned no SQL.") passes through unchanged.
+ */
+export function friendlyStepError(output: string): string {
+  const prefixes = ["executing query: ", "engine: query: ", "engine: exec: "];
+  let current = output.trim();
+  for (let guard = 0; guard < prefixes.length; guard++) {
+    let next = current;
+    for (const prefix of prefixes) {
+      if (next.startsWith(prefix)) {
+        next = next.slice(prefix.length).trim();
+        break;
+      }
+    }
+    if (next === current) break;
+    current = next;
+  }
+  return current;
+}
+
+/** The user-facing split of a failed step's output: the reason (first line) and the engine detail
+ * (the rest — DuckDB appends a "LINE n: …" echo of the offending SQL that is long and unreadable
+ * inline). detail is "" when there is nothing beyond the first line. */
+export interface SplitStepError {
+  summary: string;
+  detail: string;
+}
+
+/** Splits a failed step's output for display: friendlyStepError, then first-line summary / rest detail. */
+export function splitStepError(output: string): SplitStepError {
+  const cleaned = friendlyStepError(output);
+  const firstLineEnd = cleaned.indexOf("\n");
+  if (firstLineEnd < 0) return { summary: cleaned, detail: "" };
+  return {
+    summary: cleaned.slice(0, firstLineEnd).trim(),
+    detail: cleaned.slice(firstLineEnd + 1).trim(),
+  };
+}
