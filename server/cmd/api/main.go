@@ -227,7 +227,8 @@ func run(logger *slog.Logger) error {
 		// FEAT-050/FEAT-051: question suggestions — deterministic strip (metadata-only) plus the
 		// Pro/Team-gated smart generation. SuggestionEngine/SuggestionModel are the same engine
 		// Provider and model Client the run executor uses, so smart generation egress-logs and
-		// meters through the shared seams.
+		// meters through the shared seams. SuggestionBucket persists the generated questions
+		// ("add to the list" behavior) so a user never pays to regenerate the same set.
 		Suggestions: suggestionSource{
 			datasets:      datasetRepo,
 			columns:       columnRepo,
@@ -237,6 +238,7 @@ func run(logger *slog.Logger) error {
 		SuggestionEngine:  engineProvider,
 		SuggestionModel:   modelClient,
 		SuggestionObjects: objectStore,
+		SuggestionBucket:  postgres.NewSuggestionQuestionRepository(pool),
 
 		// FEAT-048 (single-dataset deletion) and FEAT-049 (duplicate-filename detection). Same
 		// datasetRepo/relationshipRepo/objectStore/auditWriter instances as above, satisfying the

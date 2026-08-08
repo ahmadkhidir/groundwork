@@ -1130,6 +1130,41 @@ CPU contention from running the cgo-heavy Go suite concurrently; the file passes
 the full suite is green alone). Also in this wave: a dev-only `allowedDevOrigins` entry
 (`192.168.0.111`) in `web/next.config.ts` for LAN-device verification of the mobile UI.
 
+### Post-suggestions feature — smart questions persist in a per-workspace bucket (user-authorized 2026-08-08)
+
+Product call (user): "smart questions generated should be added to the list — picking 1 of 10 and
+discarding 9 is wasteful — with the option of deleting them, and the UI should be multiline
+scrollable horizontally instead of one long strip." FEAT-051's session-only chip swap is replaced by
+a persisted bucket:
+
+- **`suggestion_questions` (migration 00013)** — per-workspace persisted smart suggestions: `id`,
+  `workspace_id` (FK cascade), `question`, `created_at`, `UNIQUE (workspace_id, question)` for
+  exact-text dedupe. The deterministic strip is deliberately NOT stored (it stays fresh with the
+  metadata and has nothing to delete). New `domain.SuggestionQuestion` entity + `postgres.
+  SuggestionQuestionRepository` (`ListByWorkspace` oldest-first, `Add` with `ON CONFLICT DO NOTHING`
+  returning the full bucket, `Delete` with the not-found sentinel).
+- **API** — `GET /suggestions` now returns `{suggestions, smart:[{id,question}]}`; `POST
+  /suggestions/smart` appends the model's questions (dedupe against the deterministic set AND the
+  existing bucket, driven by `ParseModelResponse`'s entity filter) and returns the full updated
+  shape; `DELETE /suggestions/{id}` (mutation access — owner or writable member, downgrade gate
+  applies; cross-workspace/missing → 404, never a probe). The smart route still registers only when
+  all collaborators are wired; the bucket is required for the GET/delete.
+- **Web** — `QuestionSuggestions` renders the deterministic strip AND the persisted "Smart
+  questions" bucket side by side (viewing is free on every tier; generating stays Pro/Team), each
+  smart chip fills the input on click and carries its own delete control (honest failure keeps the
+  chip; a 404 is treated as already-removed). Layout is `flex flex-wrap` inside `overflow-x-auto` —
+  multiline with horizontal scroll only when a row overflows, per the request. No more "Show
+  standard" revert.
+- **Verification** — server `make vet` + `make test` + `gofmt -l` clean (6 new/updated api tests
+  pinning append, dedupe-vs-standard, dedupe-vs-bucket, list-with-bucket, delete + 404 + read-only
+  403); web `tsc --noEmit` + `eslint` clean, `vitest run` 338/338 (3 new QuestionSuggestions tests).
+  Migration 00013 applied locally (DB at v13); the running Go API must be restarted to serve the new
+  endpoints.
+- **Doc tensions routed to product-shaper (not fixed):** features.md FEAT-051 still describes the
+  session-only swap ("FOR THE SESSION") — now wrong; schema.md has no `SuggestionQuestion` entity
+  (migration 00013 adds the table); the audit enum has no suggestion-delete action type (none
+  invented); screens/04's strip description predates the multiline layout.
+
 ### Post-suggestions bugfix — failed execute steps read as a crash (FEAT-014 AC "surfaced without crashing")
 
 A real user question ("What patterns exist between defensive actions and clean sheet achievements

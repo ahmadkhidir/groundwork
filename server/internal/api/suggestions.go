@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"github.com/ahmadkhidir/groundwork/server/internal/engine"
 	"github.com/ahmadkhidir/groundwork/server/internal/model"
 	"github.com/ahmadkhidir/groundwork/server/internal/run"
+	"github.com/ahmadkhidir/groundwork/server/internal/store/postgres"
 	"github.com/ahmadkhidir/groundwork/server/internal/suggestions"
 )
 
@@ -48,22 +50,53 @@ type SuggestionEngineProvider interface {
 	Release(handle engine.Handle) error
 }
 
-// RegisterSuggestionRoutes wires FEAT-050's deterministic read and FEAT-051's smart-generation
-// endpoint onto r. The smart endpoint is registered only when every collaborator it needs is
-// wired (users, engine, model, objects) — otherwise only the deterministic strip exists.
-func RegisterSuggestionRoutes(r chi.Router, workspaces WorkspaceStore, members MemberLookupStore, users UserTierLookup, source SuggestionSource, engineProvider SuggestionEngineProvider, modelClient SmartSuggestionModel, objects ObjectGetter, logger *slog.Logger) {
-	r.Get("/workspaces/{workspaceId}/suggestions", handleListSuggestions(workspaces, members, source, logger))
+// SuggestionBucket persists a workspace's model-generated question suggestions — FEAT-051's
+// "add to the list" behavior. The deterministic strip is computed at read time and never stored;
+// the model-generated set accumulates here so a user who picks one of ten never pays to regenerate
+// the other nine, and can delete rows they no longer want. Satisfied by
+// postgres.SuggestionQuestionRepository.
+type SuggestionBucket interface {
+	ListByWorkspace(ctx context.Context, workspaceID string) ([]domain.SuggestionQuestion, error)
+	Add(ctx context.Context, workspaceID string, questions []string) ([]domain.SuggestionQuestion, error)
+	Delete(ctx context.Context, workspaceID, id string) error
+}
+
+// publicSuggestionQuestion is the wire shape of one persisted smart suggestion. The workspace id
+// is deliberately omitted: the client already knows it, and the id doubles as the delete key.
+type publicSuggestionQuestion struct {
+	ID       string `json:"id"`
+	Question string `json:"question"`
+}
+
+func toPublicSuggestions(rows []domain.SuggestionQuestion) []publicSuggestionQuestion {
+	out := make([]publicSuggestionQuestion, 0, len(rows))
+	for _, s := range rows {
+		out = append(out, publicSuggestionQuestion{ID: s.ID, Question: s.Question})
+	}
+	return out
+}
+
+// RegisterSuggestionRoutes wires FEAT-050's deterministic read, FEAT-051's smart-generation
+// endpoint, and the persisted smart bucket (list + delete) onto r. The smart endpoint is registered
+// only when every collaborator it needs is wired (users, engine, model, objects) — otherwise only
+// the deterministic strip and bucket management exist.
+func RegisterSuggestionRoutes(r chi.Router, workspaces WorkspaceStore, members MemberLookupStore, users UserTierLookup, source SuggestionSource, bucket SuggestionBucket, engineProvider SuggestionEngineProvider, modelClient SmartSuggestionModel, objects ObjectGetter, logger *slog.Logger) {
+	if bucket == nil {
+		return
+	}
+	r.Get("/workspaces/{workspaceId}/suggestions", handleListSuggestions(workspaces, members, source, bucket, logger))
+	r.Delete("/workspaces/{workspaceId}/suggestions/{suggestionId}", handleDeleteSuggestion(workspaces, members, users, bucket, logger))
 	if users != nil && engineProvider != nil && modelClient != nil && objects != nil {
-		r.Post("/workspaces/{workspaceId}/suggestions/smart", handleSmartSuggestions(workspaces, members, users, source, engineProvider, modelClient, objects, logger))
+		r.Post("/workspaces/{workspaceId}/suggestions/smart", handleSmartSuggestions(workspaces, members, users, source, bucket, engineProvider, modelClient, objects, logger))
 	}
 }
 
 // handleListSuggestions serves GET /v1/workspaces/:id/suggestions — the deterministic, metadata-only
-// suggestions strip (FEAT-050). It is a pure Postgres read + template expansion: no engine query, no
-// model call, no egress entry. Access is the ordinary read boundary (owner OR read-only member); the
-// web UI hides the strip for read-only members, but suggestions are harmless metadata reads like any
-// other workspace read.
-func handleListSuggestions(workspaces WorkspaceStore, members MemberLookupStore, source SuggestionSource, logger *slog.Logger) http.HandlerFunc {
+// suggestions strip (FEAT-050) plus the workspace's persisted smart-suggestion bucket (FEAT-051).
+// It is a pure Postgres read + template expansion: no engine query, no model call, no egress entry.
+// Access is the ordinary read boundary (owner OR read-only member); the web UI hides the strip for
+// read-only members, but suggestions are harmless metadata reads like any other workspace read.
+func handleListSuggestions(workspaces WorkspaceStore, members MemberLookupStore, source SuggestionSource, bucket SuggestionBucket, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := requireClaims(w, r)
 		if !ok {
@@ -84,13 +117,29 @@ func handleListSuggestions(workspaces WorkspaceStore, members MemberLookupStore,
 			return
 		}
 
-		respondJSON(w, http.StatusOK, map[string]any{"suggestions": suggested})
+		bucketRows, err := bucket.ListByWorkspace(r.Context(), workspaceID)
+		if err != nil {
+			logger.Error("listing smart suggestion bucket", slog.String("error", err.Error()))
+			respondJSON(w, http.StatusInternalServerError, map[string]string{
+				"error": "Something went wrong. Try again.",
+				"code":  "internal_error",
+			})
+			return
+		}
+
+		respondJSON(w, http.StatusOK, map[string]any{
+			"suggestions": suggested,
+			"smart":       toPublicSuggestions(bucketRows),
+		})
 	}
 }
 
 // handleSmartSuggestions serves POST /v1/workspaces/:id/suggestions/smart — FEAT-051's on-demand,
 // Pro/Team-gated smart generation: wake the engine, profile safe columns, call the model once
-// through the shared payload seam, and return 5-10 data-informed questions.
+// through the shared payload seam, and APPEND the 5-10 data-informed questions to the workspace's
+// persisted bucket (never replace): the user who picks one question is not charged to regenerate
+// the other nine, and can delete rows from the bucket. The deterministic strip stays visible
+// alongside.
 //
 // Egress and metering are inherited from model.Client.Complete (the same fail-closed
 // egress-before-call and token-metering path every model call uses); the profiling queries are
@@ -102,6 +151,7 @@ func handleSmartSuggestions(
 	members MemberLookupStore,
 	users UserTierLookup,
 	source SuggestionSource,
+	bucket SuggestionBucket,
 	engineProvider SuggestionEngineProvider,
 	modelClient SmartSuggestionModel,
 	objects ObjectGetter,
@@ -160,6 +210,15 @@ func handleSmartSuggestions(
 		candidates, err := suggestions.Generate(r.Context(), workspaceID, source)
 		if err != nil {
 			logger.Error("generating candidate suggestions", slog.String("error", err.Error()))
+			respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "Something went wrong. Try again.", "code": "internal_error"})
+			return
+		}
+
+		// The persisted bucket is read up front: generation deduplicates against it AND against the
+		// deterministic set, so a question already on the list is never generated twice.
+		bucketRows, err := bucket.ListByWorkspace(r.Context(), workspaceID)
+		if err != nil {
+			logger.Error("listing smart suggestion bucket for generation", slog.String("error", err.Error()))
 			respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "Something went wrong. Try again.", "code": "internal_error"})
 			return
 		}
@@ -227,7 +286,66 @@ func handleSmartSuggestions(
 			return
 		}
 
-		respondJSON(w, http.StatusOK, map[string]any{"suggestions": smart, "model_generated": true})
+		// FEAT-051's "add to the list" behavior: append (never replace) the model's questions to
+		// the persisted bucket, skipping any that duplicate the deterministic set or an existing
+		// row. The user's accumulated list is the source of truth — a question already on it is
+		// never generated twice.
+		existing := make(map[string]bool, len(candidates)+len(bucketRows)+len(smart))
+		for _, s := range candidates {
+			existing[s] = true
+		}
+		for _, s := range bucketRows {
+			existing[s.Question] = true
+		}
+		fresh := make([]string, 0, len(smart))
+		for _, s := range smart {
+			if !existing[s] {
+				fresh = append(fresh, s)
+				existing[s] = true
+			}
+		}
+		bucketRows, err = bucket.Add(r.Context(), workspaceID, fresh)
+		if err != nil {
+			logger.Error("persisting smart suggestions", slog.String("error", err.Error()))
+			respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "Something went wrong. Try again.", "code": "internal_error"})
+			return
+		}
+
+		respondJSON(w, http.StatusOK, map[string]any{
+			"suggestions":     candidates,
+			"smart":           toPublicSuggestions(bucketRows),
+			"model_generated": true,
+		})
+	}
+}
+
+// handleDeleteSuggestion serves DELETE /v1/workspaces/:id/suggestions/:suggestionId — the user's
+// cleanup affordance for the persisted smart-suggestion bucket (FEAT-051's "add to the list"
+// behavior). Deleting a suggestion is a workspace mutation (owner or writable member; the
+// tier-downgrade gate applies), and the row must belong to the workspace — a cross-workspace id
+// reads as not-found, never a probe.
+func handleDeleteSuggestion(workspaces WorkspaceStore, members MemberLookupStore, users UserTierLookup, bucket SuggestionBucket, logger *slog.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		claims, ok := requireClaims(w, r)
+		if !ok {
+			return
+		}
+		workspaceID := chi.URLParam(r, "workspaceId")
+		if _, ok := requireWorkspaceMutationAccess(w, r, workspaces, members, users, claims.UserID, workspaceID); !ok {
+			return
+		}
+
+		err := bucket.Delete(r.Context(), workspaceID, chi.URLParam(r, "suggestionId"))
+		if err != nil {
+			if errors.Is(err, postgres.ErrSuggestionQuestionNotFound) {
+				respondJSON(w, http.StatusNotFound, map[string]string{"error": "Suggestion not found.", "code": "not_found"})
+				return
+			}
+			logger.Error("deleting smart suggestion", slog.String("error", err.Error()))
+			respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "Something went wrong. Try again.", "code": "internal_error"})
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
 	}
 }
 

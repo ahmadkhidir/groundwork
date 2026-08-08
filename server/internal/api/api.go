@@ -110,6 +110,11 @@ type Dependencies struct {
 	// SuggestionObjects downloads a workspace's normalized Parquet so the smart-generation handler
 	// can attach the engine views it profiles (FEAT-051). Satisfied by storage.Client.
 	SuggestionObjects ObjectGetter
+	// SuggestionBucket persists the workspace's model-generated smart suggestions (FEAT-051's
+	// "add to the list" behavior): the GET returns them alongside the deterministic strip, smart
+	// generation appends to them, and DELETE removes one. Satisfied by
+	// postgres.SuggestionQuestionRepository.
+	SuggestionBucket SuggestionBucket
 
 	// Datasets... below back FEAT-048 (Single-Dataset Deletion) — screens/04-workspace-home.md's
 	// Datasets panel and the shared Delete Confirmation Modal's data source — and FEAT-049's
@@ -358,10 +363,11 @@ func (s *Server) routes() {
 						s.deps.SemanticMetrics, s.deps.SemanticCorrections, s.deps.SemanticSummary, s.logger)
 				}
 
-				// FEAT-050/FEAT-051: question suggestions — deterministic strip (no engine, no model)
-				// plus the Pro/Team-gated smart generation (engine profile + one model call).
-				if s.deps.Suggestions != nil {
-					RegisterSuggestionRoutes(r, s.deps.Workspaces, s.deps.MemberLookup, s.deps.Users, s.deps.Suggestions,
+				// FEAT-050/FEAT-051: question suggestions — deterministic strip (no engine, no model),
+				// the persisted smart-suggestion bucket (list + delete), and the Pro/Team-gated smart
+				// generation that appends to it (engine profile + one model call).
+				if s.deps.Suggestions != nil && s.deps.SuggestionBucket != nil {
+					RegisterSuggestionRoutes(r, s.deps.Workspaces, s.deps.MemberLookup, s.deps.Users, s.deps.Suggestions, s.deps.SuggestionBucket,
 						s.deps.SuggestionEngine, s.deps.SuggestionModel, s.deps.SuggestionObjects, s.logger)
 				}
 

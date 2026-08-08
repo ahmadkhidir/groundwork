@@ -533,6 +533,18 @@ type Notification struct {
 	CreatedAt         time.Time         `json:"created_at"`
 }
 
+// SuggestionQuestion is one persisted, model-generated question suggestion for a workspace — the
+// FEAT-051 "add to the list" behavior. Unlike the deterministic suggestions, which are computed
+// from metadata at read time and never stored, this row is what the smart-generation endpoint
+// accumulates: a user who picks one of ten generated questions does not pay to regenerate the other
+// nine, and can delete rows they no longer want.
+type SuggestionQuestion struct {
+	ID          string    `json:"id"`
+	WorkspaceID string    `json:"workspace_id"`
+	Question    string    `json:"question"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
 // AuditLogEntry is one entry in the COMBINED audit and model-egress log.
 //
 // Deliberately one object rather than two: queries, model payloads, exports, and deletions are
