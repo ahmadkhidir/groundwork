@@ -360,6 +360,35 @@ describe("RunViewerScreen", () => {
     );
   });
 
+  it("refreshes the step feed when a complete run.status arrives as a terminal SNAPSHOT (stream was down during completion)", async () => {
+    // The viewer joins while the run is still running (e.g. mid-engine-wake after a clarifying
+    // answer), then the stream reconnects after the run has ALREADY completed — the connection's
+    // first message is a terminal snapshot, not a transition. The pill updates, but the step feed
+    // must also catch up via the durable GET (it used to stay on Plan until a manual refresh).
+    getMock
+      .mockResolvedValueOnce({
+        run: run("running"),
+        steps: [step("plan", { status: "complete" })],
+      })
+      .mockResolvedValueOnce({
+        run: run("complete"),
+        steps: completeRunSteps(),
+        report_id: "report-1",
+      });
+    render(<RunViewerScreen workspaceId="ws-1" runId="run-1" />);
+    await screen.findByText("How many customers per region?");
+
+    await emit(0, JSON.stringify({ type: "run.status", status: "complete", run_id: "run-1" }));
+
+    // The durable GET was re-fetched, so the step feed catches up with the completed run.
+    await screen.findByText(SQL_TEXT);
+    expect(screen.getByText("Execute")).toBeInTheDocument();
+    // The report link appears without auto-navigating: a terminal snapshot is a joined-state,
+    // never a transition that arms the report↔run loop.
+    expect(pushMock).not.toHaveBeenCalled();
+    expect(screen.getByRole("link", { name: /View report/ })).toBeInTheDocument();
+  });
+
   it("does not navigate away when a completed run has no report yet", async () => {
     getMock.mockResolvedValue({ run: run("complete"), steps: completeRunSteps() });
     render(<RunViewerScreen workspaceId="ws-1" runId="run-1" />);

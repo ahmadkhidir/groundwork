@@ -236,10 +236,21 @@ export function RunViewerScreen({ workspaceId, runId }: RunViewerScreenProps) {
           // completionObserved, so a terminal run mounted from elsewhere (report → "View source run")
           // never bounces back.
           if (runStatusSnapshotSeen.current) {
+            // Genuine transition observed after joining — arm the report auto-navigate and refresh
+            // the durable GET so the materialized report_id (and any late step output) lands.
             if (status === RunStatus.Complete) {
               completionObserved.current = true;
               void load();
             }
+          } else if (status === RunStatus.Complete) {
+            // Terminal SNAPSHOT: the first message of this connection says the run already
+            // finished. This happens when the stream was down while the run completed — the
+            // server's 60s request ceiling plus a long engine wake (e.g. resuming after a
+            // clarifying answer) can exceed the reconnect gap. The pill already shows Complete,
+            // but the step feed and report info are stale; refresh the durable GET so they catch
+            // up. Navigation is deliberately NOT armed: the user joined a finished run
+            // (report → "View source run") must not bounce back.
+            void load();
           }
           runStatusSnapshotSeen.current = true;
           break;
