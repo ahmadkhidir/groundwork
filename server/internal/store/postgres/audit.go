@@ -198,3 +198,19 @@ func nullableString(s string) *string {
 	}
 	return &s
 }
+
+// DeleteByUser removes every audit/egress entry belonging to userID — FEAT-052's account deletion
+// step 5. No audit entry is written for the account deletion itself: every audit row is
+// user-FK-cascaded when the users row falls at the final step, so a written entry would be destroyed
+// with the account; the per-workspace DeletionRecords from the workspace cascades are the surviving
+// proof, and their initiated_by column (plain text, deliberately not FK'd) retains the deleted user
+// id as historical reference.
+func (r *AuditRepository) DeleteByUser(ctx context.Context, userID string) error {
+	if _, err := r.pool.Exec(ctx,
+		`DELETE FROM audit_log_entries WHERE user_id = $1`,
+		userID,
+	); err != nil {
+		return fmt.Errorf("deleting audit entries for user: %w", err)
+	}
+	return nil
+}

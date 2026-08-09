@@ -300,6 +300,16 @@ func run(logger *slog.Logger) error {
 		BillingUsers:  userRepo,
 		BillingEvents: billingEventRepo,
 		BillingClient: billingClient,
+
+		// FEAT-052 (Account Profile & Self-Management): the user-scoped cleanup seams for
+		// DELETE /v1/account — memberships in other users' workspaces, notifications, reset tokens,
+		// audit entries, billing events, and finally the users row itself.
+		AccountMembers:       memberRepo,
+		AccountNotifications: notificationRepo,
+		AccountResetTokens:   resetTokens,
+		AccountAudit:         auditRepo,
+		AccountBillingEvents: billingEventRepo,
+		AccountUsers:         userRepo,
 	}
 
 	server := &http.Server{

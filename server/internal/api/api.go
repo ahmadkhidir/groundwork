@@ -174,6 +174,17 @@ type Dependencies struct {
 	WorkspaceDeletionProofs  DeletionProofStore
 	WorkspaceDeletionAudit   WorkspaceDeletionAuditWriter
 
+	// FEAT-052 (Account Profile & Self-Management) — DELETE /v1/account reuses the FEAT-043
+	// workspace cascade per owned workspace, then needs the user-scoped cleanup seams below
+	// (satisfied by the corresponding postgres repositories). Workspaces (ListByOwner) comes from the
+	// shared Workspaces seam; the billing state/client/events come from the billing seams.
+	AccountMembers       AccountMemberDeleter
+	AccountNotifications AccountNotificationDeleter
+	AccountResetTokens   AccountResetTokenInvalidator
+	AccountAudit         AccountAuditDeleter
+	AccountBillingEvents AccountBillingEventDeleter
+	AccountUsers         AccountUserDeleter
+
 	// FEAT-045 (Read-Only Workspace Sharing) — screens/13-workspace-settings.md. Members manages
 	// the workspace_members table (satisfied by postgres.MemberRepository); MemberLookup is the same
 	// repository narrowed to the access-check read (owner OR member) every handler uses; MemberUsers
@@ -304,6 +315,12 @@ func (s *Server) routes() {
 			r.Group(func(r chi.Router) {
 				r.Use(authsession.RequireAuth(s.deps.AuthSecret))
 
+				// FEAT-052: authenticated password change (the auth endpoints in the public group
+				// are signup/login/reset; this one needs a session).
+				if s.authService != nil {
+					RegisterAuthenticatedAuthRoutes(r, s.authService, s.logger)
+				}
+
 				// FEAT-002: create and list workspaces.
 				RegisterWorkspaceRoutes(r, s.deps.Workspaces, s.deps.Users, s.logger)
 
@@ -431,6 +448,21 @@ func (s *Server) routes() {
 					RegisterWorkspaceDeleteRoute(r, s.deps.Workspaces, s.deps.WorkspaceCascadeObjects,
 						s.deps.WorkspaceEngineDropper, s.deps.WorkspaceDeletionCascade,
 						s.deps.WorkspaceDeletionProofs, s.deps.WorkspaceDeletionAudit, s.logger)
+				}
+
+				// FEAT-052: account deletion — reuses the workspace cascade per owned workspace plus
+				// the user-scoped cleanup seams.
+				if s.deps.WorkspaceCascadeObjects != nil && s.deps.WorkspaceDeletionCascade != nil &&
+					s.deps.WorkspaceDeletionAudit != nil && s.deps.AccountMembers != nil &&
+					s.deps.AccountNotifications != nil && s.deps.AccountResetTokens != nil &&
+					s.deps.AccountAudit != nil && s.deps.AccountBillingEvents != nil &&
+					s.deps.AccountUsers != nil {
+					RegisterAccountDeleteRoute(r, s.deps.Workspaces, s.deps.WorkspaceCascadeObjects,
+						s.deps.WorkspaceEngineDropper, s.deps.WorkspaceDeletionCascade,
+						s.deps.WorkspaceDeletionAudit,
+						s.deps.AccountMembers, s.deps.AccountNotifications, s.deps.AccountResetTokens,
+						s.deps.AccountAudit, s.deps.BillingUsers, s.deps.BillingClient,
+						s.deps.AccountBillingEvents, s.deps.AccountUsers, s.logger)
 				}
 
 				// Billing milestone, pass 2: authenticated billing endpoints — Checkout Session

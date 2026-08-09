@@ -191,6 +191,21 @@ func (r *UserRepository) GetBillingByStripeCustomerID(ctx context.Context, custo
 	return r.findBilling(ctx, "stripe_customer_id = $1", customerID)
 }
 
+// Delete removes a user row (FEAT-052's account deletion — the LAST step of the cascade, after every
+// owned workspace and user-scoped row is gone). Hard delete: schema.md deliberately introduces no
+// soft-delete. Returns auth.ErrUserNotFound when the row no longer exists (a concurrent deletion won
+// the race — the cascade is idempotent and safe to retry, but there is nothing left to delete).
+func (r *UserRepository) Delete(ctx context.Context, userID string) error {
+	tag, err := r.pool.Exec(ctx, `DELETE FROM users WHERE id = $1`, userID)
+	if err != nil {
+		return fmt.Errorf("deleting user: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return auth.ErrUserNotFound
+	}
+	return nil
+}
+
 func (r *UserRepository) findBilling(ctx context.Context, whereClause, arg string) (UserBilling, error) {
 	var (
 		billing   UserBilling

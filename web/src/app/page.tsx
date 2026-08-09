@@ -12,8 +12,12 @@ export const metadata: Metadata = {
  * Server-rendered with no client fetch on load (the one SSR/SSG screen per architecture.md). The
  * session is read only for the screens/01 edge case: an already-authenticated visitor still sees
  * the landing page, but the primary CTA becomes "Go to Workspaces" instead of "Get started".
+ *
+ * FEAT-052 adds the `?deleted=1` query: after an account deletion the browser is redirected here,
+ * and the flag shows the neutral confirmation banner (screens/01).
  */
-export default async function LandingPage() {
+export default async function LandingPage(props: PageProps<"/">) {
   const session = await auth();
-  return <LandingScreen signedIn={Boolean(session)} />;
+  const { deleted } = await props.searchParams;
+  return <LandingScreen signedIn={Boolean(session)} deleted={deleted === "1"} />;
 }

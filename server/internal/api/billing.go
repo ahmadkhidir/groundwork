@@ -47,12 +47,14 @@ type BillingEventStore interface {
 }
 
 // StripeClient is the Stripe API seam, satisfied by *billing.Client. Narrow by construction: the
-// handlers only create checkout sessions, read one subscription snapshot, and open the customer
-// portal.
+// handlers only create checkout sessions, read one subscription snapshot, open the customer portal,
+// and (FEAT-052's account deletion) cancel a subscription immediately and delete a customer.
 type StripeClient interface {
 	CreateCheckoutSession(ctx context.Context, p billing.CheckoutParams) (billing.CheckoutResult, error)
 	GetSubscription(ctx context.Context, id string) (billing.SubscriptionSnapshot, error)
 	CreatePortalSession(ctx context.Context, customerID string) (billing.PortalSessionResult, error)
+	CancelSubscription(ctx context.Context, subscriptionID string) error
+	DeleteCustomer(ctx context.Context, customerID string) error
 }
 
 // RegisterBillingRoutes wires the AUTHENTICATED billing endpoints onto r (mounted inside

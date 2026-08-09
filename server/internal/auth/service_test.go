@@ -433,3 +433,71 @@ func TestServiceClockSeam(t *testing.T) {
 		t.Errorf("CreatedAt = %v, want %v", user.CreatedAt, fixed)
 	}
 }
+
+func TestChangePassword(t *testing.T) {
+	t.Run("rejects a wrong current password", func(t *testing.T) {
+		svc := newTestService()
+		user, err := svc.SignUp(context.Background(), "change@example.com", "old-password-1")
+		if err != nil {
+			t.Fatalf("SignUp() error = %v", err)
+		}
+
+		err = svc.ChangePassword(context.Background(), user.ID, "not-the-current", "new-password-2")
+		if err != ErrWrongCurrentPassword {
+			t.Errorf("err = %v, want ErrWrongCurrentPassword", err)
+		}
+	})
+
+	t.Run("updates the hash and invalidates outstanding reset tokens", func(t *testing.T) {
+		users := newFakeUserStore()
+		resets := NewMemoryResetTokenStore()
+		svc := NewService(users, resets, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+		user, err := svc.SignUp(context.Background(), "change2@example.com", "old-password-1")
+		if err != nil {
+			t.Fatalf("SignUp() error = %v", err)
+		}
+		// An outstanding reset token exists before the change.
+		if err := svc.RequestPasswordReset(context.Background(), user.Email); err != nil {
+			t.Fatalf("RequestPasswordReset() error = %v", err)
+		}
+		resets.mu.Lock()
+		hadToken := len(resets.entries) == 1
+		resets.mu.Unlock()
+		if !hadToken {
+			t.Fatal("expected one outstanding reset token before the change")
+		}
+
+		if err := svc.ChangePassword(context.Background(), user.ID, "old-password-1", "new-password-2"); err != nil {
+			t.Fatalf("ChangePassword() error = %v", err)
+		}
+
+		// The new password authenticates; the old one no longer does.
+		if _, err := svc.Authenticate(context.Background(), user.Email, "new-password-2"); err != nil {
+			t.Errorf("Authenticate(new) error = %v, want success", err)
+		}
+		if _, err := svc.Authenticate(context.Background(), user.Email, "old-password-1"); err != ErrInvalidCredentials {
+			t.Errorf("Authenticate(old) = %v, want ErrInvalidCredentials", err)
+		}
+		// Outstanding reset tokens were destroyed.
+		resets.mu.Lock()
+		remaining := len(resets.entries)
+		resets.mu.Unlock()
+		if remaining != 0 {
+			t.Errorf("reset tokens remaining after change = %d, want 0", remaining)
+		}
+	})
+
+	t.Run("rejects an empty new password", func(t *testing.T) {
+		svc := newTestService()
+		user, err := svc.SignUp(context.Background(), "change3@example.com", "old-password-1")
+		if err != nil {
+			t.Fatalf("SignUp() error = %v", err)
+		}
+
+		err = svc.ChangePassword(context.Background(), user.ID, "old-password-1", "")
+		if err != ErrPasswordRequired {
+			t.Errorf("err = %v, want ErrPasswordRequired", err)
+		}
+	})
+}

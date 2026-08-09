@@ -4,12 +4,15 @@ import { ArrowRight, FileUp, MessageSquareText, ScanSearch } from "lucide-react"
 import { buttonClassNames } from "@/components/ui/Button";
 import { PLANS } from "@/components/billing/PlanCard";
 import { ClaimDemo } from "./ClaimDemo";
+import { DeletedAccountBanner } from "./DeletedAccountBanner";
 import { routes } from "@/lib/routes";
 
 export interface LandingScreenProps {
   /** True when the visitor has an active session — the primary CTA becomes "Go to Workspaces"
    *  per screens/01's edge case (an authenticated visitor still sees the landing page). */
   signedIn: boolean;
+  /** True when redirected here after an account deletion (`?deleted=1`) — shows the confirmation banner. */
+  deleted?: boolean;
 }
 
 /**
@@ -21,9 +24,10 @@ export interface LandingScreenProps {
  * only state is the authenticated edge case — a signed-in visitor keeps the page but the primary
  * CTA becomes "Go to Workspaces".
  */
-export function LandingScreen({ signedIn }: LandingScreenProps) {
+export function LandingScreen({ signedIn, deleted = false }: LandingScreenProps) {
   return (
     <div className="flex min-h-full flex-col">
+      {deleted && <DeletedAccountBanner />}
       <header className="sticky top-0 z-40 border-b border-border bg-surface/90 backdrop-blur">
         <nav
           aria-label="Main"

@@ -150,6 +150,19 @@ func (r *MemberRepository) Revoke(ctx context.Context, id, workspaceID string) e
 	return nil
 }
 
+// DeleteByUser removes every membership row where userID is the member — FEAT-052's account
+// deletion removes the account's read-only memberships in other users' workspaces WITHOUT touching
+// those workspaces (an account deletion never destroys a workspace it does not own).
+func (r *MemberRepository) DeleteByUser(ctx context.Context, userID string) error {
+	if _, err := r.pool.Exec(ctx,
+		`DELETE FROM workspace_members WHERE user_id = $1`,
+		userID,
+	); err != nil {
+		return fmt.Errorf("deleting memberships for user: %w", err)
+	}
+	return nil
+}
+
 // scanMember decodes one workspace_members row. rowScanner (defined in workspaces.go) is satisfied
 // by both pgx.Row and pgx.Rows, letting this serve the single-row and multi-row reads without
 // duplicating the column list.

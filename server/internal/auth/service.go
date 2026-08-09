@@ -22,6 +22,12 @@ var (
 	// ErrInvalidCredentials is returned by Authenticate for BOTH "no such account" and "wrong
 	// password" — see Authenticate's doc comment for why the two must not be distinguishable.
 	ErrInvalidCredentials = errors.New("invalid email or password")
+	// ErrWrongCurrentPassword is returned by ChangePassword when the submitted current password does
+	// not match the stored hash. Deliberately DISTINCT from ErrInvalidCredentials: the caller is
+	// already authenticated as that account, so there is no enumeration concern, and the handler
+	// maps it to 400 invalid_current_password — never 401, which the web client's isUnauthenticated
+	// handling would misread as session expiry and route to the login gate.
+	ErrWrongCurrentPassword = errors.New("current password is incorrect")
 	// ErrInvalidResetToken is returned by ConfirmPasswordReset for a missing, already-used, or
 	// expired token.
 	ErrInvalidResetToken = errors.New("invalid or expired reset token")
@@ -235,6 +241,44 @@ func (s *Service) ConfirmPasswordReset(ctx context.Context, token, newPassword s
 	}
 
 	return s.users.UpdatePasswordHash(ctx, userID, hash)
+}
+
+// ChangePassword verifies the authenticated user's CURRENT password against the stored hash, then
+// writes a new hash for newPassword and invalidates the user's outstanding reset tokens (FEAT-052).
+//
+// The current-password check deliberately reuses the same FindByID + VerifyPassword path as
+// Authenticate, but returns ErrWrongCurrentPassword rather than ErrInvalidCredentials: the caller is
+// already authenticated as this account (the handler requires a session), so conflating "wrong
+// current password" with the login-invalid pair would hide a fixable form error behind the generic
+// credential failure. The new password runs through the same validatePassword rules as signup and
+// reset. Existing Auth.js sessions are JWT-based and are NOT revoked by a password change.
+func (s *Service) ChangePassword(ctx context.Context, userID, currentPassword, newPassword string) error {
+	if _, hash, err := s.users.FindByID(ctx, userID); err != nil {
+		return err
+	} else if ok, err := VerifyPassword(hash, currentPassword); err != nil || !ok {
+		return ErrWrongCurrentPassword
+	}
+
+	if err := validatePassword(newPassword); err != nil {
+		return err
+	}
+
+	hash, err := HashPassword(newPassword)
+	if err != nil {
+		return fmt.Errorf("hashing password: %w", err)
+	}
+
+	if err := s.users.UpdatePasswordHash(ctx, userID, hash); err != nil {
+		return err
+	}
+	// A previously-requested reset link must not be able to override the new password. Best-effort
+	// by contract: the token is single-use-on-any-attempt anyway, so a failure here is a stale-token
+	// annoyance, never a security hole.
+	if err := s.resets.InvalidateForUser(ctx, userID); err != nil {
+		s.logger.Error("invalidating reset tokens after password change",
+			slog.String("error", err.Error()), slog.String("user_id", userID))
+	}
+	return nil
 }
 
 // dummyHash is compared against on a "no such account" login attempt purely for its cost — the

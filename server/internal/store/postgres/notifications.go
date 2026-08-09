@@ -238,6 +238,19 @@ func (r *NotificationRepository) MarkAllRead(ctx context.Context, userID string)
 	return int(tag.RowsAffected()), nil
 }
 
+// DeleteByUser removes every notification belonging to userID — FEAT-052's account deletion cleanup
+// step (notifications are user-scoped, not workspace-scoped, so the workspace cascade cannot reach
+// them).
+func (r *NotificationRepository) DeleteByUser(ctx context.Context, userID string) error {
+	if _, err := r.pool.Exec(ctx,
+		`DELETE FROM notifications WHERE user_id = $1`,
+		userID,
+	); err != nil {
+		return fmt.Errorf("deleting notifications for user: %w", err)
+	}
+	return nil
+}
+
 // ResolveLinks resolves each notification's polymorphic related entity to the workspace that owns
 // it, returning a map from notification id to workspace id. The result is the deep-link half the
 // client cannot derive from the Notification entity alone — a report or dataset id carries no

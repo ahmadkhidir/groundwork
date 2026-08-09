@@ -168,71 +168,9 @@ func handleDeleteWorkspace(
 			return
 		}
 
-		ctx := r.Context()
-		completed := []string{}
-
-		// 1. Object store contents.
-		if err := objects.DeleteObjectsByPrefix(ctx, "workspaces/"+workspaceID+"/"); err != nil {
-			logger.Error("cascade: object store", slog.String("workspace_id", workspaceID), slog.String("error", err.Error()))
-			respondDeletionPartialFailure(w, string(domain.CategoryObjectStore), completed)
-			return
-		}
-		completed = append(completed, string(domain.CategoryObjectStore))
-
-		// 2. Engine state (not a recorded category — see WorkspaceEngineDropper's doc comment).
-		if engine != nil {
-			if err := engine.Drop(workspaceID); err != nil {
-				logger.Error("cascade: engine teardown", slog.String("workspace_id", workspaceID), slog.String("error", err.Error()))
-				respondDeletionPartialFailure(w, "engine", completed)
-				return
-			}
-		}
-
-		// 3-5. The database categories, in domain.AllDeletedCategories order so the completed list and
-		// the persisted proof match the documented enumeration.
-		if err := cascade.DeleteSemanticLayer(ctx, workspaceID); err != nil {
-			logger.Error("cascade: semantic layer", slog.String("workspace_id", workspaceID), slog.String("error", err.Error()))
-			respondDeletionPartialFailure(w, string(domain.CategorySemanticLayer), completed)
-			return
-		}
-		completed = append(completed, string(domain.CategorySemanticLayer))
-
-		if err := cascade.DeleteReportsAndConversation(ctx, workspaceID); err != nil {
-			logger.Error("cascade: reports and conversation", slog.String("workspace_id", workspaceID), slog.String("error", err.Error()))
-			respondDeletionPartialFailure(w, string(domain.CategoryReportsAndConversation), completed)
-			return
-		}
-		completed = append(completed, string(domain.CategoryReportsAndConversation))
-
-		if err := cascade.DeleteQueryCaches(ctx, workspaceID); err != nil {
-			logger.Error("cascade: query caches", slog.String("workspace_id", workspaceID), slog.String("error", err.Error()))
-			respondDeletionPartialFailure(w, string(domain.CategoryQueryCaches), completed)
-			return
-		}
-		completed = append(completed, string(domain.CategoryQueryCaches))
-
-		// 6. Logs — audit entry first, then destruction (order matters; see WorkspaceDeletionAuditWriter).
-		if err := auditWriter.WriteDeletion(ctx, workspaceID, claims.UserID); err != nil {
-			logger.Error("cascade: audit write", slog.String("workspace_id", workspaceID), slog.String("error", err.Error()))
-			respondDeletionPartialFailure(w, string(domain.CategoryLogs), completed)
-			return
-		}
-		if err := cascade.DeleteAuditLog(ctx, workspaceID); err != nil {
-			logger.Error("cascade: audit log rows", slog.String("workspace_id", workspaceID), slog.String("error", err.Error()))
-			respondDeletionPartialFailure(w, string(domain.CategoryLogs), completed)
-			return
-		}
-		completed = append(completed, string(domain.CategoryLogs))
-
-		// 7. LAST — the workspace row, atomically with the proof.
-		proof := domain.DeletionRecord{
-			ID:                uuid.NewString(),
-			WorkspaceID:       workspaceID,
-			InitiatedBy:       claims.UserID,
-			DeletedCategories: append([]domain.DeletedCategory(nil), domain.AllDeletedCategories...),
-			CompletedAt:       time.Now(),
-		}
-		if err := cascade.DeleteWithProof(ctx, workspaceID, proof); err != nil {
+		proof, completed, failedStep, err := deleteWorkspaceCascade(r.Context(), workspaceID, claims.UserID,
+			objects, engine, cascade, auditWriter, logger)
+		if err != nil {
 			if errors.Is(err, postgres.ErrWorkspaceNotFound) {
 				// A concurrent deletion won the race: the workspace is gone, so there is nothing left
 				// to delete or retry against. The tx rolled back, so no stray proof row was written.
@@ -242,13 +180,105 @@ func handleDeleteWorkspace(
 				})
 				return
 			}
-			logger.Error("cascade: workspace row + proof", slog.String("workspace_id", workspaceID), slog.String("error", err.Error()))
-			respondDeletionPartialFailure(w, "workspace_row", completed)
+			respondDeletionPartialFailure(w, failedStep, completed)
 			return
 		}
 
 		respondJSON(w, http.StatusOK, map[string]any{"deletion": proof})
 	}
+}
+
+// deleteWorkspaceCascade runs FEAT-043's single cascading operation for ONE workspace and returns
+// the surviving proof on success, or the completed-categories list plus the failed step on error.
+// It is the shared engine behind handleDeleteWorkspace and FEAT-052's account deletion (which runs
+// it once per owned workspace).
+//
+// Order is deliberate and load-bearing (see handleDeleteWorkspace's doc comment):
+//
+//  1. object store contents — the explicit prefix sweep, FEAT-048's lesson at workspace scope.
+//  2. engine state — drop any session-scoped engine so no ghost engine outlives its workspace.
+//     3-5. the database categories in domain.AllDeletedCategories order (semantic layer,
+//     reports_and_conversation, query_caches), each an explicit store call.
+//  6. logs — the cascade's own audit entry is written FIRST (the last moment the workspace's audit
+//     rows exist to be written into), then the log rows are destroyed.
+//  7. LAST — the workspace row, atomically with the proof record. Only now, after every category
+//     succeeded, is the workspace actually deleted; migration 00001's ON DELETE CASCADE network
+//     destroys any workspace-keyed row the explicit pass missed, and deletion_records survives as the
+//     proof.
+//
+// Every step is idempotent (deleting already-deleted objects/rows succeeds), which is what makes
+// "retry the cascade" (Flow 5 Alternate Path B) actually safe at both workspace and account scope.
+func deleteWorkspaceCascade(
+	ctx context.Context,
+	workspaceID, userID string,
+	objects WorkspaceCascadeObjectDeleter,
+	engine WorkspaceEngineDropper,
+	cascade WorkspaceDeletionStore,
+	auditWriter WorkspaceDeletionAuditWriter,
+	logger *slog.Logger,
+) (domain.DeletionRecord, []string, string, error) {
+	completed := []string{}
+
+	// 1. Object store contents.
+	if err := objects.DeleteObjectsByPrefix(ctx, "workspaces/"+workspaceID+"/"); err != nil {
+		logger.Error("cascade: object store", slog.String("workspace_id", workspaceID), slog.String("error", err.Error()))
+		return domain.DeletionRecord{}, completed, string(domain.CategoryObjectStore), err
+	}
+	completed = append(completed, string(domain.CategoryObjectStore))
+
+	// 2. Engine state (not a recorded category — see WorkspaceEngineDropper's doc comment).
+	if engine != nil {
+		if err := engine.Drop(workspaceID); err != nil {
+			logger.Error("cascade: engine teardown", slog.String("workspace_id", workspaceID), slog.String("error", err.Error()))
+			return domain.DeletionRecord{}, completed, "engine", err
+		}
+	}
+
+	// 3-5. The database categories, in domain.AllDeletedCategories order so the completed list and
+	// the persisted proof match the documented enumeration.
+	if err := cascade.DeleteSemanticLayer(ctx, workspaceID); err != nil {
+		logger.Error("cascade: semantic layer", slog.String("workspace_id", workspaceID), slog.String("error", err.Error()))
+		return domain.DeletionRecord{}, completed, string(domain.CategorySemanticLayer), err
+	}
+	completed = append(completed, string(domain.CategorySemanticLayer))
+
+	if err := cascade.DeleteReportsAndConversation(ctx, workspaceID); err != nil {
+		logger.Error("cascade: reports and conversation", slog.String("workspace_id", workspaceID), slog.String("error", err.Error()))
+		return domain.DeletionRecord{}, completed, string(domain.CategoryReportsAndConversation), err
+	}
+	completed = append(completed, string(domain.CategoryReportsAndConversation))
+
+	if err := cascade.DeleteQueryCaches(ctx, workspaceID); err != nil {
+		logger.Error("cascade: query caches", slog.String("workspace_id", workspaceID), slog.String("error", err.Error()))
+		return domain.DeletionRecord{}, completed, string(domain.CategoryQueryCaches), err
+	}
+	completed = append(completed, string(domain.CategoryQueryCaches))
+
+	// 6. Logs — audit entry first, then destruction (order matters; see WorkspaceDeletionAuditWriter).
+	if err := auditWriter.WriteDeletion(ctx, workspaceID, userID); err != nil {
+		logger.Error("cascade: audit write", slog.String("workspace_id", workspaceID), slog.String("error", err.Error()))
+		return domain.DeletionRecord{}, completed, string(domain.CategoryLogs), err
+	}
+	if err := cascade.DeleteAuditLog(ctx, workspaceID); err != nil {
+		logger.Error("cascade: audit log rows", slog.String("workspace_id", workspaceID), slog.String("error", err.Error()))
+		return domain.DeletionRecord{}, completed, string(domain.CategoryLogs), err
+	}
+	completed = append(completed, string(domain.CategoryLogs))
+
+	// 7. LAST — the workspace row, atomically with the proof.
+	proof := domain.DeletionRecord{
+		ID:                uuid.NewString(),
+		WorkspaceID:       workspaceID,
+		InitiatedBy:       userID,
+		DeletedCategories: append([]domain.DeletedCategory(nil), domain.AllDeletedCategories...),
+		CompletedAt:       time.Now(),
+	}
+	if err := cascade.DeleteWithProof(ctx, workspaceID, proof); err != nil {
+		logger.Error("cascade: workspace row + proof", slog.String("workspace_id", workspaceID), slog.String("error", err.Error()))
+		return domain.DeletionRecord{}, completed, "workspace_row", err
+	}
+
+	return proof, completed, "", nil
 }
 
 // handleGetDeletionProof serves GET /v1/workspaces/{workspaceId}/deletion — screens/14's follow-up

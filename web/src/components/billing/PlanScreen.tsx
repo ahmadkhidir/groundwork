@@ -266,6 +266,14 @@ export function PlanScreen(props: PlanScreenProps) {
 
   return (
     <main id="main-content" className="mx-auto w-full max-w-5xl p-8">
+      <nav aria-label="Account navigation" className="mb-2">
+        <Link
+          href={routes.settingsProfile()}
+          className="text-body-small text-provenance hover:text-provenance"
+        >
+          Profile &amp; Security →
+        </Link>
+      </nav>
       <h1 className="text-h1 text-text-primary">Plan &amp; Billing</h1>
       <p className="mt-1 text-body-small text-text-secondary">
         Your plan, what it unlocks, and how to change it. The server enforces every tier gate — this

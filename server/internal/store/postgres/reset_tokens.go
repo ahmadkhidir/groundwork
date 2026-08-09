@@ -100,3 +100,16 @@ func (r *ResetTokenRepository) Consume(ctx context.Context, tokenHash string) (s
 	}
 	return userID, nil
 }
+
+// InvalidateForUser destroys every outstanding (unconsumed) reset token for userID — FEAT-052's
+// change-password flow uses it so a previously-requested reset link cannot override the new
+// password, and account deletion uses it as an explicit cleanup step.
+func (r *ResetTokenRepository) InvalidateForUser(ctx context.Context, userID string) error {
+	if _, err := r.pool.Exec(ctx,
+		`DELETE FROM password_reset_tokens WHERE user_id = $1`,
+		userID,
+	); err != nil {
+		return fmt.Errorf("invalidating password reset tokens: %w", err)
+	}
+	return nil
+}

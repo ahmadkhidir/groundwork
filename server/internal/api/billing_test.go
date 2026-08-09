@@ -161,6 +161,12 @@ type fakeStripeClient struct {
 	portalResult    billing.PortalSessionResult
 	portalErr       error
 	portalCustomers []string
+	// FEAT-052 account deletion: records the subscription/customer the cascade cancelled/deleted,
+	// and the error to return (nil by default).
+	cancelSubscriptions []string
+	cancelErr           error
+	deletedCustomers    []string
+	deleteErr           error
 }
 
 func (f *fakeStripeClient) CreateCheckoutSession(ctx context.Context, p billing.CheckoutParams) (billing.CheckoutResult, error) {
@@ -199,6 +205,38 @@ func (f *fakeStripeClient) lastPortalCustomer() (string, bool) {
 		return "", false
 	}
 	return f.portalCustomers[len(f.portalCustomers)-1], true
+}
+
+func (f *fakeStripeClient) CancelSubscription(ctx context.Context, subscriptionID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cancelSubscriptions = append(f.cancelSubscriptions, subscriptionID)
+	return f.cancelErr
+}
+
+func (f *fakeStripeClient) DeleteCustomer(ctx context.Context, customerID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deletedCustomers = append(f.deletedCustomers, customerID)
+	return f.deleteErr
+}
+
+func (f *fakeStripeClient) lastCancelledSubscription() (string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.cancelSubscriptions) == 0 {
+		return "", false
+	}
+	return f.cancelSubscriptions[len(f.cancelSubscriptions)-1], true
+}
+
+func (f *fakeStripeClient) lastDeletedCustomer() (string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.deletedCustomers) == 0 {
+		return "", false
+	}
+	return f.deletedCustomers[len(f.deletedCustomers)-1], true
 }
 
 func (f *fakeStripeClient) lastCheckoutParams() billing.CheckoutParams {

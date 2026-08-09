@@ -32,6 +32,10 @@ type ResetTokenStore interface {
 	// success — invalidates the user's other outstanding tokens (screens/19 step 5). Returns the
 	// user ID the token was issued to, or ErrResetTokenNotFound.
 	Consume(ctx context.Context, tokenHash string) (string, error)
+	// InvalidateForUser destroys every outstanding reset token for userID. Used by FEAT-052's
+	// change-password flow so a previously-requested reset link cannot override the new password,
+	// and by account deletion (the tokens die with the account anyway, but explicitly first).
+	InvalidateForUser(ctx context.Context, userID string) error
 }
 
 // MemoryResetTokenStore is the in-memory ResetTokenStore used by Service tests (and by
@@ -83,6 +87,18 @@ func (s *MemoryResetTokenStore) Consume(_ context.Context, tokenHash string) (st
 		}
 	}
 	return entry.userID, nil
+}
+
+// InvalidateForUser destroys every outstanding token for userID.
+func (s *MemoryResetTokenStore) InvalidateForUser(_ context.Context, userID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for hash, entry := range s.entries {
+		if entry.userID == userID {
+			delete(s.entries, hash)
+		}
+	}
+	return nil
 }
 
 // randomToken returns a cryptographically random, URL-safe token.

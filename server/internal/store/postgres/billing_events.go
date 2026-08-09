@@ -41,3 +41,16 @@ func (r *BillingEventRepository) RecordIfNew(ctx context.Context, eventID, event
 	}
 	return tag.RowsAffected() == 1, nil
 }
+
+// DeleteByUser removes every billing event belonging to userID — FEAT-052's account deletion cleanup
+// step 6 (after the Stripe-side cancel + customer delete, the account's billing_events rows are
+// destroyed).
+func (r *BillingEventRepository) DeleteByUser(ctx context.Context, userID string) error {
+	if _, err := r.pool.Exec(ctx,
+		`DELETE FROM billing_events WHERE user_id = $1`,
+		userID,
+	); err != nil {
+		return fmt.Errorf("deleting billing events for user: %w", err)
+	}
+	return nil
+}

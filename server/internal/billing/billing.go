@@ -221,6 +221,33 @@ func (c *Client) CreatePortalSession(ctx context.Context, customerID string) (Po
 	return PortalSessionResult{URL: session.URL}, nil
 }
 
+// CancelSubscription cancels a subscription IMMEDIATELY — FEAT-052's account deletion cancels at
+// once, deliberately different from plan cancellation's end-of-period semantics (monetization.md).
+// The customer keeps paid access until Stripe processes the cancellation; a cancellation_failed
+// failure aborts the account cascade so an account that "deleted" but kept paying Stripe is never
+// a false success.
+func (c *Client) CancelSubscription(ctx context.Context, subscriptionID string) error {
+	params := &stripe.SubscriptionCancelParams{}
+	params.Context = ctx
+	if _, err := c.stripe.V1Subscriptions.Cancel(ctx, subscriptionID, params); err != nil {
+		return fmt.Errorf("billing: cancelling subscription: %w", err)
+	}
+	return nil
+}
+
+// DeleteCustomer deletes a Stripe Customer object — FEAT-052's account deletion removes the
+// customer (and with it Stripe-side payment methods and customer PII) after cancelling any active
+// subscription. Historical invoices/charges Stripe retains per its own policy; that is outside
+// Groundwork's control and documented as such.
+func (c *Client) DeleteCustomer(ctx context.Context, customerID string) error {
+	params := &stripe.CustomerDeleteParams{}
+	params.Context = ctx
+	if _, err := c.stripe.V1Customers.Delete(ctx, customerID, params); err != nil {
+		return fmt.Errorf("billing: deleting stripe customer: %w", err)
+	}
+	return nil
+}
+
 // buildCheckoutSessionParams is the pure constructor for the Stripe request — extracted so the
 // request shape (price, client_reference_id, metadata, URLs, mode) is pinned by tests without a
 // network call.

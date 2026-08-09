@@ -211,3 +211,57 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dest any) bool {
 	}
 	return true
 }
+
+// RegisterAuthenticatedAuthRoutes wires the AUTHENTICATED auth endpoints onto r. FEAT-052's
+// password change needs a session (the caller is already authenticated as the account), unlike the
+// public signup/login/reset routes RegisterAuthRoutes mounts. Called from api.go inside the
+// authsession.RequireAuth group.
+func RegisterAuthenticatedAuthRoutes(r chi.Router, service *auth.Service, logger *slog.Logger) {
+	r.Post("/auth/password-change", handlePasswordChange(service, logger))
+}
+
+// passwordChangeRequest is the shape POSTed to /v1/auth/password-change.
+type passwordChangeRequest struct {
+	CurrentPassword string `json:"current_password"`
+	NewPassword     string `json:"new_password"`
+}
+
+// handlePasswordChange serves POST /v1/auth/password-change — FEAT-052's authenticated change
+// password. The caller is already authenticated (mounted under RequireAuth), so the current password
+// is verified against the stored hash and a wrong value returns 400 invalid_current_password —
+// deliberately NOT 401, which the web client's isUnauthenticated handling would misread as session
+// expiry and route to the login gate.
+func handlePasswordChange(service *auth.Service, logger *slog.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		claims, ok := requireClaims(w, r)
+		if !ok {
+			return
+		}
+		var req passwordChangeRequest
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+
+		err := service.ChangePassword(r.Context(), claims.UserID, req.CurrentPassword, req.NewPassword)
+		switch {
+		case errors.Is(err, auth.ErrWrongCurrentPassword):
+			respondJSON(w, http.StatusBadRequest, map[string]string{
+				"error": "Your current password is incorrect.",
+				"code":  "invalid_current_password",
+			})
+		case errors.Is(err, auth.ErrPasswordRequired):
+			respondJSON(w, http.StatusBadRequest, map[string]string{
+				"error": err.Error(),
+				"code":  "validation_error",
+			})
+		case err != nil:
+			logger.Error("password change failed", slog.String("error", err.Error()))
+			respondJSON(w, http.StatusInternalServerError, map[string]string{
+				"error": "Something went wrong. Try again.",
+				"code":  "internal_error",
+			})
+		default:
+			respondJSON(w, http.StatusOK, map[string]any{"updated": true})
+		}
+	}
+}

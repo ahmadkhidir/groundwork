@@ -90,6 +90,8 @@ export const routes = {
    * The plan screen reads the `upgrade=success|cancelled` query param Stripe's redirect carries.
    */
   accountSettings: () => "/settings",
+  /** FEAT-052: Profile & Security — account self-management (change password, sign out, delete account). */
+  settingsProfile: () => "/settings/profile",
 } as const;
 
 /**
