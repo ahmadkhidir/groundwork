@@ -20,8 +20,8 @@ primary_region = "iad"
   ENVIRONMENT = "production"
   PORT = "8080"
   # The web origin (CORS + password-reset links). Never "*" — credentials ride on every request.
-  ALLOWED_ORIGIN = "https://groundwork-azure-beta.vercel.app"
-  WEB_BASE_URL = "https://groundwork-azure-beta.vercel.app"
+  ALLOWED_ORIGIN = "https://groundwork.ahmadkhidir.com"
+  WEB_BASE_URL = "https://groundwork.ahmadkhidir.com"
   # Optional thresholds; defaults are fine unless overridden (see server/.env.example).
   # MAX_UPLOAD_BYTES = "524288000"
   # ENGINE_IDLE_TIMEOUT = "10m"
