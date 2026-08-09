@@ -21,30 +21,57 @@ vi.mock("next/navigation", () => ({
   useRouter: () => routerMock,
 }));
 
-// FEAT-023: the viewer subscribes to an SSE stream (EventSource). jsdom has no EventSource, so a
-// minimal mock stands in — it records instances and lets tests push a message at one.
-class MockEventSource {
-  static instances: MockEventSource[] = [];
+// FEAT-023: the viewer subscribes to an SSE stream via fetch streaming (api-client.ts's
+// subscribeToStream — EventSource cannot send the Authorization bearer header, which is the
+// production transport to the Go API). jsdom has no streaming fetch, so globalThis.fetch is
+// mocked: the /api/session-token BFF route returns the bearer JWE, and the stream URL returns a
+// controllable Response whose ReadableStream tests push SSE frames into.
+class MockStreamSource {
+  static instances: MockStreamSource[] = [];
   readonly url: string;
-  onopen: ((ev: Event) => unknown) | null = null;
-  onmessage: ((ev: MessageEvent) => unknown) | null = null;
-  onerror: ((ev: Event) => unknown) | null = null;
-  close = vi.fn();
+  controller: ReadableStreamDefaultController<Uint8Array> | null = null;
 
   constructor(url: string) {
     this.url = url;
-    MockEventSource.instances.push(this);
+    MockStreamSource.instances.push(this);
+  }
+
+  response(): Response {
+    return new Response(
+      new ReadableStream<Uint8Array>({
+        start: (controller) => {
+          this.controller = controller;
+        },
+      }),
+      { status: 200, headers: { "Content-Type": "text/event-stream" } },
+    );
+  }
+
+  push(data: string): void {
+    this.controller?.enqueue(new TextEncoder().encode(data));
+  }
+
+  close(): void {
+    this.controller?.close();
   }
 }
-vi.stubGlobal("EventSource", MockEventSource);
 
-function stream(index = 0): MockEventSource {
-  return MockEventSource.instances[index];
+const fetchMock = vi.fn();
+
+function stream(index = 0): MockStreamSource {
+  return MockStreamSource.instances[index];
 }
 
-function emit(index: number, data: string): void {
-  const source = MockEventSource.instances[index];
-  source.onmessage?.({ data } as unknown as MessageEvent);
+/** Waits until the viewer has opened its stream connection, then returns the latest source. */
+async function waitForStream(): Promise<MockStreamSource> {
+  await vi.waitFor(() => expect(MockStreamSource.instances.length).toBeGreaterThan(0));
+  return stream(MockStreamSource.instances.length - 1);
+}
+
+/** Delivers one SSE frame (a `data:` line + blank line) to connection `index`. */
+async function emit(index: number, data: string): Promise<void> {
+  await vi.waitFor(() => expect(MockStreamSource.instances.length).toBeGreaterThan(index));
+  stream(index).push(`data: ${data}\n\n`);
 }
 
 const getMock = vi.mocked(api.get);
@@ -95,7 +122,18 @@ describe("RunViewerScreen", () => {
     getMock.mockReset();
     postMock.mockReset();
     pushMock.mockReset();
-    MockEventSource.instances.length = 0;
+    MockStreamSource.instances.length = 0;
+    fetchMock.mockReset();
+    fetchMock.mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/api/session-token")) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ token: "test-jwe" }), { status: 200 }),
+        );
+      }
+      return Promise.resolve(new MockStreamSource(url).response());
+    });
+    vi.stubGlobal("fetch", fetchMock);
   });
 
   afterEach(() => {
@@ -232,11 +270,11 @@ describe("RunViewerScreen", () => {
     await screen.findByText("How many customers per region?");
 
     // The viewer opens an SSE stream for the run.
-    const source = stream(0);
+    const source = await waitForStream();
     expect(source.url).toContain("/v1/workspaces/ws-1/runs/run-1/stream");
 
     // generate_sql completes over the stream with its output.
-    emit(
+    await emit(
       0,
       JSON.stringify({
         type: "step.completed",
@@ -249,10 +287,10 @@ describe("RunViewerScreen", () => {
 
     // The server replays the current run.status as the first message of a connection (snapshot);
     // it matches the state the viewer joined (still running), so it must not arm auto-navigation.
-    emit(0, JSON.stringify({ type: "run.status", status: "running", run_id: "run-1" }));
+    await emit(0, JSON.stringify({ type: "run.status", status: "running", run_id: "run-1" }));
 
     // A step absent from the initial snapshot is added live.
-    emit(
+    await emit(
       0,
       JSON.stringify({ type: "step.started", step_name: "execute", step_status: "running" }),
     );
@@ -260,7 +298,7 @@ describe("RunViewerScreen", () => {
     expect(screen.getByText("Execute")).toBeInTheDocument();
 
     // run.status complete ends the live run; without a report_id the viewer stays put (no navigation).
-    emit(0, JSON.stringify({ type: "run.status", status: "complete" }));
+    await emit(0, JSON.stringify({ type: "run.status", status: "complete" }));
     await waitFor(() => expect(pushMock).not.toHaveBeenCalled());
   });
 
@@ -269,7 +307,7 @@ describe("RunViewerScreen", () => {
     render(<RunViewerScreen workspaceId="ws-1" runId="run-1" />);
     await screen.findByText("How many customers per region?");
 
-    emit(0, JSON.stringify({ type: "cache.hit", cached_run_id: "run-9" }));
+    await emit(0, JSON.stringify({ type: "cache.hit", cached_run_id: "run-9" }));
 
     expect(
       await screen.findByText(/answered instantly from a prior identical run/i),
@@ -290,9 +328,9 @@ describe("RunViewerScreen", () => {
     await screen.findByText("How many customers per region?");
 
     // The connection's first run.status is the replayed snapshot (still running) — not a transition.
-    emit(0, JSON.stringify({ type: "run.status", status: "running", run_id: "run-1" }));
+    await emit(0, JSON.stringify({ type: "run.status", status: "running", run_id: "run-1" }));
     // The real completion transition follows after the viewer has joined.
-    emit(0, JSON.stringify({ type: "run.status", status: "complete" }));
+    await emit(0, JSON.stringify({ type: "run.status", status: "complete" }));
 
     await waitFor(() =>
       expect(pushMock).toHaveBeenCalledWith("/workspaces/ws-1/reports/report-1"),
@@ -312,7 +350,7 @@ describe("RunViewerScreen", () => {
     render(<RunViewerScreen workspaceId="ws-1" runId="run-1" />);
 
     await screen.findByText("How many customers per region?");
-    emit(0, JSON.stringify({ type: "run.status", status: "complete", run_id: "run-1" }));
+    await emit(0, JSON.stringify({ type: "run.status", status: "complete", run_id: "run-1" }));
 
     expect(pushMock).not.toHaveBeenCalled();
     // The report is still reachable through the explicit link.

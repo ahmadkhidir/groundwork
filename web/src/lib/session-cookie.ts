@@ -1,24 +1,27 @@
 /**
- * Production session-cookie configuration for the Groundwork web tier.
+ * Session-cookie configuration for the Groundwork web tier.
  *
- * The browser calls the Go API service DIRECTLY with the Auth.js session cookie (architecture.md's
- * boundary — the Go side decodes it via internal/authsession, never a proxy), so in production the
- * cookie must travel to a SIBLING subdomain: the web at app.groundwork.app, the API at
- * api.groundwork.app. Auth.js sets host-only cookies by default; a cross-subdomain cookie requires
- * an explicit `Domain` attribute AND the plain cookie name — the `__Secure-` prefix the HTTPS
- * defaults use forbids a Domain attribute, so a prefixed domain cookie is rejected by browsers.
+ * The name is pinned to the PLAIN `authjs.session-token` in every environment. Two reasons:
  *
- * Returns undefined (defaults preserved — host-only, secure-prefixed on HTTPS) when no
- * COOKIE_DOMAIN is configured, i.e. local dev, where ports share a host and the cookie works
- * as-is. When COOKIE_DOMAIN is set (the shared parent domain, leading dot included, e.g.
- * ".groundwork.app"), the session token is set under the plain name with that Domain. The Go
- * decoder already checks both names (server/internal/authsession/session.go), so no server change
- * is needed. Auth.js's init deep-merges this over its defaults, preserving httpOnly/sameSite/
- * path/secure.
+ * 1. Cross-origin bearer transport (Vercel web + Fly API): the browser cannot send a cross-origin
+ *    cookie to the API, so the web tier's BFF route (app/api/session-token) hands the browser the
+ *    raw Auth.js JWE and it arrives at the Go API as `Authorization: Bearer`. The JWE's HKDF salt
+ *    is the cookie name it was encoded under, so pinning the name keeps the salt stable across
+ *    environments — the Go decoder always uses "authjs.session-token" for a bearer token.
+ * 2. The `__Secure-` prefix the HTTPS defaults use would forbid a `Domain` attribute (browsers
+ *    reject prefixed domain cookies) if a custom shared-domain setup is later added.
+ *
+ * The cookie keeps `Secure` + `HttpOnly` + `SameSite=Lax` from the defaults (Auth.js deep-merges
+ * this over them). `domain` is set only when COOKIE_DOMAIN is configured — the shared parent
+ * domain (leading dot included) for the sibling-subdomain layout (app.groundwork.app web +
+ * api.groundwork.app API); local dev / vercel.app setups leave it host-only.
  */
-export function sessionTokenCookieConfig(domain: string | undefined):
-  | { name: string; options: { domain: string } }
-  | undefined {
-  if (!domain) return undefined;
-  return { name: "authjs.session-token", options: { domain } };
+export function sessionTokenCookieConfig(domain: string | undefined): {
+  name: string;
+  options: { domain?: string };
+} {
+  return {
+    name: "authjs.session-token",
+    options: domain ? { domain } : {},
+  };
 }

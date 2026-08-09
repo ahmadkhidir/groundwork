@@ -103,20 +103,20 @@ async function refreshTierClaim(token: JWT): Promise<JWT> {
 }
 
 /**
- * Production session-cookie configuration — see lib/session-cookie.ts. In production (COOKIE_DOMAIN
- * set) the session token is set under the plain name with a Domain so the browser sends it to the
- * Go API on a sibling subdomain; locally the defaults (host-only) are preserved.
+ * Session-cookie config — see lib/session-cookie.ts. The cookie name is pinned to the plain
+ * `authjs.session-token` in every environment (a stable decode salt for the Go API's bearer
+ * transport); COOKIE_DOMAIN adds a shared parent domain for a sibling-subdomain layout when set.
  */
 const sessionCookieConfig = sessionTokenCookieConfig(process.env.COOKIE_DOMAIN);
 
 export const { handlers, auth, signIn, signOut } = NextAuth({
   session: { strategy: "jwt" },
 
-  // Auth.js v5 requires trusting the host behind a reverse proxy (Fly terminates TLS and forwards
-  // plain HTTP to the app). AUTH_URL is the canonical public origin.
+  // Auth.js v5 requires trusting the host behind a reverse proxy (Vercel terminates TLS and
+  // forwards plain HTTP to the function). AUTH_URL is the canonical public origin.
   trustHost: true,
 
-  cookies: sessionCookieConfig ? { sessionToken: sessionCookieConfig } : undefined,
+  cookies: { sessionToken: sessionCookieConfig },
 
   pages: {
     signIn: routes.login(),

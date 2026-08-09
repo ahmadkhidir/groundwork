@@ -25,6 +25,11 @@ const devSecret = "dev-only-local-secret-not-for-production"
 // package's decode ever drifts from Auth.js's actual algorithm, this is the test that catches it.
 const fixtureToken = "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2Q0JDLUhTNTEyIiwia2lkIjoiOXRJNnJDN09BbzJPXy1yRjlaaGlRVk91bUhhU1NqaV81RGg3WHVZcDBKWTlvelR1QjhySExicDdWZnhrYlFVSExZOWtRZGRCbGpWbXJMR2tNQ2Z6UlEifQ..Akd93uDHh_gCT1B1QcOFVA.kJx32sO56BRCB6o50XcZIA1DLcCi5RDV-7aZ941V63U_WnKBNR2yVm4vPiJBx8divCNF3p5Qh5NDKr1K8VqXov4SEz_7j-vsykpqsmPivmHkXTUZiDAF3d6v1yzn63FEx-13o7zt6SsxckmRF5cI3e7JHQ0lIwUaq9jyyc60OmUQpwbw8oFyORERq3tljVOC5cgDAMZK9G5oFZmYi-peeg.H8cdd1EFfbxRpzTmkmYOTqdtwhKKXhFM3qzFBtCXwvE"
 
+// expiredFixtureToken carries the same claims shape with an `exp` in the past (generated with the
+// same @auth/core `encode` call and maxAge: -60). It decrypts fine — the test pins that expiry is
+// validated, not just the JWE's authenticity.
+const expiredFixtureToken = "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2Q0JDLUhTNTEyIiwia2lkIjoiOXRJNnJDN09BbzJPXy1yRjlaaGlRVk91bUhhU1NqaV81RGg3WHVZcDBKWTlvelR1QjhySExicDdWZnhrYlFVSExZOWtRZGRCbGpWbXJMR2tNQ2Z6UlEifQ..qhdHz0YlxvgtDTLHwgI9vQ.jW_90bxQrN1UKBNLgUU66lgq8nMsgRHyy0JGT598fkEkTSj1tS9IWXyMwDyIG9XY7myAK42y-XgS2mfdBb-S3AFx-JM5xQP2-mtbLJkIsNOju0VIw0X9m-JtikNqOOjYhxlqNrepJgv_K4EqzWA9DKH94rYYPf32QLwO1l1JWh7bgeQnSiubIQf9_zdkloqKCl3gxzIUtP0rDvz1In6LXw.xZP8gCBYXhqlU7zyenXQxzs1qL98o8_Q19IW2DZbvhA"
+
 func TestFromRequest_DecodesRealAuthJSToken(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/v1/workspaces", nil)
 	req.AddCookie(&http.Cookie{Name: CookieName, Value: fixtureToken})
@@ -62,6 +67,54 @@ func TestFromRequest_NoCookie(t *testing.T) {
 	_, err := FromRequest(req, devSecret)
 	if err != ErrNoSession {
 		t.Errorf("err = %v, want ErrNoSession", err)
+	}
+}
+
+func TestFromRequest_BearerToken(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/v1/workspaces", nil)
+	req.Header.Set("Authorization", "Bearer "+fixtureToken)
+
+	claims, err := FromRequest(req, devSecret)
+	if err != nil {
+		t.Fatalf("FromRequest returned error for a Bearer token: %v", err)
+	}
+	if claims.UserID != "user-123" || claims.Tier != "pro" || claims.Email != "a@b.com" {
+		t.Errorf("claims = %+v, want the fixture's claims", claims)
+	}
+}
+
+func TestFromRequest_BearerTokenSchemeIsCaseInsensitiveAndWhitespaceTolerant(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/v1/workspaces", nil)
+	req.Header.Set("Authorization", "bearer   "+fixtureToken+"  ")
+
+	claims, err := FromRequest(req, devSecret)
+	if err != nil {
+		t.Fatalf("FromRequest returned error: %v", err)
+	}
+	if claims.UserID != "user-123" {
+		t.Errorf("UserID = %q, want user-123", claims.UserID)
+	}
+}
+
+func TestFromRequest_ExpiredTokenRejected(t *testing.T) {
+	// The expired token decrypts with the right secret — the rejection must come from the exp
+	// check, not from a wrong-key failure.
+	req := httptest.NewRequest(http.MethodGet, "/v1/workspaces", nil)
+	req.Header.Set("Authorization", "Bearer "+expiredFixtureToken)
+
+	_, err := FromRequest(req, devSecret)
+	if err != ErrInvalidSession {
+		t.Errorf("err = %v, want ErrInvalidSession for an expired token", err)
+	}
+}
+
+func TestFromRequest_InvalidBearerRejected(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/v1/workspaces", nil)
+	req.Header.Set("Authorization", "Bearer not.a.valid.jwe")
+
+	_, err := FromRequest(req, devSecret)
+	if err != ErrInvalidSession {
+		t.Errorf("err = %v, want ErrInvalidSession for a malformed Bearer token", err)
 	}
 }
 

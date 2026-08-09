@@ -8,17 +8,18 @@
 // on every request ("enforced on every request by the Go API Service"). web/src/proxy.ts states this
 // explicitly: its own check is "optimistic only... not the authorization boundary."
 //
-// web/src/lib/api-client.ts (read-only to every feature slice) already calls the Go API directly
-// from the browser with `credentials: "include"` — no bearer token, no custom header, nothing this
-// package's caller can add, because api-client.ts, auth.ts, and everything under web/src/lib are
-// read-only infrastructure this wave does not own. The only thing the browser sends unprompted is
-// its cookies, and Auth.js's own session cookie (`authjs.session-token`) is a host-only cookie: it
-// is NOT port-scoped, so in local development (both tiers on `localhost`, different ports) it is
-// already delivered to the Go API's origin without any code change. In production this requires the
-// two tiers to share a cookie-eligible parent domain — recorded as a stated assumption in this
-// wave's report, not invented silently.
+// web/src/lib/api-client.ts calls the Go API directly from the browser. The credential that
+// travels is the Auth.js session token, by one of two transports:
 //
-// Given that, the only remaining piece is being able to READ that cookie. Auth.js v5 encrypts it by
+//   - Bearer header (production, Vercel web + Fly API): the two tiers have no shared parent domain
+//     for a cross-origin cookie, so the web tier's BFF route (web/src/app/api/session-token) hands
+//     the browser the raw Auth.js JWE and the browser sends it as `Authorization: Bearer`. The web
+//     tier pins the session cookie to the plain name (web/src/lib/session-cookie.ts), so the JWE's
+//     HKDF salt is always "authjs.session-token" regardless of transport.
+//   - Cookie (local development): both tiers on `localhost` (different ports) share a host, so the
+//     host-only Auth.js cookie is delivered to the API's origin unprompted.
+//
+// Given that, the only remaining piece is being able to READ the token. Auth.js v5 encrypts it by
 // default as a JWE (RFC 7518 "A256CBC-HS512", "dir" key management) derived from AUTH_SECRET via
 // HKDF-SHA256, exactly as implemented in web/node_modules/@auth/core/jwt.js's `encode`/`decode` and
 // `getDerivedEncryptionKey`. This package is a byte-for-byte Go port of that decode path — verified
@@ -46,6 +47,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"golang.org/x/crypto/hkdf"
 )
@@ -78,11 +80,18 @@ type Claims struct {
 	Email  string `json:"email"`
 }
 
-// FromRequest extracts and decodes the Auth.js session cookie from r, verifying it against secret.
+// FromRequest extracts and decodes the Auth.js session token from r, verifying it against secret.
 //
-// secret is the shared AUTH_SECRET value — the same one web/.env.local's AUTH_SECRET holds. Returns
-// ErrNoSession if neither cookie is present, ErrInvalidSession for any decode/verification failure.
+// The token is accepted from `Authorization: Bearer` (production — the web tier's BFF route hands
+// the browser the raw JWE, since a cross-origin cookie cannot travel from Vercel to the API's
+// domain) or from the session cookie (local development, where both tiers share `localhost`).
+// The bearer token's salt is always the plain cookie name, which the web tier pins. Returns
+// ErrNoSession if no token is present, ErrInvalidSession for any decode/verification failure.
 func FromRequest(r *http.Request, secret string) (Claims, error) {
+	if token := bearerToken(r); token != "" {
+		return decodeAndVerify(token, secret, CookieName)
+	}
+
 	cookieName := CookieName
 	c, err := r.Cookie(cookieName)
 	if err != nil {
@@ -92,20 +101,48 @@ func FromRequest(r *http.Request, secret string) (Claims, error) {
 			return Claims{}, ErrNoSession
 		}
 	}
+	return decodeAndVerify(c.Value, secret, cookieName)
+}
 
-	payload, err := decode(c.Value, secret, cookieName)
+// bearerToken returns the `Authorization: Bearer <token>` value, or "" when absent or not a Bearer
+// header. The scheme comparison is case-insensitive per RFC 7235.
+func bearerToken(r *http.Request) string {
+	const prefix = "Bearer "
+	header := r.Header.Get("Authorization")
+	if len(header) <= len(prefix) || !strings.EqualFold(header[:len(prefix)], prefix) {
+		return ""
+	}
+	return strings.TrimSpace(header[len(prefix):])
+}
+
+// decodeAndVerify decrypts an Auth.js JWE and validates its claims. The JWE decrypts with the
+// shared AUTH_SECRET and the salt the token was encoded with (the cookie name); the payload must
+// carry a non-empty user id and an unexpired `exp` claim. Expiry is load-bearing here: the token is
+// browser-visible in the bearer transport, so an expired JWE — which still decrypts fine — must be
+// rejected rather than trusted.
+func decodeAndVerify(token, secret, salt string) (Claims, error) {
+	payload, err := decode(token, secret, salt)
 	if err != nil {
 		return Claims{}, ErrInvalidSession
 	}
 
-	var claims Claims
-	if err := json.Unmarshal(payload, &claims); err != nil {
+	var p struct {
+		UserID string `json:"id"`
+		Tier   string `json:"tier"`
+		Email  string `json:"email"`
+		Exp    int64  `json:"exp"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
 		return Claims{}, ErrInvalidSession
 	}
-	if claims.UserID == "" {
+	if p.UserID == "" {
 		return Claims{}, ErrInvalidSession
 	}
-	return claims, nil
+	// Auth.js always sets exp (from maxAge); a token without one is not a token it issued.
+	if p.Exp == 0 || p.Exp < time.Now().Unix() {
+		return Claims{}, ErrInvalidSession
+	}
+	return Claims{UserID: p.UserID, Tier: p.Tier, Email: p.Email}, nil
 }
 
 // decode reverses @auth/core/jwt's `encode`: a compact JWE using "dir" key management and
@@ -260,7 +297,12 @@ func Encode(claims Claims, secret string) (string, error) {
 	header := []byte(`{"alg":"dir","enc":"A256CBC-HS512"}`)
 	headerB64 := base64.RawURLEncoding.EncodeToString(header)
 
-	payload, err := json.Marshal(claims)
+	// Auth.js always stamps `exp` from maxAge (30 days by default); the decode path requires it, so
+	// tokens minted here must too.
+	payload, err := json.Marshal(struct {
+		Claims
+		Exp int64 `json:"exp"`
+	}{Claims: claims, Exp: time.Now().Add(30 * 24 * time.Hour).Unix()})
 	if err != nil {
 		return "", err
 	}

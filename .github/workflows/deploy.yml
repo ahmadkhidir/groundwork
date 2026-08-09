@@ -55,8 +55,10 @@ jobs:
         # --remote-only builds on Fly's builder, so the runner needs no Docker daemon.
         run: flyctl deploy --remote-only
 
-      - name: Deploy Web
+      - name: Deploy Web (Vercel)
         working-directory: web
+        run: npx --yes vercel@latest --prod --token "${{ secrets.VERCEL_TOKEN }}" --yes
         env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-        run: flyctl deploy --remote-only
+          # Vercel reads these to pick the project (the CLI otherwise prompts interactively).
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
