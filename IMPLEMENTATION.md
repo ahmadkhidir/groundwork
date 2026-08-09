@@ -1163,7 +1163,7 @@ skip, already-deleted user) + `gofmt -l` clean; web `tsc --noEmit` + `eslint` + 
 359/359 (7 ProfileScreen tests, 2 banner tests) + `next build` green. Docs pointer bumped to
 `ef63606` in the feature commit (pushed to the docs remote first).
 
-### Navigation Shell — the `(app)` route group + Navbar (`AppShell`/`AccountMenu`), shipped 2026-08-09
+### Navigation Shell — `(app)` route group + full Navbar/Sidebar/Drawer, shipped 2026-08-09
 
 The Navigation Shell (screens.md's shared component) now has a home in the codebase. This is a
 cross-screen shared addition — the same category of change the WorkspaceHomeScreen note called out
@@ -1178,26 +1178,41 @@ foundation-level delivery rather than a roadmap-phase feature slice.
   screens are deliberately chrome-free (screens/02).
 - **`AppShell`** (`web/src/components/layout/AppShell.tsx`, client) — the sticky Navbar per
   screens.md: brand lockup (logo + wordmark → `/workspaces`), the `NotificationsBell` (lifted out of
-  `WorkspaceHomeScreen`, which no longer renders its own), and the `AccountMenu`. Styled entirely
-  through theme tokens (`bg-surface/90`, `border-border`, `text-text-primary`, `touch-target`,
-  `h-(--size-button-height)`); verified in light AND dark via Playwright (body bg white → `#15171a`
-  through the `.dark` variant, no second token system).
+  `WorkspaceHomeScreen`, which no longer renders its own), the `WorkspaceSwitcher` (desktop), and
+  the `AccountMenu`. Within a workspace route the collapsible `WorkspaceSidebar` renders beside the
+  content (desktop); on mobile a hamburger opens a Drawer carrying the switcher and the workspace
+  links. Styled entirely through theme tokens (`bg-surface/90`, `border-border`,
+  `text-text-primary`, `touch-target`, `h-(--size-button-height)`); verified in light AND dark via
+  Playwright (body bg white → `#15171a` through the `.dark` variant, no second token system).
 - **`AccountMenu`** (`web/src/components/layout/AccountMenu.tsx`) — the account-level entry point on
   every authenticated screen: "Plan & Billing" (`/settings`) and "Profile & Security"
   (`/settings/profile`). Per screens.md and FEAT-052, **sign out is deliberately NOT a menu item** —
   it lives only on Profile & Security. Avatar initials from display name (email fallback), outside-
   click + Escape close, `role="menu"`/`menuitem`, `aria-haspopup`/`aria-expanded`.
-- **Remaining unbuilt shell pieces (documented in `AppShell`'s doc comment, not invented):** the
-  collapsible workspace `Sidebar` (Home / Semantic Layer / Settings) and the workspace switcher, and
-  the mobile hamburger `Drawer`. Until they land, workspace screens keep their local contextual nav
-  (e.g. WorkspaceHomeScreen's workspace-scoped links) — the comment there now says so explicitly.
-- **Verification:** `tsc --noEmit` + `eslint` clean; `vitest run` **369/369** (49 files; 6 new
-  AccountMenu tests, 3 new AppShell tests, WorkspaceHomeScreen test cleaned of the moved bell's dead
-  mock branches); `next build` green (all routes at their unchanged URLs). Live Playwright check on
-  `/workspaces/:id` with a minted session cookie: sticky header top 0 / z-40, main below it at the
-  `max-w-5xl` column, bell + account menu visible on mobile (390px) and desktop, account menu opens
-  both items, zero console/page errors. (Diagnostic note: `node -` reads the script from stdin, so
-  the real argument is `process.argv[2]` — `argv[1]` is the `-`.)
+- **`WorkspaceSwitcher`** (`web/src/components/layout/WorkspaceSwitcher.tsx`) — the Navbar's
+  switcher: shows the current workspace's name (from the pathname-derived id) and opens a menu of
+  every reachable workspace plus "All workspaces". Loaded/empty/error states are all honest — a
+  failed or empty list never fabricates a name (falls back to "Select workspace" with the Workspace
+  List as the open item).
+- **`WorkspaceSidebar`** (`web/src/components/layout/WorkspaceSidebar.tsx`) — the collapsible
+  workspace Sidebar per screens.md: Home / Semantic Layer / Settings, active item derived from the
+  pathname with `aria-current="page"`, collapse toggle to an icon rail. `hidden lg:flex` — on
+  mobile the same items live in the Drawer, not a bottom bar. `WorkspaceHomeScreen`'s ad-hoc local
+  nav was removed in favor of it.
+- **Mobile Drawer** — the hamburger (`lg:hidden`) opens a Drawer (`role="dialog"`, `aria-modal`)
+  holding the workspace switcher, the workspace-level links, and the brand lockup; Escape, outside
+  click, or choosing a link closes it. The bell and account menu stay in the Navbar at icon size on
+  every viewport (an unread badge must not hide behind a tap).
+- **Verification:** `tsc --noEmit` + `eslint` clean; `vitest run` **383/383** (51 files; 6
+  AccountMenu, 3 AppShell, 6 WorkspaceSwitcher, 5 WorkspaceSidebar tests — 14 new; the
+  WorkspaceHomeScreen test was cleaned of the moved bell's dead mock branches and its local-nav
+  assertions were dropped with the nav); `next build` green (all routes at their unchanged URLs).
+  Live Playwright check on `/workspaces/:id` with a minted session cookie: sticky header top 0 /
+  z-40, desktop sidebar (Home/Semantic Layer/Settings) left of a centered `max-w-5xl` column,
+  switcher honest-empty for a session with no workspaces, hamburger hidden on desktop / visible on
+  mobile, drawer opens with the switcher + workspace links and closes on Escape / link choice,
+  zero console/page errors. (Diagnostic note: `node -` reads the script from stdin, so the real
+  argument is `process.argv[2]` — `argv[1]` is the `-`.)
 
 ### Post-suggestions feature — smart questions persist in a per-workspace bucket (user-authorized 2026-08-08)
 

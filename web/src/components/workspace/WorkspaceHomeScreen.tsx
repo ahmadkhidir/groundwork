@@ -129,28 +129,8 @@ export function WorkspaceHomeScreen({ workspaceId, userId, userTier }: Workspace
 
   return (
     <main id="main-content" className="mx-auto w-full max-w-5xl p-8">
-      {/* Minimal workspace-scoped navigation. screens.md's Navigation Shell exists as the Navbar
-          (AppShell: brand lockup, notifications bell, account menu) on every authenticated screen;
-          its collapsible Sidebar (Home / Semantic Layer / Settings) is the remaining unbuilt piece,
-          so these workspace-level links stay local to this screen until the Sidebar lands. */}
-      <nav
-        aria-label="Workspace navigation"
-        className="mb-4 hidden items-center gap-4 text-body-small lg:flex"
-      >
-        <span className="font-medium text-text-primary">Home</span>
-        <Link
-          href={routes.semanticLayer(workspaceId)}
-          className="text-text-secondary hover:text-text-primary"
-        >
-          Semantic Layer
-        </Link>
-        <Link
-          href={routes.settings(workspaceId)}
-          className="text-text-secondary hover:text-text-primary"
-        >
-          Settings
-        </Link>
-      </nav>
+      {/* Workspace-level navigation (Home / Semantic Layer / Settings) lives in the Navigation
+          Shell's Sidebar (desktop) and Drawer (mobile), not here — see AppShell. */}
 
       <div className="mb-6 flex items-center justify-between gap-4">
         {workspace ? (
