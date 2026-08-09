@@ -1524,6 +1524,15 @@ branch = main; Vercel deploys the web on every push (with per-PR previews) while
 handles migration + API. The web is a stateless client talking to the API over HTTP, so its deploy
 does not need to be ordered after the API's.
 
+> **Production status (verified live 2026-08-09):** full chain proven end to end on
+> `groundwork-api.fly.dev` + `groundwork-azure-beta.vercel.app` — sign-in/bearer auth, upload →
+> ingest (R2 + the in-container DuckDB engine + the preinstalled excel/sqlite_scanner extensions),
+> clarify-then-resume runs, report generation + export downloads, and a Stripe test-mode upgrade
+> through the webhook flipping the tier to Pro. Known non-bugs in prod: notifications/smart
+> generation/paid exports are Pro/Team-gated (a Free account 403s them by design); every deploy
+> causes a brief request timeout window while Fly swaps the machine. The API machine runs
+> `shared-cpu-1x` / 1GB (memory is load-bearing for the in-process engine).
+
 **Auth transport — bearer, not cookie (do not "fix" it back).** The browser sends the Auth.js
 session token to the Go API on a DIFFERENT domain (Vercel `<project>.vercel.app` web vs
 `api.<your-domain>` API) with no shared parent domain, so a cookie cannot travel. Instead: the web
