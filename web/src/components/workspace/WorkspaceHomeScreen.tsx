@@ -12,7 +12,6 @@ import { AskPanel } from "./AskPanel";
 import { RecentReportsPanel } from "./RecentReportsPanel";
 import { SemanticLayerSummaryPanel } from "./SemanticLayerSummaryPanel";
 import { DatasetsPanel } from "./DatasetsPanel";
-import { NotificationsBell } from "@/components/notifications/NotificationsBell";
 import { api, ApiError } from "@/lib/api-client";
 import { routes } from "@/lib/routes";
 import type { SubscriptionTier, Workspace } from "@/types/schema";
@@ -130,9 +129,10 @@ export function WorkspaceHomeScreen({ workspaceId, userId, userTier }: Workspace
 
   return (
     <main id="main-content" className="mx-auto w-full max-w-5xl p-8">
-      {/* Minimal workspace-scoped navigation. screens.md's full Navigation Shell (Navbar + collapsible
-          Sidebar) is a foundation-level, cross-screen concern with no home in the codebase yet —
-          reported as a needed shared addition rather than built ad hoc here for just this screen. */}
+      {/* Minimal workspace-scoped navigation. screens.md's Navigation Shell exists as the Navbar
+          (AppShell: brand lockup, notifications bell, account menu) on every authenticated screen;
+          its collapsible Sidebar (Home / Semantic Layer / Settings) is the remaining unbuilt piece,
+          so these workspace-level links stay local to this screen until the Sidebar lands. */}
       <nav
         aria-label="Workspace navigation"
         className="mb-4 hidden items-center gap-4 text-body-small lg:flex"
@@ -150,9 +150,6 @@ export function WorkspaceHomeScreen({ workspaceId, userId, userTier }: Workspace
         >
           Settings
         </Link>
-        {/* FEAT-026: the notifications bell. No full Navigation Shell exists yet (see the note
-            above), so the bell mounts here beside the workspace links until one lands. */}
-        <NotificationsBell />
       </nav>
 
       <div className="mb-6 flex items-center justify-between gap-4">

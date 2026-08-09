@@ -100,11 +100,6 @@ describe("WorkspaceHomeScreen", () => {
       if (path.includes("/reports")) {
         return { reports: [] };
       }
-      // NotificationsBell (FEAT-026) polls the unread count; it must not consume a step of the
-      // workspace status sequence either.
-      if (path.includes("/notifications")) {
-        return { unread_count: 0 };
-      }
       const workspace = workspaceSequence[Math.min(workspaceFetchCount, workspaceSequence.length - 1)];
       workspaceFetchCount += 1;
       return { workspace };
@@ -132,11 +127,6 @@ describe("WorkspaceHomeScreen", () => {
       // the workspace status sequence.
       if (path.includes("/reports")) {
         return { reports: [] };
-      }
-      // NotificationsBell (FEAT-026) polls the unread count; it must not consume a step of the
-      // workspace status sequence either.
-      if (path.includes("/notifications")) {
-        return { unread_count: 0 };
       }
       workspaceFetchCount += 1;
       if (workspaceFetchCount === 1) return { workspace: workspaceWith(EngineStatus.Ready) };
@@ -173,10 +163,6 @@ describe("WorkspaceHomeScreen", () => {
       // RecentReportsPanel (FEAT-034) issues its own /reports fetch; give it its real empty shape.
       if (path.includes("/reports")) {
         return { reports: [] };
-      }
-      // NotificationsBell (FEAT-026) polls the unread count; give it its real shape.
-      if (path.includes("/notifications")) {
-        return { unread_count: 0 };
       }
       return { workspace: workspaceWith(EngineStatus.Ready) };
     });

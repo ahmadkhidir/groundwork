@@ -144,6 +144,12 @@ groundwork/
 | `/workspaces/:id/deleted` | Deletion Proof |
 | `/notifications` | Notifications |
 
+> **Authenticated routes live under `web/src/app/(app)/`** (a URL-invisible route group sharing one
+> `layout.tsx` that renders the Navigation Shell's Navbar). The public routes — `/`,
+> `/signup`, `/login`, `/forgot-password`, `/reset-password`, `/shared/[shareToken]` — stay at the
+> `app/` root, outside the group. URLs in the table above are the public paths; the group changes
+> nothing about them.
+
 ## 3a. Theme & Token Map
 
 **All design tokens live in `web/src/styles/globals.css` inside Tailwind v4's `@theme` block.**
@@ -1156,6 +1162,42 @@ handler tests: happy path, workspace-cascade failure, Stripe failure, already-de
 skip, already-deleted user) + `gofmt -l` clean; web `tsc --noEmit` + `eslint` + `vitest run`
 359/359 (7 ProfileScreen tests, 2 banner tests) + `next build` green. Docs pointer bumped to
 `ef63606` in the feature commit (pushed to the docs remote first).
+
+### Navigation Shell — the `(app)` route group + Navbar (`AppShell`/`AccountMenu`), shipped 2026-08-09
+
+The Navigation Shell (screens.md's shared component) now has a home in the codebase. This is a
+cross-screen shared addition — the same category of change the WorkspaceHomeScreen note called out
+as "reported as a needed shared addition rather than built ad hoc" — so it is documented here as a
+foundation-level delivery rather than a roadmap-phase feature slice.
+
+- **`(app)` route group.** All authenticated routes moved under `web/src/app/(app)/`: `(app)/layout.tsx`
+  (server component) fetches the session and wraps every page in `AppShell`. Route groups are
+  URL-invisible, so public URLs, `proxy.ts` patterns, and `PageProps` types are unchanged; only
+  `next typegen` needed to run. The public `shared/[shareToken]` route and the auth/landing pages
+  stay OUTSIDE the group — the shared report must not show the authenticated shell, and the auth
+  screens are deliberately chrome-free (screens/02).
+- **`AppShell`** (`web/src/components/layout/AppShell.tsx`, client) — the sticky Navbar per
+  screens.md: brand lockup (logo + wordmark → `/workspaces`), the `NotificationsBell` (lifted out of
+  `WorkspaceHomeScreen`, which no longer renders its own), and the `AccountMenu`. Styled entirely
+  through theme tokens (`bg-surface/90`, `border-border`, `text-text-primary`, `touch-target`,
+  `h-(--size-button-height)`); verified in light AND dark via Playwright (body bg white → `#15171a`
+  through the `.dark` variant, no second token system).
+- **`AccountMenu`** (`web/src/components/layout/AccountMenu.tsx`) — the account-level entry point on
+  every authenticated screen: "Plan & Billing" (`/settings`) and "Profile & Security"
+  (`/settings/profile`). Per screens.md and FEAT-052, **sign out is deliberately NOT a menu item** —
+  it lives only on Profile & Security. Avatar initials from display name (email fallback), outside-
+  click + Escape close, `role="menu"`/`menuitem`, `aria-haspopup`/`aria-expanded`.
+- **Remaining unbuilt shell pieces (documented in `AppShell`'s doc comment, not invented):** the
+  collapsible workspace `Sidebar` (Home / Semantic Layer / Settings) and the workspace switcher, and
+  the mobile hamburger `Drawer`. Until they land, workspace screens keep their local contextual nav
+  (e.g. WorkspaceHomeScreen's workspace-scoped links) — the comment there now says so explicitly.
+- **Verification:** `tsc --noEmit` + `eslint` clean; `vitest run` **369/369** (49 files; 6 new
+  AccountMenu tests, 3 new AppShell tests, WorkspaceHomeScreen test cleaned of the moved bell's dead
+  mock branches); `next build` green (all routes at their unchanged URLs). Live Playwright check on
+  `/workspaces/:id` with a minted session cookie: sticky header top 0 / z-40, main below it at the
+  `max-w-5xl` column, bell + account menu visible on mobile (390px) and desktop, account menu opens
+  both items, zero console/page errors. (Diagnostic note: `node -` reads the script from stdin, so
+  the real argument is `process.argv[2]` — `argv[1]` is the `-`.)
 
 ### Post-suggestions feature — smart questions persist in a per-workspace bucket (user-authorized 2026-08-08)
 
