@@ -46,6 +46,16 @@ function getSessionToken(refresh = false): Promise<string | null> {
 }
 
 /**
+ * Returns the Auth.js session JWE for transports that cannot use the fetch-based `api` helper —
+ * currently the XHR file upload (web/src/components/upload/uploadFile.ts), which needs per-file
+ * progress events fetch does not provide. The upload attaches it as `Authorization: Bearer`, the
+ * same credential the fetch path sends on every request.
+ */
+export function getSessionTokenForTransport(): Promise<string | null> {
+  return getSessionToken();
+}
+
+/**
  * A structured error from the API.
  *
  * Carries the HTTP status so callers can branch on it — 401 to the login gate, 403 to a paywall or

@@ -1,4 +1,4 @@
-import { apiUrl } from "@/lib/api-client";
+import { apiUrl, getSessionTokenForTransport } from "@/lib/api-client";
 import type { Dataset } from "@/types/schema";
 
 interface UploadFileResult {
@@ -19,6 +19,13 @@ interface UploadResponseBody {
  * "per-file progress bars" — not achievable with fetch today. One XHR request per file (rather than
  * one multipart request for the whole batch) is also what makes genuinely PER-FILE progress and
  * per-file error isolation possible; the server already accepts either shape.
+ *
+ * Production auth is the `Authorization: Bearer` header (the Vercel web and Fly API share no cookie
+ * domain, so `withCredentials` alone cannot authenticate), and the fetch-based `api` helper attaches
+ * it automatically — but this upload bypasses that helper, so the header is attached here from the
+ * same BFF-issued token. A 401 is NOT retried: with a fresh token attached it means the session is
+ * genuinely invalid (secret rotation or expiry), and re-sending a potentially large file on a
+ * speculative retry is worse than surfacing the failure.
  */
 export function uploadFile(
   workspaceId: string,
@@ -26,9 +33,23 @@ export function uploadFile(
   onProgress: (fraction: number) => void,
   signal?: AbortSignal,
 ): Promise<UploadFileResult> {
+  return uploadWithToken(workspaceId, file, onProgress, signal);
+}
+
+async function uploadWithToken(
+  workspaceId: string,
+  file: File,
+  onProgress: (fraction: number) => void,
+  signal?: AbortSignal,
+): Promise<UploadFileResult> {
+  const token = await getSessionTokenForTransport();
+
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open("POST", apiUrl(`/v1/workspaces/${workspaceId}/files`));
+    if (token) {
+      xhr.setRequestHeader("Authorization", `Bearer ${token}`);
+    }
     xhr.withCredentials = true;
 
     xhr.upload.onprogress = (event) => {
