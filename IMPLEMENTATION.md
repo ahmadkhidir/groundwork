@@ -1130,6 +1130,33 @@ CPU contention from running the cgo-heavy Go suite concurrently; the file passes
 the full suite is green alone). Also in this wave: a dev-only `allowedDevOrigins` entry
 (`192.168.0.111`) in `web/next.config.ts` for LAN-device verification of the mobile UI.
 
+### FEAT-052 — Account Profile & Self-Management (docs `ef63606`, shipped 2026-08-09)
+
+Profile & Security at `/settings/profile` (screens/20): read-only identity card, change-password
+form, the product's SINGLE Auth.js sign-out affordance (none existed in the UI — FEAT-001's sign-out
+AC was unmet until now), and a type-to-confirm delete-account modal. `/settings` links to it; the
+landing page shows a `?deleted=1` banner after deletion. Docs `ef63606` also ratified the bearer-BFF
+auth transport in `architecture.md` (the docs previously said nothing about the credential
+transport; the code shipped the BFF earlier — see the deployment section).
+
+Server: `POST /v1/auth/password-change` (authenticated; verifies current via the login path, 400
+`invalid_current_password` deliberately NOT 401, writes the new hash, invalidates outstanding reset
+tokens — no new entity). `DELETE /v1/account`: FEAT-043's workspace cascade per owned workspace
+(each leaves a surviving DeletionRecord), then memberships/notifications/reset-tokens/audit entries,
+immediate Stripe cancel + customer delete (no auto-refund) + billing events, then the `users` row
+LAST — hard delete, no audit entry written (DeletionRecords survive as proof; `initiated_by` is
+plain text so it retains the deleted user id). Partial failure returns `account_deletion_partial_failed`
+with the account intact; every step is idempotent so retries are safe, including a stale-cookie
+retry after a fully-completed deletion. `deleteWorkspaceCascade` was extracted from the FEAT-043
+handler so both the workspace and account flows share it. New repo methods: user-scoped
+DeleteByUser/InvalidateForUser/Delete; `billing.Client` gains CancelSubscription + DeleteCustomer.
+
+Verification: server `make vet` + `make test` (auth service ChangePassword tests + 5 account-delete
+handler tests: happy path, workspace-cascade failure, Stripe failure, already-deleted workspace
+skip, already-deleted user) + `gofmt -l` clean; web `tsc --noEmit` + `eslint` + `vitest run`
+359/359 (7 ProfileScreen tests, 2 banner tests) + `next build` green. Docs pointer bumped to
+`ef63606` in the feature commit (pushed to the docs remote first).
+
 ### Post-suggestions feature — smart questions persist in a per-workspace bucket (user-authorized 2026-08-08)
 
 Product call (user): "smart questions generated should be added to the list — picking 1 of 10 and
