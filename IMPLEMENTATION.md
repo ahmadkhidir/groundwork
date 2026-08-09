@@ -1545,12 +1545,14 @@ required for Auth.js v5 behind a proxy (Vercel and Fly alike). Local dev is unch
    API app's**), `AUTH_URL` (the web's public URL), `NEXT_PUBLIC_API_BASE_URL` (the API's public
    URL, e.g. `https://api.<your-domain>`), `NEXT_PUBLIC_MAX_UPLOAD_BYTES`, and
    `NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY`. The `NEXT_PUBLIC_*` are baked at build time by Vercel.
-3. **Secrets.** `fly secrets set` on `groundwork-api` (never commit): `DATABASE_URL` (Neon),
-   `S3_ENDPOINT`/`S3_BUCKET`/`S3_ACCESS_KEY_ID`/`S3_SECRET_ACCESS_KEY`/`S3_REGION` (R2 —
-   S3-compatible), `ANTHROPIC_API_KEY`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`,
-   `STRIPE_PRICE_PRO`, `STRIPE_PRICE_TEAM`, `SMTP_HOST`/`SMTP_PORT`/`SMTP_USER`/`SMTP_PASSWORD`/
-   `EMAIL_FROM`, and `AUTH_SECRET`. Also set the API's `ALLOWED_ORIGIN` and `WEB_BASE_URL` env
-   (non-secret) to the web's public URL (the Vercel URL or a custom domain).
+3. **Secrets.** Fill `server/.env.prod` (gitignored — copy `server/.env.prod.example`, never commit)
+   and import: `make secrets-prod` in `server/` (reads `KEY=VALUE` lines via `fly secrets import`).
+   The file holds: `DATABASE_URL` (Neon), `S3_ENDPOINT`/`S3_BUCKET`/`S3_ACCESS_KEY_ID`/
+   `S3_SECRET_ACCESS_KEY`/`S3_REGION` (R2 — S3-compatible), `ANTHROPIC_API_KEY`,
+   `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_PRO`, `STRIPE_PRICE_TEAM`,
+   `SMTP_HOST`/`SMTP_PORT`/`SMTP_USER`/`SMTP_PASSWORD`/`EMAIL_FROM`, and `AUTH_SECRET`. Also set
+   the API's `ALLOWED_ORIGIN` and `WEB_BASE_URL` env (non-secret, `server/fly.toml` `[env]`) to the
+   web's public URL (the Vercel URL or a custom domain). Secrets apply on the next deploy.
 4. **GitHub `production` environment secrets** (repo → Settings → Environments → production):
    `FLY_API_TOKEN` and `NEON_DATABASE_URL` only — the web deploys via Vercel, so no `VERCEL_*`
    secrets live in GitHub. Optional: required reviewers on that environment for a manual deploy

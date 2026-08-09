@@ -12,6 +12,12 @@ Thumbs.db
 .env
 .env.local
 .env*.local
+# Production secrets for the Fly API — filled from .env.prod.example, imported with
+# `make secrets-prod` (server/Makefile). NEVER commit this file; the guard below is what stops
+# a stray `git add -A` from shipping live credentials. The `.example` template IS committed.
+.env.prod
+.env.prod.*
+!.env.prod.example
 
 # Node
 node_modules/

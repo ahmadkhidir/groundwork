@@ -50,7 +50,7 @@ else
   TAGFLAG :=
 endif
 
-.PHONY: build run test test-race vet fmt check doctor
+.PHONY: build run test test-race vet fmt check doctor secrets-prod
 
 build:
 	$(GO) build $(TAGFLAG) ./...
@@ -87,13 +87,25 @@ doctor:
 	@echo "build tags  : $(BUILD_TAGS)"
 	@command -v gcc >/dev/null 2>&1 \
 		&& echo "gcc         : $$(gcc --version | head -1)" \
-		|| echo "gcc         : NOT FOUND — install a C toolchain (see IMPLEMENTATION.md)"
+		|| echo "gcc         : NOT FOUND - install a C toolchain (see IMPLEMENTATION.md)"
 ifeq ($(OS),Windows_NT)
 	@test -f "$(DUCKDB_DIR)/libduckdb.dll" \
 		&& echo "libduckdb   : $(DUCKDB_DIR)" \
-		|| echo "libduckdb   : NOT FOUND at $(DUCKDB_DIR) — see IMPLEMENTATION.md §8"
+		|| echo "libduckdb   : NOT FOUND at $(DUCKDB_DIR) - see IMPLEMENTATION.md 8"
 	@test -f "$(MSYS2_PREFIX)/lib/libduckdb.dll.a" \
 		&& echo "CONFLICT    : MSYS2 duckdb is installed and WILL be linked in addition to the" \
 		&& echo "              official one. Remove it: pacman -R mingw-w64-ucrt-x86_64-duckdb" \
 		|| echo "conflicts   : none"
 endif
+
+# Imports server/.env.prod (gitignored — the .gitignore guard is what keeps live credentials out
+# of the repo) into the Fly API app's secrets. The app name comes from this directory's fly.toml,
+# so run from server/ with flyctl installed and authenticated (fly auth login).
+#
+#   cp .env.prod.example .env.prod   # fill in real values, NEVER commit
+#   make secrets-prod
+secrets-prod:
+	@test -f .env.prod || { echo "server/.env.prod not found — copy .env.prod.example and fill it in"; exit 1; }
+	fly secrets import < .env.prod
+	@echo "Secrets imported into the fly.toml app. They take effect on the next deploy:"
+	@echo "  fly deploy --remote-only"
