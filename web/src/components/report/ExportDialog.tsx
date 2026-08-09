@@ -17,7 +17,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { Button } from "@/components/ui/Button";
-import { apiUrl, ApiError } from "@/lib/api-client";
+import { apiUrl, ApiError, getSessionTokenForTransport } from "@/lib/api-client";
 import { QueryParam, routes } from "@/lib/routes";
 import { upgradeLabelFor } from "@/lib/tier";
 import { SubscriptionTier } from "@/types/schema";
@@ -429,8 +429,11 @@ function defaultFilename(format: ResolvedExportFormat): string {
  *
  * A plain `<a href>` cannot be used: the Go API is cross-origin in development, and a navigation
  * anchor would not attach the Auth.js session cookie. Fetching with `credentials: "include"` (the
- * same mode the api-client uses) carries the cookie, and the resulting blob is downloaded via a
- * temporary object URL. The server's Content-Disposition filename is honored when present.
+ * same mode the api-client uses) carries the cookie, and in production the SAME BFF-issued JWE the
+ * api-client sends as `Authorization: Bearer` is attached (the Vercel web and Fly API share no
+ * cookie domain, so the cookie alone cannot authenticate — exactly the upload's requirement). The
+ * resulting blob is downloaded via a temporary object URL. The server's Content-Disposition
+ * filename is honored when present.
  *
  * @throws {ApiError} on any non-2xx response, shaped like the api-client's errors.
  */
@@ -438,9 +441,11 @@ export async function downloadExportFile(
   path: string,
   fallbackFilename: string,
 ): Promise<void> {
+  const token = await getSessionTokenForTransport();
   const response = await fetch(apiUrl(path), {
     credentials: "include",
     cache: "no-store",
+    headers: token ? { Authorization: `Bearer ${token}` } : undefined,
   });
 
   if (!response.ok) {

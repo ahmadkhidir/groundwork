@@ -2,6 +2,7 @@ import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ExportDialog, downloadExportFile } from "./ExportDialog";
+import { resetSessionTokenCacheForTests } from "@/lib/api-client";
 import { SubscriptionTier } from "@/types/schema";
 
 // A reactive URLSearchParams store so tests can simulate real navigation: when `router.replace`
@@ -75,6 +76,9 @@ function okResponse(filename?: string) {
           ? `attachment; filename="${filename}"`
           : null,
     },
+    // downloadExportFile first calls the BFF /api/session-token route for the bearer; the default
+    // response is "no session" so existing tests keep exercising the no-header path.
+    json: async () => ({ token: null }),
     blob: async () => new Blob(["file-bytes"], { type: "application/octet-stream" }),
   };
 }
@@ -165,6 +169,36 @@ describe("ExportDialog", () => {
     );
     // The server-provided Content-Disposition filename wins.
     expect(capturedAnchor?.download).toBe("customers-results.csv");
+  });
+
+  it("attaches the production bearer token to the export request (the cookie cannot cross origins)", async () => {
+    const user = userEvent.setup();
+    // Clear the page-lifetime token cache so this test simulates a fresh load.
+    resetSessionTokenCacheForTests();
+    // The BFF session-token route returns the JWE; the export endpoint then receives it.
+    fetchMock.mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/api/session-token")) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: { get: () => null },
+          json: async () => ({ token: "jwe-1" }),
+        });
+      }
+      return Promise.resolve(okResponse("customers-results.csv"));
+    });
+    renderDialog({ tier: SubscriptionTier.Pro });
+
+    await user.click(screen.getByRole("radio", { name: /Excel\/CSV/ }));
+    await user.click(screen.getByRole("button", { name: "Export" }));
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringContaining("/export?format=csv"),
+        expect.objectContaining({ headers: { Authorization: "Bearer jwe-1" } }),
+      ),
+    );
   });
 
   it("shows the exporting state on the selected row while the export is in flight", async () => {

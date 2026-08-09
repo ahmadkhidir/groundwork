@@ -47,12 +47,20 @@ function getSessionToken(refresh = false): Promise<string | null> {
 
 /**
  * Returns the Auth.js session JWE for transports that cannot use the fetch-based `api` helper —
- * currently the XHR file upload (web/src/components/upload/uploadFile.ts), which needs per-file
- * progress events fetch does not provide. The upload attaches it as `Authorization: Bearer`, the
- * same credential the fetch path sends on every request.
+ * currently the XHR file upload (web/src/components/upload/uploadFile.ts) and the blob export
+ * download (web/src/components/report/ExportDialog.tsx). The upload/download attach it as
+ * `Authorization: Bearer`, the same credential the fetch path sends on every request.
  */
 export function getSessionTokenForTransport(): Promise<string | null> {
   return getSessionToken();
+}
+
+/**
+ * Test-only seam: clears the cached session token so a test can simulate a fresh page load
+ * (module state otherwise persists across tests in one file). No production caller needs it.
+ */
+export function resetSessionTokenCacheForTests(): void {
+  sessionTokenPromise = null;
 }
 
 /**
