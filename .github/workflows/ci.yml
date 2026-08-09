@@ -43,6 +43,10 @@ jobs:
           cache-dependency-path: web/package-lock.json
       - name: Install
         run: npm ci
+      # PageProps/LayoutProps are GLOBAL types Next generates into .next/types (gitignored). On a
+      # fresh checkout they don't exist, so typecheck must come after typegen (or after a build).
+      - name: Typegen
+        run: npx next typegen
       - name: Typecheck
         run: npm run typecheck
       - name: Lint

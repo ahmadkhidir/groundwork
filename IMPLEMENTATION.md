@@ -1484,6 +1484,11 @@ npm run typecheck                    # tsc --noEmit
 npx next typegen                     # Regenerate PageProps/LayoutProps after adding a route
 ```
 
+**Typecheck needs the generated types first.** `PageProps`/`LayoutProps` are globals Next emits
+into `.next/types/` (gitignored). On a fresh checkout they don't exist until `next dev`/`next build`/
+`next typegen` has run — so run `npx next typegen` before `npm run typecheck` (CI does this
+explicitly), and don't be surprised when typecheck fails right after a `.next` cleanup.
+
 **Windows dev-server hazards (both observed 2026-08-08 — the routes themselves are fine; `next build`
 compiles every route and production is unaffected):**
 
