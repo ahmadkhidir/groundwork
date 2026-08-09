@@ -30,6 +30,14 @@ primary_region = "iad"
 # The API is the always-on backend (it hosts the engine lifecycle and receives every browser
 # request with the session cookie), so it does NOT scale to zero — the per-session engine inside
 # it idles down on its own via ENGINE_IDLE_TIMEOUT.
+#
+# Memory is load-bearing: the embedded DuckDB engine runs in THIS process, and a real ingest or
+# query can exceed Fly's default (256MB for shared-cpu-1x), OOM-killing the machine mid-work. 1GB
+# is the floor for shared-cpu-1x and the sensible starting point for a DuckDB-hosting API.
+[vm]
+  size = "shared-cpu-1x"
+  memory = "1gb"
+
 [http_service]
   internal_port = 8080
   force_https = true
