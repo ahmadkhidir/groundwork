@@ -17,7 +17,7 @@ jobs:
     uses: ./.github/workflows/ci.yml
 
   deploy:
-    name: Deploy to Fly
+    name: Deploy API to Fly
     needs: test
     runs-on: ubuntu-latest
     # The deploy secrets live in the repo's "production" environment (Settings → Environments →
@@ -55,10 +55,7 @@ jobs:
         # --remote-only builds on Fly's builder, so the runner needs no Docker daemon.
         run: flyctl deploy --remote-only
 
-      - name: Deploy Web (Vercel)
-        working-directory: web
-        run: npx --yes vercel@latest --prod --token "${{ secrets.VERCEL_TOKEN }}" --yes
-        env:
-          # Vercel reads these to pick the project (the CLI otherwise prompts interactively).
-          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
-          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+# NOTE — the WEB tier deploys through Vercel's native GitHub integration, not this workflow: link
+# this repo in Vercel, production branch = main, and Vercel deploys the web on every push (with
+# per-PR previews) while this workflow handles migration + API. The web is a stateless client that
+# talks to the API over HTTP, so its deploy does not need to be ordered after the API's.

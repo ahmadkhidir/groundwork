@@ -1512,9 +1512,12 @@ Postgres or DuckDB); the Go API must stay on a container host (long-lived proces
 Vercel cannot run it. CI/CD is `.github/workflows/ci.yml` (push to main + PR: server `make
 fmt/vet/test` on Linux — the static cgo linkage the Makefile's non-Windows path uses is exactly what
 CI needs — and web `npm ci` + typecheck + lint + vitest + build) and `.github/workflows/deploy.yml`
-(main push: runs CI as the gate, then goose-migrates the Neon DB, then `flyctl deploy` of the API
-and `vercel --prod` of the web; both deploy secrets live in the repo's `production` GitHub
-environment).
+(main push: runs CI as the gate, then goose-migrates the Neon DB, then `flyctl deploy` of the API;
+deploy secrets live in the repo's `production` GitHub environment). **The web deploys through
+Vercel's native GitHub integration, not the workflow** — link this repo in Vercel with production
+branch = main; Vercel deploys the web on every push (with per-PR previews) while the workflow
+handles migration + API. The web is a stateless client talking to the API over HTTP, so its deploy
+does not need to be ordered after the API's.
 
 **Auth transport — bearer, not cookie (do not "fix" it back).** The browser sends the Auth.js
 session token to the Go API on a DIFFERENT domain (Vercel `<project>.vercel.app` web vs
@@ -1535,7 +1538,9 @@ required for Auth.js v5 behind a proxy (Vercel and Fly alike). Local dev is unch
 1. **Fly API app + region.** `flyctl apps create groundwork-api`. Match `primary_region` in
    `server/fly.toml` to the Neon/R2 region (single-region co-location). There is no web Fly app —
    the web is on Vercel.
-2. **Vercel project.** Create the project from the repo (web root) and set its environment
+2. **Vercel project (GitHub integration).** Create the project in Vercel and **link this GitHub
+   repo** (production branch = `main`); Vercel then deploys the web on every push and gives per-PR
+   previews — nothing in the GitHub workflow deploys the web. Set the project's environment
    variables (Project → Settings → Environment Variables): `AUTH_SECRET` (**byte-identical to the
    API app's**), `AUTH_URL` (the web's public URL), `NEXT_PUBLIC_API_BASE_URL` (the API's public
    URL, e.g. `https://api.<your-domain>`), `NEXT_PUBLIC_MAX_UPLOAD_BYTES`, and
@@ -1547,9 +1552,9 @@ required for Auth.js v5 behind a proxy (Vercel and Fly alike). Local dev is unch
    `EMAIL_FROM`, and `AUTH_SECRET`. Also set the API's `ALLOWED_ORIGIN` and `WEB_BASE_URL` env
    (non-secret) to the web's public URL (the Vercel URL or a custom domain).
 4. **GitHub `production` environment secrets** (repo → Settings → Environments → production):
-   `FLY_API_TOKEN`, `NEON_DATABASE_URL` (migration step), and `VERCEL_TOKEN` + `VERCEL_ORG_ID` +
-   `VERCEL_PROJECT_ID` (the web deploy step). Optional: required reviewers on that environment for
-   a manual deploy gate.
+   `FLY_API_TOKEN` and `NEON_DATABASE_URL` only — the web deploys via Vercel, so no `VERCEL_*`
+   secrets live in GitHub. Optional: required reviewers on that environment for a manual deploy
+   gate.
 5. **Stripe webhook.** Point the Stripe webhook at `https://api.<your-domain>/v1/billing/webhook`.
 
 **Known image constraint (load-bearing, not optional):** `server/Dockerfile` installs the DuckDB
