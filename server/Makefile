@@ -102,10 +102,13 @@ endif
 # of the repo) into the Fly API app's secrets. The app name comes from this directory's fly.toml,
 # so run from server/ with flyctl installed and authenticated (fly auth login).
 #
+# The `.env.prod` PREREQUISITE is the existence guard — chosen over a `test -f ...` recipe line so
+# the target works under both cmd.exe (Windows) and sh (Linux/CI): make itself errors out with
+# "No rule to make target '.env.prod'" when the file is missing, on every platform.
+#
 #   cp .env.prod.example .env.prod   # fill in real values, NEVER commit
 #   make secrets-prod
-secrets-prod:
-	@test -f .env.prod || { echo "server/.env.prod not found — copy .env.prod.example and fill it in"; exit 1; }
+secrets-prod: .env.prod
 	fly secrets import < .env.prod
-	@echo "Secrets imported into the fly.toml app. They take effect on the next deploy:"
-	@echo "  fly deploy --remote-only"
+	@echo Secrets imported into the fly.toml app. They take effect on the next deploy:
+	@echo   fly deploy --remote-only
