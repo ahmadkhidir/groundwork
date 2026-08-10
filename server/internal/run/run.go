@@ -1463,10 +1463,17 @@ Do not include markdown fences or any text outside the JSON object.`
 
 // generateSQLSystemPrompt frames the generate_sql step: write SQL referencing exactly the table
 // names and columns provided, following the plan's approach.
+//
+// The quoting rule is not cosmetic: real data has column names that are not bare SQL identifiers —
+// a MetaTrader-style export headers its columns `<DATE>`, `<HIGH>`, etc. Those names are literal;
+// DuckDB only parses them double-quoted ("<HIGH>"), and an unquoted `<` is read as the less-than
+// operator, so the whole run fails at execute. Quoting every identifier is always valid in DuckDB
+// and removes the model's need to judge when quoting is required.
 const generateSQLSystemPrompt = `You are the SQL generation step of a grounded analytics system. The user's question and a plan are provided alongside the schema/profile metadata of the workspace's datasets and its semantic layer.
 
 Write read-only analytical SQL that answers the question. Requirements:
 - Reference tables by EXACTLY the names given in the payload. Never invent table or column names.
+- Write every table and column reference as a DOUBLE-QUOTED identifier exactly as it appears in the payload: "volume", "<HIGH>", "Open Price". The names in the payload are LITERAL — a column named <DATE> is a real column, never a placeholder, and there is no substitution step after you. An unquoted identifier containing anything other than letters, digits, or underscore (such as <, >, or a space) is a parse error that fails the whole run, so quote even ordinary names — it costs nothing and is always valid in DuckDB. If the question needs a column that is not in the payload, the workspace's data cannot answer it — write SQL only over the columns provided.
 - Prefer the confirmed relationships and metric definitions in the semantic layer for joins and calculations.
 - Only join tables when a confirmed or clearly implied relationship connects them.
 - Return only the columns the question needs. Use aggregate functions and GROUP BY for summarization questions.
