@@ -126,6 +126,10 @@ export function WorkspaceHomeScreen({ workspaceId, userId, userTier }: Workspace
 
   const workspace = state.status === "loaded" ? state.workspace : null;
   const enginePill = workspace ? engineStatusPill(workspace.engine_status) : null;
+  // FEAT-045: a shared workspace viewed by a non-owner is read-only. Drives the Ask panel, the
+  // suggestions strip, the Datasets panel's delete action, and its "Add data" affordance.
+  const readOnly =
+    userId !== undefined && workspace !== null && workspace.owner_id !== userId;
 
   return (
     <main id="main-content" className="mx-auto w-full max-w-5xl p-8">
@@ -167,16 +171,17 @@ export function WorkspaceHomeScreen({ workspaceId, userId, userTier }: Workspace
           // FEAT-050: the suggestions strip renders only when the workspace has data, and is hidden
           // for read-only members (screens/04's edge case) alongside the Ask input's mutating role.
           hasDatasets={workspace?.has_datasets}
-          readOnly={userId !== undefined && workspace !== null && workspace.owner_id !== userId}
+          readOnly={readOnly}
           tier={userTier}
         />
       </Card>
 
       {/* "Upload data prompt... Shown when no files ingested yet" (screens/04-workspace-home.md) —
           driven by has_datasets from the same workspace fetch as the status pill, per that screen's
-          Data Flow step 5. Hidden once the workspace has data; File Upload stays reachable from the
-          workspace navigation and from Workspace List either way, so hiding the CTA removes a
-          redundant prompt rather than the route itself.
+          Data Flow step 5. Hidden once the workspace has data — the persistent "Add data"
+          affordance inside the Datasets panel (below) is what keeps File Upload reachable after the
+          first ingest, since the docs' own flows (FEAT-003 multiple files, FEAT-049 re-upload) require
+          adding more data to a workspace that already has some.
 
           Rendered only once the workspace has actually loaded: showing the CTA during the first
           fetch would make it flash and vanish on every visit to a workspace that has data. */}
@@ -200,14 +205,21 @@ export function WorkspaceHomeScreen({ workspaceId, userId, userTier }: Workspace
           <h2 className="mb-2 text-h3 text-text-primary">Recent reports</h2>
           <RecentReportsPanel workspaceId={workspaceId} />
         </div>
-        <div className="hidden flex-col gap-6 lg:flex">
+        <div className="flex flex-col gap-6">
+          {/* Semantic layer summary: "Both (compact on mobile)" per screens/04-workspace-home.md's
+              component table — stacks compactly below recent reports on mobile and sits in the
+              right column on lg+. */}
           <SemanticLayerSummaryPanel workspaceId={workspaceId} />
           {/* Datasets panel (FEAT-048): filename, upload time, row count, per-row delete. Shown once
               the workspace has data — before that, there is nothing to list and the Empty (no data)
-              state above already covers the same message. */}
+              state above already covers the same message. Rendered on EVERY viewport per the
+              component table ("Both (collapsible on mobile)"): stacking below the reports on mobile
+              and sitting in the right column on lg+, so single-dataset deletion (FEAT-048) and the
+              "Add data" affordance are never unavailable on a phone. */}
           {workspace?.has_datasets && (
             <DatasetsPanel
               workspaceId={workspaceId}
+              readOnly={readOnly}
               onDatasetDeleted={(remainingCount) => {
                 // screens/04's Data Flow step 6: deleting the workspace's last remaining dataset
                 // reverts has_datasets, which in turn brings back the Empty (no data) state and the

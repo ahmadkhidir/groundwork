@@ -19,8 +19,9 @@ type PanelState =
   | { status: "error" };
 
 /**
- * Compact semantic layer summary panel — screens/04-workspace-home.md's web-only right column:
- * "12 relationships, 4 metric definitions — view all".
+ * Compact semantic layer summary panel — screens/04-workspace-home.md's "Both (compact on mobile)"
+ * right-side panel: "12 relationships, 4 metric definitions — view all". Renders on every viewport,
+ * stacked compactly below recent reports on mobile and in the right column on lg+.
  *
  * Now wired to FEAT-019's real GET /v1/workspaces/:id/semantic-layer/summary. Previously rendered a
  * visibly-unbuilt placeholder ("Not built yet") since that endpoint didn't exist; this wave built it.

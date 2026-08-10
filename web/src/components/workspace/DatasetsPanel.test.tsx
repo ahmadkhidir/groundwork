@@ -49,6 +49,21 @@ describe("DatasetsPanel", () => {
     await waitFor(() => expect(screen.getByText("No datasets yet")).toBeInTheDocument());
   });
 
+  // The empty-state "Upload data" CTA on Workspace Home is hidden once has_datasets is true
+  // (screens/04-workspace-home.md Data Flow step 5), but FEAT-003 / FEAT-049 require adding more
+  // data to a workspace that already has some — this header affordance is that persistent entry
+  // point, and it renders on every viewport since the panel is "Both (collapsible on mobile)".
+  it("offers a persistent Add data link to File Upload", async () => {
+    getMock.mockResolvedValueOnce({ datasets: [DATASET] });
+    render(<DatasetsPanel workspaceId="ws-1" />);
+
+    await waitFor(() => expect(screen.getByText("customers.csv")).toBeInTheDocument());
+    expect(screen.getByRole("link", { name: /add data/i })).toHaveAttribute(
+      "href",
+      "/workspaces/ws-1/upload",
+    );
+  });
+
   // FEAT-048's core non-negotiable: the confirmation must name a dependent Relationship AND, as a
   // SEPARATE warning, that type/PII review work is lost and not carried forward — never a bare
   // "are you sure?".
@@ -128,11 +143,12 @@ describe("DatasetsPanel", () => {
     expect(screen.getByText("customers.csv")).toBeInTheDocument();
   });
 
-  it("hides the per-row delete action for read-only access", async () => {
+  it("hides the per-row delete action and Add data affordance for read-only access", async () => {
     getMock.mockResolvedValueOnce({ datasets: [DATASET] });
     render(<DatasetsPanel workspaceId="ws-1" readOnly />);
 
     await waitFor(() => expect(screen.getByText("customers.csv")).toBeInTheDocument());
     expect(screen.queryByRole("button", { name: /delete customers.csv/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: /add data/i })).not.toBeInTheDocument();
   });
 });

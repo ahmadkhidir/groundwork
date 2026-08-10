@@ -209,4 +209,67 @@ describe("WorkspaceHomeScreen", () => {
     await waitFor(() => expect(screen.getByText("Q3 Numbers")).toBeInTheDocument());
     expect(screen.queryByRole("link", { name: /upload data/i })).not.toBeInTheDocument();
   });
+
+  /**
+   * Walks up from an element checking whether any ancestor carries Tailwind's `hidden` class (a
+   * below-lg `display: none`). jsdom cannot evaluate breakpoints, so this guards the
+   * mobile-visibility regression structurally: per screens/04-workspace-home.md (updated by
+   * product-shaper), BOTH the Datasets panel ("Both (collapsible on mobile)") and the Semantic
+   * layer summary ("Both (compact on mobile)") render on every viewport — neither may sit in a
+   * hidden below-lg container anymore.
+   */
+  function isInHiddenAncestor(el: Element | null): boolean {
+    let node: Element | null = el;
+    while (node) {
+      if (typeof node.className === "string" && node.className.split(/\s+/).includes("hidden")) {
+        return true;
+      }
+      node = node.parentElement;
+    }
+    return false;
+  }
+
+  // FEAT-003 / FEAT-049: adding more data to a workspace that already has some is an ordinary,
+  // required action — the empty-state "Upload data" CTA is gone once has_datasets is true, so the
+  // Datasets panel's "Add data" affordance is what keeps File Upload reachable (and it must be
+  // reachable on mobile too, per the panel's "Both (collapsible on mobile)" platform tag).
+  it("keeps Add data reachable after datasets exist, on every viewport", async () => {
+    getMock.mockImplementation(async (path: string) => {
+      if (path.includes("/semantic-layer/summary")) {
+        return { relationship_count: 12, metric_definition_count: 4 };
+      }
+      if (path.includes("/reports")) {
+        return { reports: [] };
+      }
+      return { workspace: workspaceWith(EngineStatus.Ready, true) };
+    });
+    render(<WorkspaceHomeScreen workspaceId="ws-1" />);
+
+    await waitFor(() => expect(screen.getByText("Q3 Numbers")).toBeInTheDocument());
+    const addDataLink = screen.getByRole("link", { name: /add data/i });
+    expect(addDataLink).toHaveAttribute("href", "/workspaces/ws-1/upload");
+    // Mobile-visibility regression guards: neither Add data nor the semantic layer summary may sit
+    // inside a `hidden` (below-lg) container — screens/04 now tags both panels "Both".
+    expect(isInHiddenAncestor(addDataLink)).toBe(false);
+    await waitFor(() => expect(screen.getByText(/relationships/)).toBeInTheDocument());
+    expect(isInHiddenAncestor(screen.getByText(/relationships/))).toBe(false);
+  });
+
+  // screens/04's read-only edge case (FEAT-045): the Upload CTA is hidden for read-only members —
+  // the persistent "Add data" affordance follows the same rule.
+  it("hides the Add data affordance for read-only shared access", async () => {
+    getMock.mockImplementation(async (path: string) => {
+      if (path.includes("/semantic-layer/summary")) {
+        return { relationship_count: 0, metric_definition_count: 0 };
+      }
+      if (path.includes("/reports")) {
+        return { reports: [] };
+      }
+      return { workspace: workspaceWith(EngineStatus.Ready, true) };
+    });
+    render(<WorkspaceHomeScreen workspaceId="ws-1" userId="other-user" />);
+
+    await waitFor(() => expect(screen.getByText("Q3 Numbers")).toBeInTheDocument());
+    expect(screen.queryByRole("link", { name: /add data/i })).not.toBeInTheDocument();
+  });
 });

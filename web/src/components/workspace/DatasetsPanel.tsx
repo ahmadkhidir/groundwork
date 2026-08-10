@@ -1,13 +1,16 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { Database, Trash2 } from "lucide-react";
+import Link from "next/link";
+import { Database, Trash2, UploadCloud } from "lucide-react";
 import { Card, CardHeader } from "@/components/ui/Card";
+import { buttonClassNames } from "@/components/ui/Button";
 import { StatusPill } from "@/components/ui/StatusPill";
 import { EmptyState } from "@/components/shared/EmptyState";
 import { Skeleton } from "@/components/shared/Skeleton";
 import { DeleteConfirmationModal } from "@/components/shared/DeleteConfirmationModal";
 import { api, ApiError } from "@/lib/api-client";
+import { routes } from "@/lib/routes";
 import { IngestStatus } from "@/types/schema";
 
 export interface DatasetsPanelProps {
@@ -126,6 +129,15 @@ export function buildDeletionDisclosure(impact: DeletionImpact): {
  * (filename, upload time, row count, ingest status) with a per-row delete action that opens the
  * shared Delete Confirmation Modal, naming exactly what will be destroyed before the user commits.
  *
+ * The header also carries the persistent "Add data" affordance linking to File Upload. The spec's
+ * "Upload data" prompt on Workspace Home is explicitly an empty-state CTA (hidden once
+ * `has_datasets` is true, per screens/04's Data Flow step 5), yet the product's own flows require
+ * adding more data to a workspace that already has some — FEAT-003 ("multiple files into the same
+ * workspace"), Flow 2/Flow 3 (workspaces with several files), and FEAT-049 ("re-uploading a
+ * corrected spreadsheet... an entirely ordinary action"). The Datasets panel is that entry point,
+ * and being rendered on every viewport ("Both (collapsible on mobile)") it keeps File Upload
+ * reachable on mobile too, where the empty-state CTA no longer exists.
+ *
  * Two datasets sharing an original_filename (FEAT-049's "Keep both" outcome) are distinguished here
  * by their upload time, since the list is already ordered most-recent-first and each row shows its
  * own `created_at`.
@@ -133,6 +145,18 @@ export function buildDeletionDisclosure(impact: DeletionImpact): {
 export function DatasetsPanel({ workspaceId, readOnly = false, onDatasetDeleted }: DatasetsPanelProps) {
   const [state, setState] = useState<PanelState>({ status: "loading" });
   const [modal, setModal] = useState<ModalState>({ phase: "closed" });
+
+  // FEAT-045: read-only shared members cannot upload files — the affordance is hidden, exactly as
+  // screens/04 hides the Ask input and Upload CTA for them.
+  const addDataAction = readOnly ? null : (
+    <Link
+      href={routes.upload(workspaceId)}
+      className={buttonClassNames("secondary")}
+    >
+      <UploadCloud size={16} aria-hidden="true" />
+      Add data
+    </Link>
+  );
 
   const load = useCallback(async () => {
     try {
@@ -192,7 +216,7 @@ export function DatasetsPanel({ workspaceId, readOnly = false, onDatasetDeleted 
   if (state.status === "loading") {
     return (
       <Card>
-        <CardHeader title="Datasets" />
+        <CardHeader title="Datasets" action={addDataAction} />
         <div className="flex flex-col gap-2">
           <Skeleton className="h-10 w-full" />
           <Skeleton className="h-10 w-full" />
@@ -204,7 +228,7 @@ export function DatasetsPanel({ workspaceId, readOnly = false, onDatasetDeleted 
   if (state.status === "error") {
     return (
       <Card>
-        <CardHeader title="Datasets" />
+        <CardHeader title="Datasets" action={addDataAction} />
         <p className="text-body-small text-error">{state.message}</p>
       </Card>
     );
@@ -218,7 +242,11 @@ export function DatasetsPanel({ workspaceId, readOnly = false, onDatasetDeleted 
 
   return (
     <Card>
-      <CardHeader title="Datasets" description={`${state.datasets.length} uploaded`} />
+      <CardHeader
+        title="Datasets"
+        description={`${state.datasets.length} uploaded`}
+        action={addDataAction}
+      />
 
       {state.datasets.length === 0 ? (
         <EmptyState icon={Database} title="No datasets yet" subtitle="Upload a file to see it here." />
