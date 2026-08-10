@@ -279,6 +279,42 @@ func TestUpdateColumnOverridesInferredType(t *testing.T) {
 	}
 }
 
+// TestUpdateColumnAcceptsTimeTypeOverride covers schema.md's seventh type: a bare time-of-day
+// column (trading data's split Date + Time) can be reviewed/overridden as `time` on screens/07.
+func TestUpdateColumnAcceptsTimeTypeOverride(t *testing.T) {
+	workspaces := newFakeWorkspaceStore()
+	workspaces.byID["ws-1"] = domain.Workspace{ID: "ws-1", OwnerID: "user-1"}
+	columns := newFakeConfirmationColumnStore()
+	columns.put("ws-1", domain.Column{
+		ID:             "col-1",
+		DatasetID:      "ds-1",
+		Name:           "session_time",
+		InferredType:   domain.TypeString,
+		TypeConfidence: 0.4,
+		TypeFitRates: map[domain.InferredType]float64{
+			domain.TypeString: 0.4,
+			domain.TypeTime:   0.95,
+		},
+	})
+	router := newTestConfirmationRouter(workspaces, &fakeConfirmationDatasetStore{byID: map[string]domain.Dataset{}}, columns, &fakeConfirmationCandidateJoinStore{byID: map[string]domain.CandidateJoin{}}, &fakeRelationshipStore{})
+
+	req := authedRequest(t, http.MethodPatch, "/v1/workspaces/ws-1/columns/col-1", map[string]any{"inferred_type": "time"}, "user-1", domain.TierFree)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 for the time override; body: %s", rec.Code, rec.Body.String())
+	}
+	updated := columns.byID["col-1"]
+	if updated.InferredType != domain.TypeTime {
+		t.Errorf("inferred_type = %q, want %q", updated.InferredType, domain.TypeTime)
+	}
+	// FEAT-006: the badge moves to the measured fit rate for the newly chosen type.
+	if updated.TypeConfidence != 0.95 {
+		t.Errorf("type_confidence = %v, want 0.95 (the measured fit rate for time)", updated.TypeConfidence)
+	}
+}
+
 // A column profiled before migration 00006 has an empty type_fit_rates; overriding its type must keep
 // its existing type_confidence (the SQL's COALESCE fallback) rather than dropping to zero or being
 // promoted to a fabricated 1.0.

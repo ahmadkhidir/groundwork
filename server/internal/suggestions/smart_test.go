@@ -63,14 +63,15 @@ func TestProfileSkipsUnsafeColumnsAndBuildsTypeAwareProfiles(t *testing.T) {
 		{ID: "c-1", DatasetID: "ds-1", Name: "region", InferredType: domain.TypeString},
 		{ID: "c-2", DatasetID: "ds-1", Name: "total_amount", InferredType: domain.TypeNumber},
 		{ID: "c-3", DatasetID: "ds-1", Name: "email", InferredType: domain.TypeString, PIIFlag: true},
+		{ID: "c-4", DatasetID: "ds-1", Name: "session_time", InferredType: domain.TypeTime},
 	}
 
 	profiles, err := Profile(context.Background(), h, datasets, columns)
 	if err != nil {
 		t.Fatalf("Profile() error = %v", err)
 	}
-	if len(profiles) != 2 {
-		t.Fatalf("profiled %d columns, want 2 (PII column skipped)", len(profiles))
+	if len(profiles) != 3 {
+		t.Fatalf("profiled %d columns, want 3 (PII column skipped, time column profiled as top values)", len(profiles))
 	}
 	for _, p := range profiles {
 		if strings.Contains(strings.ToLower(p.Column), "email") {

@@ -81,11 +81,15 @@ type InferredType string
 
 // Inferred column types.
 const (
-	TypeString    InferredType = "string"
-	TypeInteger   InferredType = "integer"
-	TypeNumber    InferredType = "number"
-	TypeBoolean   InferredType = "boolean"
-	TypeDate      InferredType = "date"
+	TypeString  InferredType = "string"
+	TypeInteger InferredType = "integer"
+	TypeNumber  InferredType = "number"
+	TypeBoolean InferredType = "boolean"
+	TypeDate    InferredType = "date"
+	// TypeTime is a bare time-of-day value (e.g. `09:30:00`), distinct from TypeTimestamp — trading
+	// data commonly splits date and time into separate columns, and a bare time coerces to neither
+	// DATE nor TIMESTAMP, so it needs its own honest type rather than falling back to string.
+	TypeTime      InferredType = "time"
 	TypeTimestamp InferredType = "timestamp"
 )
 

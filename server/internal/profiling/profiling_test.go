@@ -136,6 +136,39 @@ func TestProfileRecognizesBooleanDateAndTimestamp(t *testing.T) {
 	}
 }
 
+// TestProfileRecognizesTimeOfDayColumn covers schema.md's seventh type: a bare time-of-day column
+// (trading data splits date and time into separate columns) that coerces to neither DATE nor
+// TIMESTAMP. It must map to `time`, score HIGH on time, and — the regression — NOT read as
+// HIGH-confidence free text, which is exactly what it did before TIME joined stricterThanString.
+func TestProfileRecognizesTimeOfDayColumn(t *testing.T) {
+	handle := acquireTestHandle(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "times.parquet")
+
+	writeParquetFixture(t, handle, path, `
+		SELECT * FROM (VALUES
+			(TIME '09:30:00'),
+			(TIME '09:30:00'),
+			(TIME '15:45:00')
+		) AS t(session_time)
+	`)
+
+	byName := profileByName(t, handle, path)
+	col, ok := byName["session_time"]
+	if !ok {
+		t.Fatal("missing column 'session_time'")
+	}
+	if col.InferredType != domain.TypeTime {
+		t.Errorf("session_time.InferredType = %q, want %q", col.InferredType, domain.TypeTime)
+	}
+	if got := col.TypeFitRates[domain.TypeTime]; got < highConfidenceBand {
+		t.Errorf("session_time time fit = %v, want >= %v (every value coerces to TIME)", got, highConfidenceBand)
+	}
+	if got := col.TypeFitRates[domain.TypeString]; got >= highConfidenceBand {
+		t.Errorf("session_time string fit = %v, want < %v (a time column must not look like free text)", got, highConfidenceBand)
+	}
+}
+
 // Band thresholds from schema.md / FEAT-005, restated here rather than imported from production code
 // so a change to a production constant cannot silently move the bar these assertions check against.
 // The web tier derives the same bands in web/src/components/confirmation/types.ts.

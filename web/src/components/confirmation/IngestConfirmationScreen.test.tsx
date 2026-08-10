@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { IngestConfirmationScreen } from "./IngestConfirmationScreen";
@@ -172,6 +172,17 @@ describe("IngestConfirmationScreen", () => {
     // own guess, while the badge must state how much of the DATA fits the type currently selected —
     // which is what makes it still true after a user overrides the type.
     expect(screen.getAllByText(/92% of values fit/).length).toBeGreaterThan(0);
+  });
+
+  // schema.md's seventh type: a bare time-of-day column (trading data's split Date + Time) must be
+  // offered on the FEAT-006 override dropdown, distinct from "Date & time".
+  it("offers Time as a column type option", async () => {
+    mockLoad([column({ name: "session_time", inferred_type: "string", type_confidence: 0.4 })]);
+    render(<IngestConfirmationScreen workspaceId="ws-1" />);
+
+    await waitFor(() => expect(screen.getAllByText("session_time").length).toBeGreaterThan(0));
+    const select = screen.getAllByLabelText("Override type for session_time")[0];
+    expect(within(select).getByRole("option", { name: "Time" })).toBeInTheDocument();
   });
 
   it("overrides a column's type via PATCH and reflects the confirmed value", async () => {

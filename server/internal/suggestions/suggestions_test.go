@@ -96,6 +96,30 @@ func TestGenerateProducesTypeAwareQuestions(t *testing.T) {
 	}
 }
 
+// TestGenerateProducesTimeOfDayQuestions covers FEAT-050's type-aware rule for schema.md's seventh
+// type: a bare time-of-day column (trading data's split Date + Time) yields time-of-day questions —
+// paired with a same-dataset numeric column, and standalone — never trend questions.
+func TestGenerateProducesTimeOfDayQuestions(t *testing.T) {
+	src := &fakeSource{
+		datasets: []domain.Dataset{{ID: "ds-1", OriginalFilename: "trades.csv", IngestStatus: domain.IngestComplete}},
+		columns: []domain.Column{
+			col("c-1", "ds-1", "volume", domain.TypeNumber),
+			col("c-2", "ds-1", "session_time", domain.TypeTime),
+		},
+	}
+	got, err := Generate(context.Background(), "ws-1", src)
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	joined := strings.Join(got, "\n")
+	if !strings.Contains(joined, "What is the volume by time of day?") {
+		t.Errorf("numeric/time-of-day pairing missing:\n%v", got)
+	}
+	if !strings.Contains(joined, "What are the most common session time values?") {
+		t.Errorf("standalone time question missing:\n%v", got)
+	}
+}
+
 func TestGenerateNeverReferencesUnsafeOrNonexistentEntities(t *testing.T) {
 	src := &fakeSource{
 		datasets: []domain.Dataset{{ID: "ds-1", OriginalFilename: "x.csv", IngestStatus: domain.IngestComplete}},

@@ -78,7 +78,7 @@ func Generate(ctx context.Context, workspaceID string, src Source) ([]string, er
 		}
 	}
 
-	var numeric, categorical, temporal []safeColumn
+	var numeric, categorical, temporal, timeOfDay []safeColumn
 	colByID := make(map[string]domain.Column, len(columns))
 	for _, c := range columns {
 		// FEAT-050: a PII-flagged or model-excluded column is never referenced, even by name.
@@ -96,6 +96,10 @@ func Generate(ctx context.Context, workspaceID string, src Source) ([]string, er
 			numeric = append(numeric, sc)
 		case domain.TypeDate, domain.TypeTimestamp:
 			temporal = append(temporal, sc)
+		case domain.TypeTime:
+			// A bare time-of-day column (trading data's split Date + Time) generates time-of-day
+			// questions rather than trend questions, per FEAT-050's type-aware template rule.
+			timeOfDay = append(timeOfDay, sc)
 		case domain.TypeString, domain.TypeBoolean:
 			categorical = append(categorical, sc)
 		}
@@ -126,6 +130,18 @@ func Generate(ctx context.Context, workspaceID string, src Source) ([]string, er
 		for range sameDataset(temporal, nc.dataset.ID) {
 			add("How does " + name + " change over time?")
 		}
+		// Time-of-day pairing, FEAT-050: a numeric column with a same-dataset time column yields a
+		// time-of-day question ("What is the volume by time of day?"), the trading-data case where
+		// date and time are split into separate columns.
+		if len(sameDataset(timeOfDay, nc.dataset.ID)) > 0 {
+			add("What is the " + name + " by time of day?")
+		}
+	}
+
+	// Time-of-day questions from time columns (e.g. trading session times), FEAT-050.
+	for _, tc := range timeOfDay {
+		name := displayName(tc.col.Name)
+		add("What are the most common " + name + " values?")
 	}
 
 	// Distribution / top-value questions from categorical columns.

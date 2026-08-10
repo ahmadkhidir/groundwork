@@ -233,6 +233,7 @@ var validInferredTypes = map[string]domain.InferredType{
 	"number":    domain.TypeNumber,
 	"boolean":   domain.TypeBoolean,
 	"date":      domain.TypeDate,
+	"time":      domain.TypeTime,
 	"timestamp": domain.TypeTimestamp,
 }
 

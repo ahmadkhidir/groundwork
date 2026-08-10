@@ -50,6 +50,7 @@ var candidateTypes = []domain.InferredType{
 	domain.TypeNumber,
 	domain.TypeBoolean,
 	domain.TypeDate,
+	domain.TypeTime,
 	domain.TypeTimestamp,
 }
 
@@ -70,7 +71,12 @@ const confidenceFloor = 0.4
 // DOUBLE subsumes the integer check: any value that coerces to an integer also coerces to a double,
 // and the string branch only asks "could this have been something stricter?", not which stricter
 // type it would have been.
-var stricterThanString = []string{"DOUBLE", "BOOLEAN", "TIMESTAMP", "DATE"}
+//
+// TIME is included because a bare time-of-day value (`09:30:00`) is exactly the column that
+// otherwise looks like free text here: it coerces to neither DOUBLE, BOOLEAN, TIMESTAMP, nor DATE,
+// so without TIME its string fit rate would read HIGH — the silent-wrongness the time type exists
+// to prevent (trading data splits date and time into separate columns).
+var stricterThanString = []string{"DOUBLE", "BOOLEAN", "TIMESTAMP", "TIME", "DATE"}
 
 // coercionTargetSQL maps schema.md's InferredType enum to the SQL type a value must coerce to for it
 // to count as agreeing with that inference.
@@ -81,6 +87,7 @@ var stricterThanString = []string{"DOUBLE", "BOOLEAN", "TIMESTAMP", "DATE"}
 var coercionTargetSQL = map[domain.InferredType]string{
 	domain.TypeBoolean:   "BOOLEAN",
 	domain.TypeDate:      "DATE",
+	domain.TypeTime:      "TIME",
 	domain.TypeTimestamp: "TIMESTAMP",
 	domain.TypeInteger:   "HUGEINT",
 	domain.TypeNumber:    "DOUBLE",
@@ -218,9 +225,9 @@ type columnAggregates struct {
 //
 // Two branches, exactly as FEAT-005 specifies:
 //
-//   - boolean/date/timestamp/integer/number: values that coerce to the inferred type without loss.
-//     TRY_CAST yields NULL rather than erroring on failure, which is what makes this expressible as
-//     a FILTER clause inside the existing combined query.
+//   - boolean/date/time/timestamp/integer/number: values that coerce to the inferred type without
+//     loss. TRY_CAST yields NULL rather than erroring on failure, which is what makes this
+//     expressible as a FILTER clause inside the existing combined query.
 //   - string: DuckDB's fallback, chosen once every stricter type was tried and rejected. Agreement
 //     is the fraction of values that do NOT also coerce to one of those stricter types. Free text
 //     coerces to none of them and scores 1.0; a mostly-numeric column scores near 0, surfacing the
@@ -344,8 +351,14 @@ func mapDuckDBType(duckType string) domain.InferredType {
 		return domain.TypeBoolean
 	case t == "DATE":
 		return domain.TypeDate
+	// TIMESTAMP must be matched before the TIME cases: "TIMESTAMP..." starts with the substring
+	// "TIME", and DuckDB's DESCRIBE reports the full type name.
 	case strings.HasPrefix(t, "TIMESTAMP"):
 		return domain.TypeTimestamp
+	case t == "TIME" || strings.HasPrefix(t, "TIME "):
+		// Bare time-of-day (TIME) and TIME WITH TIME ZONE (TIMETZ) — a split date/time pair in
+		// trading-style data. Coerced to the product's `time` type, reviewable on screens/07.
+		return domain.TypeTime
 	case isIntegerType(t):
 		return domain.TypeInteger
 	case isNumberType(t):

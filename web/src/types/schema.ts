@@ -82,6 +82,7 @@ export const InferredType = {
   Number: "number",
   Boolean: "boolean",
   Date: "date",
+  Time: "time",
   Timestamp: "timestamp",
 } as const;
 export type InferredType = (typeof InferredType)[keyof typeof InferredType];

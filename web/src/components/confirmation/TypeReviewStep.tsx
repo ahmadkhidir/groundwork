@@ -24,6 +24,9 @@ const TYPE_OPTIONS: { value: string; label: string }[] = [
   { value: InferredType.Number, label: "Decimal number" },
   { value: InferredType.Boolean, label: "True/false" },
   { value: InferredType.Date, label: "Date" },
+  // A bare time-of-day column (e.g. trading data's split Date + Time columns) is its own type,
+  // distinct from "Date & time" — a `09:30:00` value cannot coerce to DATE or TIMESTAMP.
+  { value: InferredType.Time, label: "Time" },
   { value: InferredType.Timestamp, label: "Date & time" },
 ];
 

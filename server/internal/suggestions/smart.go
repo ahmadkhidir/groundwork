@@ -72,7 +72,11 @@ func Profile(ctx context.Context, h profiler, datasets []domain.Dataset, columns
 		p := model.SuggestionsProfile{Column: sc.col.Name, Type: string(sc.col.InferredType)}
 		quoted := quoteIdent(sc.col.Name)
 		switch sc.col.InferredType {
-		case domain.TypeString, domain.TypeBoolean:
+		case domain.TypeString, domain.TypeBoolean, domain.TypeTime:
+			// Time columns profile like low-cardinality categoricals for the model's purposes:
+			// top distinct times with counts (e.g. "09:30:00" × 500) is exactly what a
+			// time-of-day question can be grounded in. FEAT-050's profiler payload is what the
+			// model may reference as question subjects, so this keeps `time` columns eligible.
 			rows, err := h.Query(ctx,
 				`SELECT CAST(`+quoted+` AS VARCHAR) AS v, COUNT(*) AS c FROM `+sc.view+
 					` WHERE `+quoted+` IS NOT NULL GROUP BY `+quoted+` ORDER BY c DESC LIMIT 5`)
