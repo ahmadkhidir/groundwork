@@ -264,56 +264,83 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.router.ServeHTTP(w, r)
 }
 
+// Request-timeout ceilings (chi's Timeout middleware cancels the request context and answers 504
+// Gateway Timeout when a handler outlives its deadline).
+//
+// The general ceiling stays deliberately short: the run and ingest SSE streams are designed around
+// it (see handleStreamRun's doc — "this stream's 60s request timeout"), so raising it globally would
+// silently change the stream contract. Long-running routes — file upload (a 500 MB body over a slow
+// link legitimately takes minutes) and smart question generation (engine wake + dataset downloads +
+// profiling + a model call) — get their own much longer ceiling via a separate middleware group.
+const (
+	defaultRequestTimeout = 60 * time.Second
+	longRequestTimeout    = 15 * time.Minute
+)
+
 // routes registers middleware and every endpoint.
 //
 // Middleware order is significant: RequestID must come first so every later log line and error
 // response can carry the correlation id, and Recoverer must wrap the handlers so a panic becomes a
 // 500 rather than killing the process.
+//
+// The timeout middleware is applied per group, NOT globally, so long-running routes (uploads, smart
+// generation) can exceed the default ceiling without raising it for every other endpoint.
 func (s *Server) routes() {
 	s.router.Use(middleware.RequestID)
 	s.router.Use(middleware.RealIP)
 	s.router.Use(s.requestLogger)
 	s.router.Use(middleware.Recoverer)
-	s.router.Use(middleware.Timeout(60 * time.Second))
 	s.router.Use(s.cors)
 
 	// Liveness and readiness. Deliberately unauthenticated: a health check that requires a session
 	// cannot be used by a load balancer.
-	s.router.Get("/healthz", s.handleHealth)
+	s.router.Group(func(r chi.Router) {
+		r.Use(middleware.Timeout(defaultRequestTimeout))
+		r.Get("/healthz", s.handleHealth)
+	})
 
 	s.router.Route("/v1", func(r chi.Router) {
-		// FEAT-001: signup, login (credential verification for the Next.js Credentials provider —
-		// the web layer never reads the users table itself, per architecture.md's boundary rule),
-		// and password reset.
-		if s.authService != nil {
-			RegisterAuthRoutes(r, s.authService, s.logger)
-		}
+		// Public group — no session required, fast by nature, still bounded so a slow client
+		// cannot hold connections open indefinitely.
+		r.Group(func(r chi.Router) {
+			r.Use(middleware.Timeout(defaultRequestTimeout))
 
-		// FEAT-046's UNAUTHENTICATED shared-report read: GET /v1/shared/reports/:shareToken.
-		// Deliberately registered on the public /v1 group, OUTSIDE authsession.RequireAuth — access
-		// is scoped to possession of the share token, not account identity (user_flow.md's
-		// Authentication Gate). The handler only reads through the narrow ShareLookupStore seam and
-		// never leaks the workspace id.
-		if s.deps.Reports != nil && s.deps.ShareLookup != nil && s.deps.Provenance != nil && s.deps.RunSteps != nil {
-			RegisterPublicShareRoutes(r, s.deps.Reports, s.deps.ShareLookup, s.deps.Provenance, s.deps.RunSteps, s.logger)
-		}
+			// FEAT-001: signup, login (credential verification for the Next.js Credentials provider —
+			// the web layer never reads the users table itself, per architecture.md's boundary rule),
+			// and password reset.
+			if s.authService != nil {
+				RegisterAuthRoutes(r, s.authService, s.logger)
+			}
 
-		// Billing milestone, pass 2: Stripe's UNAUTHENTICATED webhook delivery. Stripe has no
-		// Auth.js session cookie — the endpoint self-authenticates by verifying the Stripe-Signature
-		// header with STRIPE_WEBHOOK_SECRET (RegisterStripeWebhookRoute's handler rejects
-		// unsigned/invalid signatures with 400). Registered on the public /v1 group for that reason.
-		if s.deps.BillingUsers != nil && s.deps.BillingEvents != nil && s.deps.BillingClient != nil {
-			RegisterStripeWebhookRoute(r, s.deps.BillingUsers, s.deps.BillingEvents, s.deps.BillingClient,
-				s.cfg.StripeWebhookSecret, s.cfg.StripePricePro, s.cfg.StripePriceTeam, s.logger)
-		}
+			// FEAT-046's UNAUTHENTICATED shared-report read: GET /v1/shared/reports/:shareToken.
+			// Deliberately registered on the public /v1 group, OUTSIDE authsession.RequireAuth — access
+			// is scoped to possession of the share token, not account identity (user_flow.md's
+			// Authentication Gate). The handler only reads through the narrow ShareLookupStore seam and
+			// never leaks the workspace id.
+			if s.deps.Reports != nil && s.deps.ShareLookup != nil && s.deps.Provenance != nil && s.deps.RunSteps != nil {
+				RegisterPublicShareRoutes(r, s.deps.Reports, s.deps.ShareLookup, s.deps.Provenance, s.deps.RunSteps, s.logger)
+			}
+
+			// Billing milestone, pass 2: Stripe's UNAUTHENTICATED webhook delivery. Stripe has no
+			// Auth.js session cookie — the endpoint self-authenticates by verifying the Stripe-Signature
+			// header with STRIPE_WEBHOOK_SECRET (RegisterStripeWebhookRoute's handler rejects
+			// unsigned/invalid signatures with 400). Registered on the public /v1 group for that reason.
+			if s.deps.BillingUsers != nil && s.deps.BillingEvents != nil && s.deps.BillingClient != nil {
+				RegisterStripeWebhookRoute(r, s.deps.BillingUsers, s.deps.BillingEvents, s.deps.BillingClient,
+					s.cfg.StripeWebhookSecret, s.cfg.StripePricePro, s.cfg.StripePriceTeam, s.logger)
+			}
+		})
 
 		// Everything below requires an authenticated session — see internal/authsession's package
 		// doc for why this middleware, not web/src/proxy.ts's redirect, is the actual authorization
 		// boundary. Guarded on deps.Workspaces being wired so a test server built with a zero-value
 		// Dependencies (e.g. this package's own routing/CORS tests) doesn't panic on a nil store.
 		if s.deps.Workspaces != nil {
+			// General authenticated routes — the default ceiling (keeps the SSE streams' designed
+			// bound intact).
 			r.Group(func(r chi.Router) {
 				r.Use(authsession.RequireAuth(s.deps.AuthSecret))
+				r.Use(middleware.Timeout(defaultRequestTimeout))
 
 				// FEAT-052: authenticated password change (the auth endpoints in the public group
 				// are signup/login/reset; this one needs a session).
@@ -324,12 +351,8 @@ func (s *Server) routes() {
 				// FEAT-002: create and list workspaces.
 				RegisterWorkspaceRoutes(r, s.deps.Workspaces, s.deps.Users, s.logger)
 
-				// FEAT-003: file upload.
-				if s.deps.Datasets != nil && s.deps.Objects != nil {
-					RegisterUploadRoutes(r, s.deps.Workspaces, s.deps.MemberLookup, s.deps.Users, s.deps.Datasets, s.deps.Objects, s.cfg.MaxUploadBytes, s.logger)
-				}
-
 				// FEAT-049: pre-upload duplicate-filename check. screens/05-file-upload.md.
+				// (FEAT-003's file upload itself lives in the long-running group below.)
 				if s.deps.DuplicateCheck != nil {
 					RegisterDuplicateCheckRoute(r, s.deps.Workspaces, s.deps.MemberLookup, s.deps.DuplicateCheck, s.logger)
 				}
@@ -378,14 +401,6 @@ func (s *Server) routes() {
 					s.deps.SemanticCorrections != nil && s.deps.SemanticSummary != nil {
 					RegisterSemanticRoutes(r, s.deps.Workspaces, s.deps.MemberLookup, s.deps.Users, s.deps.SemanticRelationships,
 						s.deps.SemanticMetrics, s.deps.SemanticCorrections, s.deps.SemanticSummary, s.logger)
-				}
-
-				// FEAT-050/FEAT-051: question suggestions — deterministic strip (no engine, no model),
-				// the persisted smart-suggestion bucket (list + delete), and the Pro/Team-gated smart
-				// generation that appends to it (engine profile + one model call).
-				if s.deps.Suggestions != nil && s.deps.SuggestionBucket != nil {
-					RegisterSuggestionRoutes(r, s.deps.Workspaces, s.deps.MemberLookup, s.deps.Users, s.deps.Suggestions, s.deps.SuggestionBucket,
-						s.deps.SuggestionEngine, s.deps.SuggestionModel, s.deps.SuggestionObjects, s.logger)
 				}
 
 				// FEAT-013: ask-a-question run lifecycle — create a run and watch it execute.
@@ -471,6 +486,32 @@ func (s *Server) routes() {
 				if s.deps.BillingUsers != nil && s.deps.BillingClient != nil {
 					RegisterBillingRoutes(r, s.deps.BillingUsers, s.deps.BillingClient,
 						s.cfg.StripePricePro, s.cfg.StripePriceTeam, s.cfg.AllowedOrigin, s.logger)
+				}
+			})
+
+			// Long-running authenticated routes — a much higher ceiling than the default, because
+			// these endpoints' legitimate latency exceeds it:
+			//   - FEAT-003 file upload: a 500 MB multipart body over a slow link takes minutes to
+			//     read, and the read must not be cut off at the default ceiling.
+			//   - FEAT-050/FEAT-051 question suggestions: the smart-generation POST wakes the engine
+			//     (30s), downloads every dataset's Parquet, profiles safe columns, and calls the
+			//     model — all in one request.
+			// Both stay behind RequireAuth; only the timeout ceiling differs.
+			r.Group(func(r chi.Router) {
+				r.Use(authsession.RequireAuth(s.deps.AuthSecret))
+				r.Use(middleware.Timeout(longRequestTimeout))
+
+				// FEAT-003: file upload.
+				if s.deps.Datasets != nil && s.deps.Objects != nil {
+					RegisterUploadRoutes(r, s.deps.Workspaces, s.deps.MemberLookup, s.deps.Users, s.deps.Datasets, s.deps.Objects, s.cfg.MaxUploadBytes, s.logger)
+				}
+
+				// FEAT-050/FEAT-051: question suggestions — deterministic strip (no engine, no model),
+				// the persisted smart-suggestion bucket (list + delete), and the Pro/Team-gated smart
+				// generation that appends to it (engine profile + one model call).
+				if s.deps.Suggestions != nil && s.deps.SuggestionBucket != nil {
+					RegisterSuggestionRoutes(r, s.deps.Workspaces, s.deps.MemberLookup, s.deps.Users, s.deps.Suggestions, s.deps.SuggestionBucket,
+						s.deps.SuggestionEngine, s.deps.SuggestionModel, s.deps.SuggestionObjects, s.logger)
 				}
 			})
 		}

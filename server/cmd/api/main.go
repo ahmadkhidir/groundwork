@@ -318,9 +318,16 @@ func run(logger *slog.Logger) error {
 		// Timeouts are set explicitly: Go's defaults are none, which leaves the service open to
 		// slow-client resource exhaustion.
 		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
+		// ReadTimeout must cover the largest legitimate upload body (500 MB by default) over a
+		// slow link — 30s cut 500 MB files off mid-read at anything below ~17 MB/s. 15 minutes
+		// covers ~4.4 Mbps and above; ReadHeaderTimeout still bounds the header phase, and normal
+		// API calls have tiny bodies so they are unaffected.
+		ReadTimeout: 15 * time.Minute,
 		// Generous, because ingest uploads and long analytical queries legitimately take a while.
-		WriteTimeout: 5 * time.Minute,
+		// Go's write deadline starts when the request headers are read, so a long upload body read
+		// leaves little of the old 5-minute budget for the response write itself — 20 minutes gives
+		// that final JSON write real headroom after a 15-minute body read.
+		WriteTimeout: 20 * time.Minute,
 		IdleTimeout:  120 * time.Second,
 	}
 
