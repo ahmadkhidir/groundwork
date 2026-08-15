@@ -2,6 +2,7 @@ package suggestions
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -104,12 +105,19 @@ func Profile(ctx context.Context, h profiler, datasets []domain.Dataset, columns
 				return nil, fmt.Errorf("profiling %s numeric range: %w", sc.col.Name, err)
 			}
 			if rows.Next() {
-				var min, max, avg float64
+				// MIN/MAX/AVG over an empty table (or a fully-NULL column) returns a single row of
+				// SQL NULLs — DuckDB follows the standard. Scanning that into float64 fails, and
+				// one empty column must not 500 the whole generation, so scan as nullable and only
+				// record an observed range when all three are present. An all-NULL column is honest
+				// as name-and-type only: there is no observed range to ground a question in.
+				var min, max, avg sql.NullFloat64
 				if err := rows.Scan(&min, &max, &avg); err != nil {
 					rows.Close()
 					return nil, fmt.Errorf("scanning %s numeric range: %w", sc.col.Name, err)
 				}
-				p.Numeric = &model.NumericRange{Min: min, Max: max, Avg: avg}
+				if min.Valid && max.Valid && avg.Valid {
+					p.Numeric = &model.NumericRange{Min: min.Float64, Max: max.Float64, Avg: avg.Float64}
+				}
 			}
 			if err := rows.Err(); err != nil {
 				rows.Close()

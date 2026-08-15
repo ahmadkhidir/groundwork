@@ -50,6 +50,26 @@ type SmartState =
   | { status: "error"; message: string };
 
 /**
+ * Shapes a smart-generation failure into something a user can act on.
+ *
+ * The API client falls back to "Request failed with status N" when the error body is not JSON (a
+ * panic or a proxy in front of the API) — that is not a useful message, so a 5xx fallback is
+ * replaced with plain language. Every ApiError that carries a request id (the server now echoes it
+ * in the error body and the x-request-id header) gets it appended, so the user can report the
+ * failure and support can match it against the server request log.
+ */
+function smartGenerationErrorMessage(error: unknown): string {
+  if (error instanceof ApiError) {
+    const base =
+      error.status >= 500 && error.message.startsWith("Request failed with status")
+        ? "Something went wrong while generating questions. Try again."
+        : error.message;
+    return error.requestId ? `${base} Reference: ${error.requestId}` : base;
+  }
+  return "Something went wrong. Try again.";
+}
+
+/**
  * FEAT-050 + FEAT-051's question-suggestions strip (screens/04-workspace-home.md, docs commit
  * ef8f3bd): suggested-question chips below the Ask input, laid out MULTILINE (flex-wrap) inside a
  * horizontally scrollable container — an accumulated bucket is long, so it wraps onto several rows
@@ -122,10 +142,10 @@ export function QuestionSuggestions({ workspaceId, onFill, tier }: QuestionSugge
     } catch (error) {
       if (!mounted.current) return;
       // A failure leaves the deterministic strip and any existing bucket rows usable — keep them,
-      // surface the error.
+      // surface the error (with a correlation id when the server supplied one).
       setSmartState({
         status: "error",
-        message: error instanceof ApiError ? error.message : "Something went wrong. Try again.",
+        message: smartGenerationErrorMessage(error),
       });
     }
   }, [smartState.status, workspaceId]);

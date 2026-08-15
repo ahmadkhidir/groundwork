@@ -8,6 +8,7 @@ import (
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/ahmadkhidir/groundwork/server/internal/domain"
 	"github.com/ahmadkhidir/groundwork/server/internal/engine"
@@ -76,6 +77,18 @@ func toPublicSuggestions(rows []domain.SuggestionQuestion) []publicSuggestionQue
 	return out
 }
 
+// suggestionError writes an error response carrying the request's correlation id in the body. The
+// web tier reads the x-request-id header when CORS exposes it, but the body copy is the reliable
+// transport through every proxy — a user who hits a 5xx can report the id and support can match it
+// against the request log (api.go's requestLogger).
+func suggestionError(w http.ResponseWriter, r *http.Request, status int, message, code string) {
+	body := map[string]string{"error": message, "code": code}
+	if reqID := middleware.GetReqID(r.Context()); reqID != "" {
+		body["request_id"] = reqID
+	}
+	respondJSON(w, status, body)
+}
+
 // RegisterSuggestionRoutes wires FEAT-050's deterministic read, FEAT-051's smart-generation
 // endpoint, and the persisted smart bucket (list + delete) onto r. The smart endpoint is registered
 // only when every collaborator it needs is wired (users, engine, model, objects) — otherwise only
@@ -110,20 +123,14 @@ func handleListSuggestions(workspaces WorkspaceStore, members MemberLookupStore,
 		suggested, err := suggestions.Generate(r.Context(), workspaceID, source)
 		if err != nil {
 			logger.Error("generating question suggestions", slog.String("error", err.Error()))
-			respondJSON(w, http.StatusInternalServerError, map[string]string{
-				"error": "Something went wrong. Try again.",
-				"code":  "internal_error",
-			})
+			suggestionError(w, r, http.StatusInternalServerError, "Something went wrong. Try again.", "internal_error")
 			return
 		}
 
 		bucketRows, err := bucket.ListByWorkspace(r.Context(), workspaceID)
 		if err != nil {
 			logger.Error("listing smart suggestion bucket", slog.String("error", err.Error()))
-			respondJSON(w, http.StatusInternalServerError, map[string]string{
-				"error": "Something went wrong. Try again.",
-				"code":  "internal_error",
-			})
+			suggestionError(w, r, http.StatusInternalServerError, "Something went wrong. Try again.", "internal_error")
 			return
 		}
 
@@ -173,10 +180,7 @@ func handleSmartSuggestions(
 		if err != nil {
 			logger.Error("looking up user for smart-generation tier gate",
 				slog.String("workspace_id", workspaceID), slog.String("error", err.Error()))
-			respondJSON(w, http.StatusInternalServerError, map[string]string{
-				"error": "Something went wrong. Try again.",
-				"code":  "internal_error",
-			})
+			suggestionError(w, r, http.StatusInternalServerError, "Something went wrong. Try again.", "internal_error")
 			return
 		}
 		if user.Tier != domain.TierPro && user.Tier != domain.TierTeam {
@@ -191,26 +195,26 @@ func handleSmartSuggestions(
 		datasets, err := source.Datasets(r.Context(), workspaceID)
 		if err != nil {
 			logger.Error("listing datasets for smart suggestions", slog.String("error", err.Error()))
-			respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "Something went wrong. Try again.", "code": "internal_error"})
+			suggestionError(w, r, http.StatusInternalServerError, "Something went wrong. Try again.", "internal_error")
 			return
 		}
 		columns, err := source.Columns(r.Context(), workspaceID)
 		if err != nil {
 			logger.Error("listing columns for smart suggestions", slog.String("error", err.Error()))
-			respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "Something went wrong. Try again.", "code": "internal_error"})
+			suggestionError(w, r, http.StatusInternalServerError, "Something went wrong. Try again.", "internal_error")
 			return
 		}
 		metrics, err := source.Metrics(r.Context(), workspaceID)
 		if err != nil {
 			logger.Error("listing metric definitions for smart suggestions", slog.String("error", err.Error()))
-			respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "Something went wrong. Try again.", "code": "internal_error"})
+			suggestionError(w, r, http.StatusInternalServerError, "Something went wrong. Try again.", "internal_error")
 			return
 		}
 
 		candidates, err := suggestions.Generate(r.Context(), workspaceID, source)
 		if err != nil {
 			logger.Error("generating candidate suggestions", slog.String("error", err.Error()))
-			respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "Something went wrong. Try again.", "code": "internal_error"})
+			suggestionError(w, r, http.StatusInternalServerError, "Something went wrong. Try again.", "internal_error")
 			return
 		}
 
@@ -219,7 +223,7 @@ func handleSmartSuggestions(
 		bucketRows, err := bucket.ListByWorkspace(r.Context(), workspaceID)
 		if err != nil {
 			logger.Error("listing smart suggestion bucket for generation", slog.String("error", err.Error()))
-			respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "Something went wrong. Try again.", "code": "internal_error"})
+			suggestionError(w, r, http.StatusInternalServerError, "Something went wrong. Try again.", "internal_error")
 			return
 		}
 
@@ -229,14 +233,11 @@ func handleSmartSuggestions(
 		handle, err := engineProvider.Acquire(r.Context(), workspaceID)
 		if err != nil {
 			if err == engine.ErrEngineUnavailable {
-				respondJSON(w, http.StatusServiceUnavailable, map[string]string{
-					"error": "The engine is taking longer than usual to wake. Try again.",
-					"code":  "engine_unavailable",
-				})
+				suggestionError(w, r, http.StatusServiceUnavailable, "The engine is taking longer than usual to wake. Try again.", "engine_unavailable")
 				return
 			}
 			logger.Error("acquiring engine for smart suggestions", slog.String("error", err.Error()))
-			respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "Something went wrong. Try again.", "code": "internal_error"})
+			suggestionError(w, r, http.StatusInternalServerError, "Something went wrong. Try again.", "internal_error")
 			return
 		}
 		cleanups, viewErr := run.PrepareViews(r.Context(), handle, workspaceID, datasets, objects)
@@ -246,7 +247,7 @@ func handleSmartSuggestions(
 				logger.Error("releasing engine after view attach failure", slog.String("error", releaseErr.Error()))
 			}
 			logger.Error("attaching engine views for smart suggestions", slog.String("error", viewErr.Error()))
-			respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "Something went wrong. Try again.", "code": "internal_error"})
+			suggestionError(w, r, http.StatusInternalServerError, "Couldn't read your data to generate questions. Try again.", "data_unavailable")
 			return
 		}
 		profiles, profileErr := suggestions.Profile(r.Context(), handle, datasets, columns)
@@ -256,7 +257,7 @@ func handleSmartSuggestions(
 		releaseErr := engineProvider.Release(handle)
 		if profileErr != nil {
 			logger.Error("profiling for smart suggestions", slog.String("error", profileErr.Error()))
-			respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "Something went wrong. Try again.", "code": "internal_error"})
+			suggestionError(w, r, http.StatusInternalServerError, "Couldn't read your data to generate questions. Try again.", "data_unavailable")
 			return
 		}
 		if releaseErr != nil {
@@ -269,20 +270,14 @@ func handleSmartSuggestions(
 		text, err := modelClient.Complete(r.Context(), workspaceID, claims.UserID, suggestions.SuggestionsSystemPrompt, payload)
 		if err != nil {
 			logger.Error("smart suggestion model call", slog.String("error", err.Error()))
-			respondJSON(w, http.StatusBadGateway, map[string]string{
-				"error": "Could not generate smart questions right now. Try again.",
-				"code":  "model_error",
-			})
+			suggestionError(w, r, http.StatusBadGateway, "Could not generate smart questions right now. Try again.", "model_error")
 			return
 		}
 
 		smart, err := suggestions.ParseModelResponse(text, safeColumnNames(columns), metricNames(metrics))
 		if err != nil {
 			logger.Error("parsing smart suggestion response", slog.String("error", err.Error()))
-			respondJSON(w, http.StatusBadGateway, map[string]string{
-				"error": "Could not generate smart questions right now. Try again.",
-				"code":  "model_error",
-			})
+			suggestionError(w, r, http.StatusBadGateway, "Could not generate smart questions right now. Try again.", "model_error")
 			return
 		}
 
@@ -307,7 +302,7 @@ func handleSmartSuggestions(
 		bucketRows, err = bucket.Add(r.Context(), workspaceID, fresh)
 		if err != nil {
 			logger.Error("persisting smart suggestions", slog.String("error", err.Error()))
-			respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "Something went wrong. Try again.", "code": "internal_error"})
+			suggestionError(w, r, http.StatusInternalServerError, "Something went wrong. Try again.", "internal_error")
 			return
 		}
 
@@ -342,7 +337,7 @@ func handleDeleteSuggestion(workspaces WorkspaceStore, members MemberLookupStore
 				return
 			}
 			logger.Error("deleting smart suggestion", slog.String("error", err.Error()))
-			respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "Something went wrong. Try again.", "code": "internal_error"})
+			suggestionError(w, r, http.StatusInternalServerError, "Something went wrong. Try again.", "internal_error")
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)

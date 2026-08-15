@@ -186,4 +186,40 @@ describe("QuestionSuggestions", () => {
     expect(screen.getByText("What is the total total amount?")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Try again/ })).toBeInTheDocument();
   });
+
+  it("replaces the opaque 5xx fallback with a plain-language smart-generation error", async () => {
+    getMock.mockResolvedValue({ suggestions: SUGGESTIONS, smart: [] });
+    // A panic or proxy returns a non-JSON 500, so the API client falls back to the status-derived
+    // message — that must not reach the user verbatim.
+    postMock.mockRejectedValue(new ApiError(500, "Request failed with status 500"));
+    const user = userEvent.setup();
+    render(<QuestionSuggestions workspaceId="ws-1" onFill={vi.fn()} tier="pro" />);
+
+    await screen.findByText("What is the total total amount?");
+    await user.click(screen.getByRole("button", { name: /Generate smarter questions/ }));
+
+    await waitFor(() =>
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "Something went wrong while generating questions. Try again.",
+      ),
+    );
+    expect(screen.queryByText(/Request failed with status/)).not.toBeInTheDocument();
+  });
+
+  it("appends the request reference id so a smart-generation failure can be reported", async () => {
+    getMock.mockResolvedValue({ suggestions: SUGGESTIONS, smart: [] });
+    postMock.mockRejectedValue(
+      new ApiError(500, "Couldn't read your data to generate questions. Try again.", "data_unavailable", "req-abc123"),
+    );
+    const user = userEvent.setup();
+    render(<QuestionSuggestions workspaceId="ws-1" onFill={vi.fn()} tier="pro" />);
+
+    await screen.findByText("What is the total total amount?");
+    await user.click(screen.getByRole("button", { name: /Generate smarter questions/ }));
+
+    await waitFor(() =>
+      expect(screen.getByRole("alert")).toHaveTextContent(/couldn't read your data to generate questions/i),
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent("Reference: req-abc123");
+  });
 });

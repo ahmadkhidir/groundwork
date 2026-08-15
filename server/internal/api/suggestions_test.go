@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/ahmadkhidir/groundwork/server/internal/authsession"
 	"github.com/ahmadkhidir/groundwork/server/internal/domain"
@@ -52,6 +53,9 @@ func newTestSuggestionsRouter(workspaces WorkspaceStore, members MemberLookupSto
 
 func newTestSuggestionsRouterWithSmart(workspaces WorkspaceStore, members MemberLookupStore, source SuggestionSource, bucket SuggestionBucket, engineProvider SuggestionEngineProvider, modelClient SmartSuggestionModel, objects ObjectGetter, users UserTierLookup) http.Handler {
 	r := chi.NewRouter()
+	// RequestID runs in production (api.go routes()), and suggestionError embeds the correlation id
+	// in error bodies — including it here lets the error-shape tests assert the id is present.
+	r.Use(middleware.RequestID)
 	r.Route("/v1", func(r chi.Router) {
 		r.Group(func(r chi.Router) {
 			r.Use(authsession.RequireAuth(testAuthSecret))
@@ -121,6 +125,14 @@ type fakeObjectGetter struct{}
 
 func (f *fakeObjectGetter) GetObject(_ context.Context, _ string) (io.ReadCloser, error) {
 	return io.NopCloser(strings.NewReader("dummy parquet bytes")), nil
+}
+
+// failingObjectGetter models the production case where the normalized Parquet cannot be downloaded
+// (missing object, storage outage) — the view-attach step fails and the handler must say so clearly.
+type failingObjectGetter struct{}
+
+func (f *failingObjectGetter) GetObject(_ context.Context, _ string) (io.ReadCloser, error) {
+	return nil, errors.New("object storage unavailable")
 }
 
 func TestListSuggestionsServesDeterministicMetadataOnlyQuestions(t *testing.T) {
@@ -492,5 +504,44 @@ func TestSmartSuggestionsSurfacesModelFailure(t *testing.T) {
 
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestSmartSuggestionsSurfacesDataUnavailableWithRequestID(t *testing.T) {
+	// The view-attach step (downloading the dataset's normalized Parquet) fails: the user must get
+	// an honest, specific message ("couldn't read your data") rather than a generic 500, and the
+	// response must carry the request id so the report can be matched against server logs.
+	workspaces := newFakeWorkspaceStore()
+	workspaces.byID["ws-1"] = domain.Workspace{ID: "ws-1", OwnerID: "user-1"}
+	users := newFakeUserTierLookup()
+	users.tiers["user-1"] = domain.TierPro
+	router := newTestSuggestionsRouterWithSmart(workspaces, newFakeMemberLookupStore(), &fakeSuggestionSource{
+		datasets: []domain.Dataset{{ID: "ds-1", OriginalFilename: "x.csv", IngestStatus: domain.IngestComplete}},
+		columns:  []domain.Column{{ID: "c-1", DatasetID: "ds-1", Name: "amount", InferredType: domain.TypeNumber}},
+	}, &fakeSuggestionBucket{}, &fakeSmartEngine{}, &fakeSmartModel{}, &failingObjectGetter{}, users)
+
+	req := authedRequest(t, http.MethodPost, "/v1/workspaces/ws-1/suggestions/smart", nil, "user-1", domain.TierPro)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body: %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Error     string `json:"error"`
+		Code      string `json:"code"`
+		RequestID string `json:"request_id"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decoding body: %v", err)
+	}
+	if body.Code != "data_unavailable" {
+		t.Errorf("code = %q, want data_unavailable", body.Code)
+	}
+	if body.Error != "Couldn't read your data to generate questions. Try again." {
+		t.Errorf("error = %q, want the data-read message", body.Error)
+	}
+	if body.RequestID == "" {
+		t.Error("request_id missing from the error body — a user cannot report this error")
 	}
 }

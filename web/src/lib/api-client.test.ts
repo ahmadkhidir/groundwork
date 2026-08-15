@@ -100,6 +100,28 @@ describe("api bearer transport", () => {
     expect(fetchMock.mock.calls[1][1]!.credentials).toBe("include");
   });
 
+  it("reads request_id from the error body when the response header is not exposed (cross-origin)", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ token: "jwe-1" }))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            error: "Something went wrong. Try again.",
+            code: "internal_error",
+            request_id: "req-body-42",
+          }),
+          { status: 500, headers: { "Content-Type": "application/json" } },
+        ),
+      );
+    const { api } = await freshClient();
+
+    await expect(api.get("/v1/workspaces")).rejects.toMatchObject({
+      status: 500,
+      message: "Something went wrong. Try again.",
+      requestId: "req-body-42",
+    });
+  });
+
   it("subscribes to an SSE stream via fetch with the bearer header (EventSource cannot set headers)", async () => {
     const source = new MockStreamSource();
     fetchMock

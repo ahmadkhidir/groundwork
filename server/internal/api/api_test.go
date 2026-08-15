@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/ahmadkhidir/groundwork/server/internal/config"
@@ -93,6 +94,13 @@ func TestCORSAllowsTheConfiguredOriginWithCredentials(t *testing.T) {
 	}
 	if rec.Header().Get("Access-Control-Allow-Credentials") != "true" {
 		t.Error("Allow-Credentials must be true: session cookies ride on every API request")
+	}
+
+	// x-request-id must be readable by the cross-origin web tier (Vercel web → Fly API) so a user
+	// can report an error by its correlation id; without Expose-Headers fetch hides it from JS.
+	exposed := rec.Header().Get("Access-Control-Expose-Headers")
+	if !strings.Contains(strings.ToLower(exposed), "x-request-id") {
+		t.Errorf("Expose-Headers = %q, want it to include x-request-id", exposed)
 	}
 }
 

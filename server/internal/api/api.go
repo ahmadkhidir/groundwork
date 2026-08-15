@@ -524,12 +524,18 @@ func (s *Server) requestLogger(next http.Handler) http.Handler {
 // The origin is echoed from configuration rather than reflected from the request, and is never "*":
 // the browser sends session cookies on every API call, and a wildcard origin with credentials is
 // both rejected by browsers and unsafe in principle.
+//
+// Access-Control-Expose-Headers names x-request-id so the web tier (a different origin in
+// production — Vercel web, Fly API) can read the request's correlation id off every response and
+// surface it to the user when an error needs reporting. Without this header, fetch hides
+// x-request-id from JS entirely and ApiError.requestId is empty in production.
 func (s *Server) cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", s.cfg.AllowedOrigin)
 		w.Header().Set("Access-Control-Allow-Credentials", "true")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, PUT, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Expose-Headers", "x-request-id")
 		w.Header().Set("Vary", "Origin")
 
 		if r.Method == http.MethodOptions {

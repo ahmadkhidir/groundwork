@@ -2,6 +2,7 @@ package suggestions
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"strings"
 	"testing"
@@ -26,13 +27,26 @@ func (f *fakeRows) Next() bool {
 func (f *fakeRows) Scan(dest ...any) error {
 	row := f.data[f.idx]
 	for i := range dest {
+		// A nil row value models SQL NULL: it leaves the destination untouched (NullFloat64 stays
+		// invalid, pointer/string destinations stay zero) rather than panicking — the same
+		// database/sql semantics Profile depends on for empty aggregates.
 		switch d := dest[i].(type) {
 		case *string:
-			*d = row[i].(string)
+			if v, ok := row[i].(string); ok {
+				*d = v
+			}
 		case *int64:
-			*d = row[i].(int64)
+			if v, ok := row[i].(int64); ok {
+				*d = v
+			}
 		case *float64:
-			*d = row[i].(float64)
+			if v, ok := row[i].(float64); ok {
+				*d = v
+			}
+		case *sql.NullFloat64:
+			if v, ok := row[i].(float64); ok {
+				*d = sql.NullFloat64{Float64: v, Valid: true}
+			}
 		}
 	}
 	f.idx++
@@ -133,5 +147,34 @@ func TestProfileSurfacesQueryError(t *testing.T) {
 	)
 	if err == nil {
 		t.Error("Profile() returned nil error on a query failure")
+	}
+}
+
+// nullNumericProfiler returns one row of all-NULL aggregates, mirroring DuckDB's MIN/MAX/AVG over an
+// empty table or a fully-NULL column (standard SQL: aggregates without GROUP BY return one row).
+type nullNumericProfiler struct{}
+
+func (f *nullNumericProfiler) Query(_ context.Context, _ string, _ ...any) (engine.Rows, error) {
+	return &fakeRows{data: [][]any{{nil, nil, nil}}}, nil
+}
+
+func TestProfileToleratesAllNullNumericColumn(t *testing.T) {
+	// An all-NULL numeric column must NOT fail the whole generation with a scan error — it profiles
+	// as name-and-type only (no observed range), and the other columns still profile normally.
+	h := &nullNumericProfiler{}
+	datasets := []domain.Dataset{{ID: "ds-1", OriginalFilename: "x.csv", IngestStatus: domain.IngestComplete}}
+	columns := []domain.Column{
+		{ID: "c-1", DatasetID: "ds-1", Name: "empty_amount", InferredType: domain.TypeNumber},
+	}
+
+	profiles, err := Profile(context.Background(), h, datasets, columns)
+	if err != nil {
+		t.Fatalf("Profile() error = %v, want nil for an all-NULL numeric column", err)
+	}
+	if len(profiles) != 1 {
+		t.Fatalf("profiled %d columns, want 1", len(profiles))
+	}
+	if profiles[0].Numeric != nil {
+		t.Errorf("Numeric = %+v, want nil (no observed range for an all-NULL column)", profiles[0].Numeric)
 	}
 }

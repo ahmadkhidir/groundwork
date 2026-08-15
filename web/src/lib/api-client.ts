@@ -113,6 +113,12 @@ interface ApiErrorBody {
   error?: string;
   message?: string;
   code?: string;
+  /**
+   * The request's correlation id, mirrored into the body by api.go's error helper. The
+   * x-request-id header is the primary transport (CORS now exposes it), but the body copy works
+   * through proxies that strip headers — so a user can always report an error by id.
+   */
+  request_id?: string;
 }
 
 export interface RequestOptions {
@@ -199,7 +205,7 @@ async function request<TResponse>(
     break;
   }
 
-  const requestId = response.headers.get("x-request-id") ?? "";
+  let requestId = response.headers.get("x-request-id") ?? "";
 
   if (!response.ok) {
     let message = `Request failed with status ${response.status}`;
@@ -210,6 +216,7 @@ async function request<TResponse>(
       const parsed = (await response.json()) as ApiErrorBody;
       message = parsed.error ?? parsed.message ?? message;
       code = parsed.code ?? "";
+      requestId = parsed.request_id ?? requestId;
     } catch {
       // Keep the status-derived message.
     }
