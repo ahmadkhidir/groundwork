@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"testing"
 	"time"
 
@@ -34,11 +35,20 @@ func (f *fakeWorkspaceStore) Create(ctx context.Context, ws domain.Workspace) er
 }
 
 func (f *fakeWorkspaceStore) ListByOwner(ctx context.Context, ownerID string) ([]domain.Workspace, error) {
-	var out []domain.Workspace
-	for _, ws := range f.byID {
+	// Deterministic order (by id), mirroring the real repository's ListByOwner contract — the
+	// postgres store orders deterministically (ORDER BY updated_at DESC), and a map iteration here
+	// made every consumer of this fake (account deletion's cascade, billing access) order-dependent
+	// and flaky under test.
+	ids := make([]string, 0, len(f.byID))
+	for id, ws := range f.byID {
 		if ws.OwnerID == ownerID {
-			out = append(out, ws)
+			ids = append(ids, id)
 		}
+	}
+	sort.Strings(ids)
+	out := make([]domain.Workspace, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, f.byID[id])
 	}
 	return out, nil
 }
