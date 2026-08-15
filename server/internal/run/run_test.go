@@ -296,8 +296,14 @@ func (f *fakeHandle) Query(_ context.Context, sql string, _ ...any) (engine.Rows
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.queried = append(f.queried, sql)
-	if f.describeRows != nil && strings.HasPrefix(sql, "DESCRIBE ") {
-		return &fakeRows{cols: []string{"column_name", "column_type", "null", "key", "default", "extra"}, rows: f.describeRows}, nil
+	// DESCRIBE (the physical-type backfill) must never consume the shared `rows` cursor — fakeRows
+	// is stateful, and a later execute query reuses it. Without describeRows configured, DESCRIBE
+	// returns an empty result so the backfill is a no-op.
+	if strings.HasPrefix(sql, "DESCRIBE ") {
+		if f.describeRows != nil {
+			return &fakeRows{cols: []string{"column_name", "column_type", "null", "key", "default", "extra"}, rows: f.describeRows}, nil
+		}
+		return &fakeRows{cols: []string{"column_name", "column_type", "null", "key", "default", "extra"}}, nil
 	}
 	if f.sumRows != nil && strings.HasPrefix(sql, "SELECT sum(") {
 		return &fakeRows{cols: []string{"sum"}, rows: f.sumRows}, nil
@@ -1351,9 +1357,9 @@ func TestPrepareViewsBackfillsPhysicalColumnTypes(t *testing.T) {
 	columns := &fakeColumnStore{byDataset: map[string][]domain.Column{
 		"ds-1": {
 			// The production case: S/N is overridden to number, but the engine stores it as text.
-			{ID: "col-sn", Name: "S/N", InferredType: domain.TypeNumber},
-			{ID: "col-amt", Name: "amount", InferredType: domain.TypeNumber},
-			{ID: "col-region", Name: "region", InferredType: domain.TypeString},
+			{ID: "col-sn", DatasetID: "ds-1", Name: "S/N", InferredType: domain.TypeNumber},
+			{ID: "col-amt", DatasetID: "ds-1", Name: "amount", InferredType: domain.TypeNumber},
+			{ID: "col-region", DatasetID: "ds-1", Name: "region", InferredType: domain.TypeString},
 		},
 	}}
 	executor.columns = columns
