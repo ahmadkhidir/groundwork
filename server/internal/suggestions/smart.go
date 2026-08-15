@@ -44,6 +44,11 @@ type profiler interface {
 // Only safe columns are profiled: a PII-flagged or excluded column is skipped entirely (never even
 // queried), matching FEAT-051's privacy rule. The queries are engine work (metered engine-seconds),
 // never model calls.
+//
+// The engine's ACTUAL column type is authoritative over the inferred metadata: a column whose real
+// type does not match its inferred type (a bank "S/N" column inferred numeric but stored as text,
+// say) must not abort the whole generation — the numeric profile falls back to a categorical
+// profile so the model still gets usable grounding.
 func Profile(ctx context.Context, h profiler, datasets []domain.Dataset, columns []domain.Column) ([]model.SuggestionsProfile, error) {
 	// Index safe columns by dataset for the per-view queries.
 	type safeCol struct {
@@ -71,83 +76,119 @@ func Profile(ctx context.Context, h profiler, datasets []domain.Dataset, columns
 	out := make([]model.SuggestionsProfile, 0, len(safe))
 	for _, sc := range safe {
 		p := model.SuggestionsProfile{Column: sc.col.Name, Type: string(sc.col.InferredType)}
-		quoted := quoteIdent(sc.col.Name)
 		switch sc.col.InferredType {
 		case domain.TypeString, domain.TypeBoolean, domain.TypeTime:
 			// Time columns profile like low-cardinality categoricals for the model's purposes:
 			// top distinct times with counts (e.g. "09:30:00" × 500) is exactly what a
 			// time-of-day question can be grounded in. FEAT-050's profiler payload is what the
 			// model may reference as question subjects, so this keeps `time` columns eligible.
-			rows, err := h.Query(ctx,
-				`SELECT CAST(`+quoted+` AS VARCHAR) AS v, COUNT(*) AS c FROM `+sc.view+
-					` WHERE `+quoted+` IS NOT NULL GROUP BY `+quoted+` ORDER BY c DESC LIMIT 5`)
-			if err != nil {
-				return nil, fmt.Errorf("profiling %s top values: %w", sc.col.Name, err)
+			if err := profileTopValues(ctx, h, sc.col, sc.view, &p); err != nil {
+				return nil, err
 			}
-			for rows.Next() {
-				var v string
-				var c int64
-				if err := rows.Scan(&v, &c); err != nil {
-					rows.Close()
-					return nil, fmt.Errorf("scanning %s top values: %w", sc.col.Name, err)
-				}
-				p.TopValues = append(p.TopValues, model.ValueCount{Value: v, Count: c})
-			}
-			if err := rows.Err(); err != nil {
-				rows.Close()
-				return nil, fmt.Errorf("iterating %s top values: %w", sc.col.Name, err)
-			}
-			rows.Close()
 		case domain.TypeInteger, domain.TypeNumber:
-			rows, err := h.Query(ctx,
-				`SELECT MIN(`+quoted+`), MAX(`+quoted+`), AVG(`+quoted+`) FROM `+sc.view)
-			if err != nil {
-				return nil, fmt.Errorf("profiling %s numeric range: %w", sc.col.Name, err)
-			}
-			if rows.Next() {
-				// MIN/MAX/AVG over an empty table (or a fully-NULL column) returns a single row of
-				// SQL NULLs — DuckDB follows the standard. Scanning that into float64 fails, and
-				// one empty column must not 500 the whole generation, so scan as nullable and only
-				// record an observed range when all three are present. An all-NULL column is honest
-				// as name-and-type only: there is no observed range to ground a question in.
-				var min, max, avg sql.NullFloat64
-				if err := rows.Scan(&min, &max, &avg); err != nil {
-					rows.Close()
-					return nil, fmt.Errorf("scanning %s numeric range: %w", sc.col.Name, err)
-				}
-				if min.Valid && max.Valid && avg.Valid {
-					p.Numeric = &model.NumericRange{Min: min.Float64, Max: max.Float64, Avg: avg.Float64}
+			if err := profileNumericRange(ctx, h, sc.col, sc.view, &p); err != nil {
+				// The numeric query failed — the engine column is not actually numeric (e.g.
+				// avg(VARCHAR) has no DuckDB function). Fall back to a categorical profile so
+				// one mis-typed column cannot fail the whole generation; the model is better
+				// served by "what are the most common S/N values?" than by nothing.
+				if ferr := profileTopValues(ctx, h, sc.col, sc.view, &p); ferr != nil {
+					return nil, ferr
 				}
 			}
-			if err := rows.Err(); err != nil {
-				rows.Close()
-				return nil, fmt.Errorf("iterating %s numeric range: %w", sc.col.Name, err)
-			}
-			rows.Close()
 		case domain.TypeDate, domain.TypeTimestamp:
-			rows, err := h.Query(ctx,
-				`SELECT CAST(`+quoted+` AS VARCHAR) AS d FROM `+sc.view+
-					` WHERE `+quoted+` IS NOT NULL ORDER BY `+quoted+` DESC LIMIT 5`)
-			if err != nil {
-				return nil, fmt.Errorf("profiling %s top dates: %w", sc.col.Name, err)
+			if err := profileTopDates(ctx, h, sc.col, sc.view, &p); err != nil {
+				return nil, err
 			}
-			for rows.Next() {
-				var d string
-				if err := rows.Scan(&d); err != nil {
-					rows.Close()
-					return nil, fmt.Errorf("scanning %s top dates: %w", sc.col.Name, err)
-				}
-				p.TopDates = append(p.TopDates, d)
-			}
-			if err := rows.Err(); err != nil {
-				rows.Close()
-				return nil, fmt.Errorf("iterating %s top dates: %w", sc.col.Name, err)
-			}
-			rows.Close()
 		}
 		out = append(out, p)
 	}
 	return out, nil
+}
+
+// profileTopValues fills p with the column's most common non-null values and their counts. The
+// universal fallback: CAST AS VARCHAR + GROUP BY works on every scalar engine type, so it is safe
+// to run for a column whose real type disagrees with its inferred type.
+func profileTopValues(ctx context.Context, h profiler, col domain.Column, view string, p *model.SuggestionsProfile) error {
+	quoted := quoteIdent(col.Name)
+	rows, err := h.Query(ctx,
+		`SELECT CAST(`+quoted+` AS VARCHAR) AS v, COUNT(*) AS c FROM `+view+
+			` WHERE `+quoted+` IS NOT NULL GROUP BY `+quoted+` ORDER BY c DESC LIMIT 5`)
+	if err != nil {
+		return fmt.Errorf("profiling %s top values: %w", col.Name, err)
+	}
+	for rows.Next() {
+		var v string
+		var c int64
+		if err := rows.Scan(&v, &c); err != nil {
+			rows.Close()
+			return fmt.Errorf("scanning %s top values: %w", col.Name, err)
+		}
+		p.TopValues = append(p.TopValues, model.ValueCount{Value: v, Count: c})
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterating %s top values: %w", col.Name, err)
+	}
+	rows.Close()
+	return nil
+}
+
+// profileNumericRange fills p with the column's observed min/max/avg, when one exists.
+//
+// MIN/MAX/AVG over an empty table (or a fully-NULL column) returns a single row of SQL NULLs —
+// DuckDB follows the standard. Scanning that into float64 fails, and one empty column must not 500
+// the whole generation, so scan as nullable and only record an observed range when all three are
+// present. An all-NULL column is honest as name-and-type only: there is no observed range to ground
+// a question in. A column whose real engine type is not numeric (text "S/N" values, say) makes the
+// query itself fail; Profile's caller falls back to profileTopValues.
+func profileNumericRange(ctx context.Context, h profiler, col domain.Column, view string, p *model.SuggestionsProfile) error {
+	quoted := quoteIdent(col.Name)
+	rows, err := h.Query(ctx,
+		`SELECT MIN(`+quoted+`), MAX(`+quoted+`), AVG(`+quoted+`) FROM `+view)
+	if err != nil {
+		return fmt.Errorf("profiling %s numeric range: %w", col.Name, err)
+	}
+	if rows.Next() {
+		var min, max, avg sql.NullFloat64
+		if err := rows.Scan(&min, &max, &avg); err != nil {
+			rows.Close()
+			return fmt.Errorf("scanning %s numeric range: %w", col.Name, err)
+		}
+		if min.Valid && max.Valid && avg.Valid {
+			p.Numeric = &model.NumericRange{Min: min.Float64, Max: max.Float64, Avg: avg.Float64}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterating %s numeric range: %w", col.Name, err)
+	}
+	rows.Close()
+	return nil
+}
+
+// profileTopDates fills p with the column's five most recent non-null values (as strings).
+func profileTopDates(ctx context.Context, h profiler, col domain.Column, view string, p *model.SuggestionsProfile) error {
+	quoted := quoteIdent(col.Name)
+	rows, err := h.Query(ctx,
+		`SELECT CAST(`+quoted+` AS VARCHAR) AS d FROM `+view+
+			` WHERE `+quoted+` IS NOT NULL ORDER BY `+quoted+` DESC LIMIT 5`)
+	if err != nil {
+		return fmt.Errorf("profiling %s top dates: %w", col.Name, err)
+	}
+	for rows.Next() {
+		var d string
+		if err := rows.Scan(&d); err != nil {
+			rows.Close()
+			return fmt.Errorf("scanning %s top dates: %w", col.Name, err)
+		}
+		p.TopDates = append(p.TopDates, d)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterating %s top dates: %w", col.Name, err)
+	}
+	rows.Close()
+	return nil
 }
 
 // ParseModelResponse parses FEAT-051's model output: a JSON array of suggestion strings. It

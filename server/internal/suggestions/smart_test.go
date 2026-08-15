@@ -178,3 +178,42 @@ func TestProfileToleratesAllNullNumericColumn(t *testing.T) {
 		t.Errorf("Numeric = %+v, want nil (no observed range for an all-NULL column)", profiles[0].Numeric)
 	}
 }
+
+// mismatchProfiler models a column whose engine type disagrees with its inferred type: the numeric
+// MIN/MAX/AVG query fails (DuckDB: "No function matches the given name and argument types
+// 'avg(VARCHAR)'") while the categorical fallback query succeeds.
+type mismatchProfiler struct {
+	fallbackRows engine.Rows
+}
+
+func (f *mismatchProfiler) Query(_ context.Context, sql string, _ ...any) (engine.Rows, error) {
+	if strings.Contains(sql, "MIN(") {
+		return nil, errors.New("Binder Error: No function matches the given name and argument types 'avg(VARCHAR)'")
+	}
+	return f.fallbackRows, nil
+}
+
+func TestProfileFallsBackToCategoricalWhenNumericQueryFails(t *testing.T) {
+	// Production regression: a bank statement's "S/N" (serial number) column is inferred numeric but
+	// stored as text, so MIN/MAX/AVG fails at the engine. One mis-typed column must not abort the
+	// whole generation — Profile falls back to top values and the model still gets grounding.
+	h := &mismatchProfiler{fallbackRows: &fakeRows{data: [][]any{{"SN-0001", int64(120)}, {"SN-0002", int64(80)}}}}
+	datasets := []domain.Dataset{{ID: "ds-1", OriginalFilename: "gtbank.csv", IngestStatus: domain.IngestComplete}}
+	columns := []domain.Column{
+		{ID: "c-1", DatasetID: "ds-1", Name: "S/N", InferredType: domain.TypeNumber},
+	}
+
+	profiles, err := Profile(context.Background(), h, datasets, columns)
+	if err != nil {
+		t.Fatalf("Profile() error = %v, want the categorical fallback to succeed", err)
+	}
+	if len(profiles) != 1 {
+		t.Fatalf("profiled %d columns, want 1", len(profiles))
+	}
+	if profiles[0].Numeric != nil {
+		t.Errorf("Numeric = %+v, want nil (the column is not actually numeric)", profiles[0].Numeric)
+	}
+	if len(profiles[0].TopValues) != 2 || profiles[0].TopValues[0].Value != "SN-0001" || profiles[0].TopValues[0].Count != 120 {
+		t.Errorf("TopValues = %+v, want the categorical fallback rows", profiles[0].TopValues)
+	}
+}
