@@ -46,11 +46,12 @@ func (r *ColumnRepository) BulkInsert(ctx context.Context, workspaceID string, c
 	for _, c := range cols {
 		batch.Queue(
 			`INSERT INTO columns
-			   (id, dataset_id, workspace_id, name, inferred_type, type_confidence, type_fit_rates,
+			   (id, dataset_id, workspace_id, name, inferred_type, physical_type, type_confidence, type_fit_rates,
 			    pii_flag, pii_pattern, pii_reviewed_at, type_overridden_at,
 			    excluded_from_model, null_rate, distinct_count)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
-			c.ID, c.DatasetID, workspaceID, c.Name, string(c.InferredType), c.TypeConfidence, fitRatesJSON(c.TypeFitRates),
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+			c.ID, c.DatasetID, workspaceID, c.Name, string(c.InferredType), nullableInferredType(c.PhysicalType),
+			c.TypeConfidence, fitRatesJSON(c.TypeFitRates),
 			c.PIIFlag, c.PIIPattern, nullableTime(c.PIIReviewedAt), nullableTime(c.TypeOverriddenAt),
 			c.ExcludedFromModel, c.NullRate, c.DistinctCount,
 		)
@@ -70,7 +71,7 @@ func (r *ColumnRepository) BulkInsert(ctx context.Context, workspaceID string, c
 // ListByDataset returns every column belonging to datasetID, in stable name order.
 func (r *ColumnRepository) ListByDataset(ctx context.Context, datasetID string) ([]domain.Column, error) {
 	rows, err := r.pool.Query(ctx,
-		`SELECT id, dataset_id, name, inferred_type, type_confidence, type_fit_rates,
+		`SELECT id, dataset_id, name, inferred_type, physical_type, type_confidence, type_fit_rates,
 		        pii_flag, pii_pattern, pii_reviewed_at, type_overridden_at,
 		        excluded_from_model, null_rate, distinct_count
 		 FROM columns WHERE dataset_id = $1 ORDER BY name ASC`,
@@ -87,7 +88,7 @@ func (r *ColumnRepository) ListByDataset(ctx context.Context, datasetID string) 
 // inference, which compares columns across datasets within the same workspace.
 func (r *ColumnRepository) ListByWorkspace(ctx context.Context, workspaceID string) ([]domain.Column, error) {
 	rows, err := r.pool.Query(ctx,
-		`SELECT id, dataset_id, name, inferred_type, type_confidence, type_fit_rates,
+		`SELECT id, dataset_id, name, inferred_type, physical_type, type_confidence, type_fit_rates,
 		        pii_flag, pii_pattern, pii_reviewed_at, type_overridden_at,
 		        excluded_from_model, null_rate, distinct_count
 		 FROM columns WHERE workspace_id = $1 ORDER BY dataset_id, name ASC`,
@@ -107,16 +108,18 @@ func scanColumns(rows pgx.Rows) ([]domain.Column, error) {
 		var (
 			c                domain.Column
 			inferredType     string
+			physicalType     *string
 			fitRates         []byte
 			piiReviewedAt    *time.Time
 			typeOverriddenAt *time.Time
 		)
-		if err := rows.Scan(&c.ID, &c.DatasetID, &c.Name, &inferredType, &c.TypeConfidence, &fitRates,
+		if err := rows.Scan(&c.ID, &c.DatasetID, &c.Name, &inferredType, &physicalType, &c.TypeConfidence, &fitRates,
 			&c.PIIFlag, &c.PIIPattern, &piiReviewedAt, &typeOverriddenAt,
 			&c.ExcludedFromModel, &c.NullRate, &c.DistinctCount); err != nil {
 			return nil, fmt.Errorf("scanning column: %w", err)
 		}
 		c.InferredType = domain.InferredType(inferredType)
+		c.PhysicalType = physicalInferredType(physicalType)
 		c.TypeFitRates = parseFitRates(fitRates)
 		c.PIIReviewedAt = formatNullableTime(piiReviewedAt)
 		c.TypeOverriddenAt = formatNullableTime(typeOverriddenAt)
@@ -133,17 +136,18 @@ func (r *ColumnRepository) GetByID(ctx context.Context, id string) (domain.Colum
 	var (
 		c                domain.Column
 		inferredType     string
+		physicalType     *string
 		fitRates         []byte
 		piiReviewedAt    *time.Time
 		typeOverriddenAt *time.Time
 	)
 	err := r.pool.QueryRow(ctx,
-		`SELECT id, dataset_id, name, inferred_type, type_confidence, type_fit_rates,
+		`SELECT id, dataset_id, name, inferred_type, physical_type, type_confidence, type_fit_rates,
 		        pii_flag, pii_pattern, pii_reviewed_at, type_overridden_at,
 		        excluded_from_model, null_rate, distinct_count
 		 FROM columns WHERE id = $1`,
 		id,
-	).Scan(&c.ID, &c.DatasetID, &c.Name, &inferredType, &c.TypeConfidence, &fitRates,
+	).Scan(&c.ID, &c.DatasetID, &c.Name, &inferredType, &physicalType, &c.TypeConfidence, &fitRates,
 		&c.PIIFlag, &c.PIIPattern, &piiReviewedAt, &typeOverriddenAt,
 		&c.ExcludedFromModel, &c.NullRate, &c.DistinctCount)
 	if err != nil {
@@ -153,6 +157,7 @@ func (r *ColumnRepository) GetByID(ctx context.Context, id string) (domain.Colum
 		return domain.Column{}, fmt.Errorf("getting column: %w", err)
 	}
 	c.InferredType = domain.InferredType(inferredType)
+	c.PhysicalType = physicalInferredType(physicalType)
 	c.TypeFitRates = parseFitRates(fitRates)
 	c.PIIReviewedAt = formatNullableTime(piiReviewedAt)
 	c.TypeOverriddenAt = formatNullableTime(typeOverriddenAt)
@@ -168,17 +173,18 @@ func (r *ColumnRepository) GetByIDForWorkspace(ctx context.Context, id, workspac
 	var (
 		c                domain.Column
 		inferredType     string
+		physicalType     *string
 		fitRates         []byte
 		piiReviewedAt    *time.Time
 		typeOverriddenAt *time.Time
 	)
 	err := r.pool.QueryRow(ctx,
-		`SELECT id, dataset_id, name, inferred_type, type_confidence, type_fit_rates,
+		`SELECT id, dataset_id, name, inferred_type, physical_type, type_confidence, type_fit_rates,
 		        pii_flag, pii_pattern, pii_reviewed_at, type_overridden_at,
 		        excluded_from_model, null_rate, distinct_count
 		 FROM columns WHERE id = $1 AND workspace_id = $2`,
 		id, workspaceID,
-	).Scan(&c.ID, &c.DatasetID, &c.Name, &inferredType, &c.TypeConfidence, &fitRates,
+	).Scan(&c.ID, &c.DatasetID, &c.Name, &inferredType, &physicalType, &c.TypeConfidence, &fitRates,
 		&c.PIIFlag, &c.PIIPattern, &piiReviewedAt, &typeOverriddenAt,
 		&c.ExcludedFromModel, &c.NullRate, &c.DistinctCount)
 	if err != nil {
@@ -188,6 +194,7 @@ func (r *ColumnRepository) GetByIDForWorkspace(ctx context.Context, id, workspac
 		return domain.Column{}, fmt.Errorf("getting column for workspace: %w", err)
 	}
 	c.InferredType = domain.InferredType(inferredType)
+	c.PhysicalType = physicalInferredType(physicalType)
 	c.TypeFitRates = parseFitRates(fitRates)
 	c.PIIReviewedAt = formatNullableTime(piiReviewedAt)
 	c.TypeOverriddenAt = formatNullableTime(typeOverriddenAt)
@@ -225,6 +232,54 @@ func (r *ColumnRepository) UpdateInferredType(ctx context.Context, id string, t 
 		return fmt.Errorf("updating column inferred type: %w", err)
 	}
 	return nil
+}
+
+// UpdatePhysicalTypes records the engine's physical column types for the given columns, scoped to
+// workspaceID so a caller can never write another workspace's rows. Used by the run path's lazy
+// backfill: columns ingested before physical_type existed carry NULL and get their real engine type
+// persisted the first time their dataset's views are attached (run.prepareViews DESCRIBEs each view
+// and calls this for every column still missing one).
+//
+// Only the named columns are touched; a column already carrying a physical type is left alone (the
+// physical type never changes — FEAT-006's override rewrites inferred_type, not this).
+func (r *ColumnRepository) UpdatePhysicalTypes(ctx context.Context, workspaceID string, types map[string]domain.InferredType) error {
+	if len(types) == 0 {
+		return nil
+	}
+	batch := &pgx.Batch{}
+	for id, t := range types {
+		batch.Queue(
+			`UPDATE columns SET physical_type = $3 WHERE id = $1 AND workspace_id = $2`,
+			id, workspaceID, string(t),
+		)
+	}
+	br := r.pool.SendBatch(ctx, batch)
+	defer br.Close()
+	for range types {
+		if _, err := br.Exec(); err != nil {
+			return fmt.Errorf("updating column physical type: %w", err)
+		}
+	}
+	return nil
+}
+
+// nullableInferredType renders a physical type for storage: the empty string (absent) stores as NULL,
+// matching the empty-string-means-absent convention used across the schema.
+func nullableInferredType(t domain.InferredType) *string {
+	if t == "" {
+		return nil
+	}
+	s := string(t)
+	return &s
+}
+
+// physicalInferredType converts a stored nullable physical type back to the domain value: NULL (or
+// empty) reads as the empty string — "unknown, backfill me".
+func physicalInferredType(p *string) domain.InferredType {
+	if p == nil {
+		return ""
+	}
+	return domain.InferredType(*p)
 }
 
 // fitRatesJSON encodes a column's per-type fit rates for storage. A nil or empty map is stored as an

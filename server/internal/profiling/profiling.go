@@ -340,6 +340,14 @@ func aggregateStats(ctx context.Context, h Execer, parquetPath string, schema []
 	return agg, nil
 }
 
+// PhysicalTypeForDuckDB maps a DuckDB column type name (as reported by DESCRIBE) to schema.md's
+// InferredType enum — the exported form of mapDuckDBType, used by the run path's physical-type
+// backfill (run.prepareViews DESCRIBEs each attached view and persists every column's real engine
+// type, so the model payload can be taught what SQL must actually execute against).
+func PhysicalTypeForDuckDB(duckType string) domain.InferredType {
+	return mapDuckDBType(duckType)
+}
+
 // mapDuckDBType maps a DuckDB column type name (as reported by DESCRIBE) to schema.md's
 // InferredType enum. Falls back to "string" for any type this product does not otherwise
 // distinguish (BLOB, structured/nested types, etc.) — a safe, inspectable default rather than an

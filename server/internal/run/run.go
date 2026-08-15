@@ -41,6 +41,7 @@ import (
 	"github.com/ahmadkhidir/groundwork/server/internal/events"
 	"github.com/ahmadkhidir/groundwork/server/internal/model"
 	"github.com/ahmadkhidir/groundwork/server/internal/orchestrator"
+	"github.com/ahmadkhidir/groundwork/server/internal/profiling"
 	"github.com/ahmadkhidir/groundwork/server/internal/semantic"
 	"github.com/ahmadkhidir/groundwork/server/internal/storage"
 )
@@ -80,9 +81,14 @@ type DatasetStore interface {
 	ListByWorkspace(ctx context.Context, workspaceID string) ([]domain.Dataset, error)
 }
 
-// ColumnStore lists a dataset's profiled columns. Satisfied by postgres.ColumnRepository.
+// ColumnStore lists a dataset's profiled columns and records physical engine types. Satisfied by
+// postgres.ColumnRepository.
 type ColumnStore interface {
 	ListByDataset(ctx context.Context, datasetID string) ([]domain.Column, error)
+	// UpdatePhysicalTypes persists the engine's physical type for the named columns — the lazy
+	// backfill that teaches the model what SQL must execute against for columns ingested before
+	// physical types were persisted (see backfillPhysicalTypes).
+	UpdatePhysicalTypes(ctx context.Context, workspaceID string, types map[string]domain.InferredType) error
 }
 
 // ReportStore persists a completed run's Report object. Satisfied by postgres.ReportRepository.
@@ -1248,7 +1254,7 @@ func (e *Executor) assembleTables(ctx context.Context, workspaceID string) ([]mo
 		for _, c := range cols {
 			tm.Columns = append(tm.Columns, model.ColumnMetadata{
 				Name:              c.Name,
-				Type:              string(c.InferredType),
+				Type:              string(activeColumnType(c)),
 				PIIFlag:           c.PIIFlag,
 				ExcludedFromModel: c.ExcludedFromModel,
 				NullRate:          c.NullRate,
@@ -1264,6 +1270,23 @@ func (e *Executor) assembleTables(ctx context.Context, workspaceID string) ([]mo
 	return tables, nil
 }
 
+// activeColumnType returns the type the model should be taught for column c: the PHYSICAL engine
+// type when known, falling back to the inferred/overridden type for columns ingested before
+// physical types were persisted.
+//
+// Generated SQL must execute against the physical type. Teaching the ACTIVE (inferred/overridden)
+// type instead lets a user override contradict the data — a bank "S/N" serial-number column stored
+// as text but typed number — and the model then emits aggregates DuckDB rejects (avg(VARCHAR)),
+// failing every run that references it. The override remains the type shown to the user and the
+// one FEAT-050's deterministic suggestions read; only what the SQL generator is taught defers to
+// the engine's reality.
+func activeColumnType(c domain.Column) domain.InferredType {
+	if c.PhysicalType != "" {
+		return c.PhysicalType
+	}
+	return c.InferredType
+}
+
 // prepareViews makes every complete dataset queryable inside the workspace's engine session by
 // downloading its normalized Parquet to a temp file the session can read and attaching a view over
 // it under the dataset's canonical table name (tableNameForDataset).
@@ -1273,12 +1296,117 @@ func (e *Executor) assembleTables(ctx context.Context, workspaceID string) ([]mo
 // download-to-temp pattern (ingest's downloadToTemp is unexported; reported as a shared-module
 // consideration). CREATE OR REPLACE makes re-runs idempotent. Each returned cleanup removes the
 // temp file; callers must run them after the query completes.
+//
+// The physical-type backfill runs after the views are attached: columns ingested before migration
+// 00015 carry no physical_type, and this is the one moment the run has both the engine and the
+// data attached — DESCRIBE each view, persist what it reports, so the NEXT payload build is taught
+// the types SQL must actually execute against. Best-effort; a failure leaves the run on the
+// inferred-type path it was already on.
 func (e *Executor) prepareViews(ctx context.Context, handle engine.Handle, workspaceID string) (cleanups []func(), err error) {
 	datasets, err := e.datasets.ListByWorkspace(ctx, workspaceID)
 	if err != nil {
 		return nil, fmt.Errorf("listing datasets for views: %w", err)
 	}
-	return PrepareViews(ctx, handle, workspaceID, datasets, e.objects)
+	var columns []domain.Column
+	for _, ds := range datasets {
+		cols, err := e.columns.ListByDataset(ctx, ds.ID)
+		if err != nil {
+			return nil, fmt.Errorf("listing columns for views: %w", err)
+		}
+		columns = append(columns, cols...)
+	}
+	cleanups, err = PrepareViews(ctx, handle, workspaceID, datasets, e.objects)
+	if err != nil {
+		return nil, err
+	}
+	if backfillErr := e.backfillPhysicalTypes(ctx, handle, workspaceID, datasets, columns); backfillErr != nil {
+		e.logger.Error("backfilling physical column types",
+			slog.String("workspace_id", workspaceID), slog.String("error", backfillErr.Error()))
+	}
+	return cleanups, nil
+}
+
+// backfillPhysicalTypes persists the engine's physical type for every column that does not carry
+// one yet (columns ingested before migration 00015), reading the attached views via DESCRIBE —
+// metadata only, no row scan. Only columns with an empty physical_type are touched; the physical
+// type never changes, so this is a one-time per-column write.
+func (e *Executor) backfillPhysicalTypes(ctx context.Context, handle engine.Handle, workspaceID string, datasets []domain.Dataset, columns []domain.Column) error {
+	colsByDataset := make(map[string][]domain.Column)
+	missing := false
+	for _, c := range columns {
+		if c.PhysicalType == "" {
+			missing = true
+		}
+		colsByDataset[c.DatasetID] = append(colsByDataset[c.DatasetID], c)
+	}
+	if !missing {
+		return nil
+	}
+
+	types := make(map[string]domain.InferredType) // column id -> physical type
+	for _, ds := range datasets {
+		if ds.IngestStatus != domain.IngestComplete {
+			continue
+		}
+		view := tableNameForDataset(ds)
+		// view is sanitized (letters/digits/underscore), so it is safe to embed unquoted.
+		rows, err := handle.Query(ctx, "DESCRIBE "+view)
+		if err != nil {
+			return fmt.Errorf("describing view %s: %w", view, err)
+		}
+		physical := make(map[string]domain.InferredType)
+		for rows.Next() {
+			// Scan into generic slots (DuckDB's DESCRIBE shape: column_name, column_type, null,
+			// key, default, extra) and stringify the first two — the fake rows in tests only fill
+			// *any destinations, and the real driver returns VARCHAR as string/[]byte.
+			dest := make([]any, 6)
+			ptrs := make([]any, 6)
+			for i := range dest {
+				ptrs[i] = &dest[i]
+			}
+			if err := rows.Scan(ptrs...); err != nil {
+				rows.Close()
+				return fmt.Errorf("scanning DESCRIBE for %s: %w", view, err)
+			}
+			name := describeValue(dest[0])
+			duckType := describeValue(dest[1])
+			physical[name] = profiling.PhysicalTypeForDuckDB(duckType)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return fmt.Errorf("iterating DESCRIBE for %s: %w", view, err)
+		}
+		rows.Close()
+
+		for _, c := range colsByDataset[ds.ID] {
+			if c.PhysicalType != "" {
+				continue
+			}
+			if t, ok := physical[c.Name]; ok {
+				types[c.ID] = t
+			}
+		}
+	}
+
+	if len(types) == 0 {
+		return nil
+	}
+	return e.columns.UpdatePhysicalTypes(ctx, workspaceID, types)
+}
+
+// describeValue stringifies one DESCRIBE cell (column name or type), tolerating the string-vs-[]byte
+// variance of database/sql drivers — the same conversion profiling.asString performs.
+func describeValue(v any) string {
+	switch val := v.(type) {
+	case string:
+		return val
+	case []byte:
+		return string(val)
+	case nil:
+		return ""
+	default:
+		return fmt.Sprintf("%v", val)
+	}
 }
 
 // PrepareViews is the exported form of the executor's view-attachment step: download every complete

@@ -326,6 +326,14 @@ type Column struct {
 	// user's override once they set one (FEAT-006 overwrites this field rather than storing the
 	// override separately).
 	InferredType InferredType `json:"inferred_type"`
+	// PhysicalType is the type the ENGINE actually reports for this column's storage (the mapped
+	// DuckDB type from profiling's DESCRIBE), set once at ingest and never changed by a FEAT-006
+	// override. Generated SQL must execute against the physical type, so the model payload teaches
+	// it when known (see run.assembleTables); a user override to a type the data does not have
+	// otherwise makes every aggregate on the column fail at the engine (e.g. avg(VARCHAR)). Empty
+	// for columns ingested before this was persisted; run.prepareViews backfills those lazily from
+	// the attached views.
+	PhysicalType InferredType `json:"physical_type,omitempty"`
 	// TypeFitRates is the 0-1 fit rate for every candidate type, measured once during profiling.
 	// TypeConfidence is a lookup into this map, which is what lets the badge describe whichever type
 	// the user selects without re-querying the engine (FEAT-005).

@@ -322,6 +322,12 @@ func (p *Pipeline) profileAndStore(ctx context.Context, handle engine.Handle, ds
 			DatasetID:    ds.ID,
 			Name:         s.Name,
 			InferredType: s.InferredType,
+			// The physical engine type at ingest time is the type profiling's DESCRIBE mapped
+			// s.InferredType from — the two start equal, and only a later FEAT-006 override changes
+			// InferredType. Persisting it separately means the run payload can always teach the
+			// model what SQL must actually execute against, even after an override (the production
+			// "S/N stored as text but typed number" case).
+			PhysicalType: s.InferredType,
 			// Carried so a later type override can look up the rate for the type the user picks,
 			// instead of re-scanning the data or (as it once did) reporting a flat 100%.
 			TypeFitRates:   s.TypeFitRates,

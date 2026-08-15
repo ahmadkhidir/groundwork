@@ -293,6 +293,13 @@ export interface Column {
   name: string;
   /** Inferred at ingest; reviewable and overridable by the user. */
   inferred_type: InferredType;
+  /**
+   * The type the ENGINE actually reports for this column's storage, set once at ingest and never
+   * changed by a type override. The SQL generator is taught this (what queries must execute
+   * against); `inferred_type` remains the user-facing active type. Optional/absent for columns
+   * ingested before this was persisted — they are backfilled lazily as their views are attached.
+   */
+  physical_type?: InferredType;
   /** Confidence score 0-1 for the current active type — `type_fit_rates[active type]`, never a flat 1.0. */
   type_confidence: number;
   /** 0-1 fit rate for every candidate type; the confidence badge reads `type_fit_rates[active type]`. Optional: absent for columns profiled before this was introduced. */

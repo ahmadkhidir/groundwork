@@ -217,10 +217,23 @@ func (f *fakeDatasetStore) ListByWorkspace(_ context.Context, _ string) ([]domai
 
 type fakeColumnStore struct {
 	byDataset map[string][]domain.Column
+	// physicalTypeUpdates records UpdatePhysicalTypes calls (column id -> type) so tests can assert
+	// the lazy physical-type backfill.
+	physicalTypeUpdates map[string]domain.InferredType
 }
 
 func (f *fakeColumnStore) ListByDataset(_ context.Context, datasetID string) ([]domain.Column, error) {
 	return f.byDataset[datasetID], nil
+}
+
+func (f *fakeColumnStore) UpdatePhysicalTypes(_ context.Context, _ string, types map[string]domain.InferredType) error {
+	if f.physicalTypeUpdates == nil {
+		f.physicalTypeUpdates = make(map[string]domain.InferredType)
+	}
+	for id, t := range types {
+		f.physicalTypeUpdates[id] = t
+	}
+	return nil
 }
 
 type fakeObjectStore struct{}
@@ -261,6 +274,9 @@ type fakeHandle struct {
 	execStatements []string
 	queried        []string
 	rows           engine.Rows
+	// describeRows, when set, is returned for DESCRIBE <view> queries (the physical-type backfill),
+	// shaped like DuckDB's DESCRIBE output: column_name, column_type, null, key, default, extra.
+	describeRows [][]any
 	// countRows, when set, is returned for SELECT count(*) queries (reconciliation measurement and
 	// FEAT-031's count shadow), so the fake can produce a distinct row count without exhausting
 	// rows. Kept as data, not an engine.Rows, so each count query gets a fresh cursor (fakeRows is
@@ -280,6 +296,9 @@ func (f *fakeHandle) Query(_ context.Context, sql string, _ ...any) (engine.Rows
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.queried = append(f.queried, sql)
+	if f.describeRows != nil && strings.HasPrefix(sql, "DESCRIBE ") {
+		return &fakeRows{cols: []string{"column_name", "column_type", "null", "key", "default", "extra"}, rows: f.describeRows}, nil
+	}
 	if f.sumRows != nil && strings.HasPrefix(sql, "SELECT sum(") {
 		return &fakeRows{cols: []string{"sum"}, rows: f.sumRows}, nil
 	}
@@ -1287,5 +1306,108 @@ func TestParseModelJSON(t *testing.T) {
 				t.Errorf("parseModelJSON(%q) = %+v, want %+v", tt.raw, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestActiveColumnTypePrefersPhysicalType(t *testing.T) {
+	tests := []struct {
+		name string
+		col  domain.Column
+		want domain.InferredType
+	}{
+		{
+			name: "physical wins when known — the S/N override case",
+			col:  domain.Column{InferredType: domain.TypeNumber, PhysicalType: domain.TypeString},
+			want: domain.TypeString,
+		},
+		{
+			name: "fall back to inferred when physical not yet persisted",
+			col:  domain.Column{InferredType: domain.TypeNumber},
+			want: domain.TypeNumber,
+		},
+		{
+			name: "correctly-typed column is unchanged",
+			col:  domain.Column{InferredType: domain.TypeNumber, PhysicalType: domain.TypeNumber},
+			want: domain.TypeNumber,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := activeColumnType(tt.col); got != tt.want {
+				t.Errorf("activeColumnType() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPrepareViewsBackfillsPhysicalColumnTypes(t *testing.T) {
+	executor, _, _, handle, _, _, _ := newTestExecutor()
+	executor.datasets = &fakeDatasetStore{datasets: []domain.Dataset{{
+		ID:               "ds-1",
+		WorkspaceID:      "ws-1",
+		OriginalFilename: "gtbank.csv",
+		IngestStatus:     domain.IngestComplete,
+	}}}
+	columns := &fakeColumnStore{byDataset: map[string][]domain.Column{
+		"ds-1": {
+			// The production case: S/N is overridden to number, but the engine stores it as text.
+			{ID: "col-sn", Name: "S/N", InferredType: domain.TypeNumber},
+			{ID: "col-amt", Name: "amount", InferredType: domain.TypeNumber},
+			{ID: "col-region", Name: "region", InferredType: domain.TypeString},
+		},
+	}}
+	executor.columns = columns
+	// DESCRIBE reports the engine's reality: S/N is VARCHAR (text), amount DOUBLE, region VARCHAR.
+	handle.describeRows = [][]any{
+		{"S/N", "VARCHAR", "YES", nil, nil, nil},
+		{"amount", "DOUBLE", "YES", nil, nil, nil},
+		{"region", "VARCHAR", "YES", nil, nil, nil},
+	}
+
+	cleanups, err := executor.prepareViews(context.Background(), handle, "ws-1")
+	if err != nil {
+		t.Fatalf("prepareViews() error = %v", err)
+	}
+	for _, done := range cleanups {
+		done()
+	}
+
+	got := columns.physicalTypeUpdates
+	if got["col-sn"] != domain.TypeString {
+		t.Errorf("S/N physical type = %q, want string (the engine stores it as text)", got["col-sn"])
+	}
+	if got["col-amt"] != domain.TypeNumber {
+		t.Errorf("amount physical type = %q, want number", got["col-amt"])
+	}
+	if got["col-region"] != domain.TypeString {
+		t.Errorf("region physical type = %q, want string", got["col-region"])
+	}
+}
+
+func TestPrepareViewsSkipsBackfillWhenPhysicalTypesKnown(t *testing.T) {
+	executor, _, _, handle, _, _, _ := newTestExecutor()
+	executor.datasets = &fakeDatasetStore{datasets: []domain.Dataset{{
+		ID:               "ds-1",
+		WorkspaceID:      "ws-1",
+		OriginalFilename: "x.csv",
+		IngestStatus:     domain.IngestComplete,
+	}}}
+	columns := &fakeColumnStore{byDataset: map[string][]domain.Column{
+		"ds-1": {
+			{ID: "col-amt", Name: "amount", InferredType: domain.TypeNumber, PhysicalType: domain.TypeNumber},
+		},
+	}}
+	executor.columns = columns
+
+	cleanups, err := executor.prepareViews(context.Background(), handle, "ws-1")
+	if err != nil {
+		t.Fatalf("prepareViews() error = %v", err)
+	}
+	for _, done := range cleanups {
+		done()
+	}
+
+	if len(columns.physicalTypeUpdates) != 0 {
+		t.Errorf("physical type updates = %v, want none (all types already known)", columns.physicalTypeUpdates)
 	}
 }
