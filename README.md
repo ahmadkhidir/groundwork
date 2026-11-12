@@ -82,3 +82,7 @@ from the beginning is a worse product than one that resumes.
 
 **Privacy is enforced at the boundary.** A shared payload builder strips PII before any model call,
 egress is logged fail-closed, and deleting a workspace deletes its contents in one cascade.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
